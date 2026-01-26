@@ -171,6 +171,7 @@ jobs:
     steps:
       - name: delete test image
         uses: bots-house/ghcr-delete-image-action@3827559c68cb4dcdf54d813ea9853be6d468d3a4
+        continue-on-error: true
         if: ${{ always() && ( needs.build_instrumentation_image.outputs.instrumentation_any_changed == 'true' || github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/') ) }}
         with:
           owner: au-ee

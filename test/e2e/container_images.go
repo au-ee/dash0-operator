@@ -37,7 +37,7 @@ const (
 	tagLatest  = "latest"
 	tagMainDev = "main-dev"
 
-	productionImageRepositoryPrefix = "ghcr.io/dash0hq/"
+	productionImageRepositoryPrefix = "ghcr.io/au-ee/"
 	defaultImageRepositoryPrefix    = ""
 	defaultImageTag                 = tagLatest
 	defaultPullPolicy               = "Always"
@@ -222,14 +222,14 @@ func deriveAlternativeImageForUpdateTest(image ImageSpec, imageName string) Imag
 	// alternative fully qualified image name, one that is different from the image name that is being used for the
 	// regular "helm install" invocations in this e2e test suite run.
 	if image.repository != productionImage || image.tag != tagLatest {
-		// Use "ghcr.io/dash0hq/$image:latest", if that is different from the original image.
+		// Use "ghcr.io/au-ee/$image:latest", if that is different from the original image.
 		// (The "latest" tag is built with every release, although it is not used in the Helm chart.)
 		return ImageSpec{
 			repository: productionImage,
 			tag:        tagLatest,
 		}
 	} else {
-		// Otherwise, as a fallback, use "ghcr.io/dash0hq/$image:main-dev".
+		// Otherwise, as a fallback, use "ghcr.io/au-ee/$image:main-dev".
 		// (The "main-dev" tag is built for every commit pushed to the main branch.)
 		return ImageSpec{
 			repository: productionImage,
