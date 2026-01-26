@@ -11,7 +11,7 @@ OPERATOR_HELM_CHART ?= helm-chart/dash0-operator
 # Variables for all operator container images:
 
 # Use "localhost:5001/" for the local registry, leave empty for local images on Docker Desktop, set to any registry
-# path (e.g., "ghcr.io/dash0hq/") for remote images.
+# path (e.g., "ghcr.io/au-ee/") for remote images.
 IMAGE_REPOSITORY_PREFIX ?= ""
 
 # Use "latest" for local dev, specific tag for CI/remote registries

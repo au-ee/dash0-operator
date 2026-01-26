@@ -22,6 +22,6 @@ echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin
 docker build \
   --platform linux/amd64 \
   . \
-  -t ghcr.io/dash0hq/dash0-operator-nodejs-20-express-test-app:latest
+  -t ghcr.io/au-ee/dash0-operator-nodejs-20-express-test-app:latest
 
-docker push ghcr.io/dash0hq/dash0-operator-nodejs-20-express-test-app:latest
+docker push ghcr.io/au-ee/dash0-operator-nodejs-20-express-test-app:latest

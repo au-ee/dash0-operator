@@ -88,7 +88,7 @@ This will tag the image as `localhost:5001/operator-controller:latest`, `localho
 
 **Using images from a remote registry:**
 
-Run `make deploy IMAGE_REPOSITORY_PREFIX=ghcr.io/dash0hq/ IMAGE_TAG=main-dev PULL_POLICY=""`
+Run `make deploy IMAGE_REPOSITORY_PREFIX=ghcr.io/au-ee/ IMAGE_TAG=main-dev PULL_POLICY=""`
 
 **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin privileges or be logged in as
 admin.
@@ -310,8 +310,8 @@ Moving beyond the quickstart instructions, here are more details on the test scr
   `IMAGE_REPOSITORY_PREFIX`, `IMAGE_TAG`, and `PULL_POLICY`. These can be used if you need a different
   container image registry, tag or pull policy per image. The `*_IMAGE_REPOSITORY` variables together
   with `*_IMAGE_TAG` will override the fully qualified name of the image. For example, setting
-  `CONTROLLER_IMAGE_REPOSITORY=ghcr.io/dash0hq/operator-controller` and `CONTROLLER_IMAGE_TAG=0.45.1` will instruct the
-  scripts to use `ghcr.io/dash0hq/operator-controller:0.45.1`.
+  `CONTROLLER_IMAGE_REPOSITORY=ghcr.io/au-ee/operator-controller` and `CONTROLLER_IMAGE_TAG=0.45.1` will instruct the
+  scripts to use `ghcr.io/au-ee/operator-controller:0.45.1`.
   You can also use `*_IMAGE_DIGEST` to use a specific image digest instead of an image tag.
   Here is the full list of image related environment variables:
     * `CONTROLLER_IMAGE_REPOSITORY`
@@ -349,7 +349,7 @@ Moving beyond the quickstart instructions, here are more details on the test scr
         * `TEST_APP_NODEJS_IMAGE_REPOSITORY`, `TEST_APP_NODEJS_IMAGE_TAG`, `TEST_APP_NODEJS_IMAGE`, and `TEST_APP_NODEJS_IMAGE_PULL_POLICY`.
 * To run the scenario with the images that have been built from the main branch and pushed to ghcr.io most recently:
     ```
-    IMAGE_REPOSITORY_PREFIX=ghcr.io/dash0hq/ \
+    IMAGE_REPOSITORY_PREFIX=ghcr.io/au-ee/ \
       IMAGE_TAG=main-dev \
       PULL_POLICY="" \
       test-resources/bin/test-scenario-01-aum-operator-cr.sh
@@ -401,7 +401,7 @@ Kubernetes cluster (the one associated with the kubectl context determined by `E
 
 The tests can also be run with images from any registry, like this:
 ```
-IMAGE_REPOSITORY_PREFIX=ghcr.io/dash0hq/ \
+IMAGE_REPOSITORY_PREFIX=ghcr.io/au-ee/ \
   IMAGE_TAG=main-dev \
   PULL_POLICY="" \
   make test-e2e

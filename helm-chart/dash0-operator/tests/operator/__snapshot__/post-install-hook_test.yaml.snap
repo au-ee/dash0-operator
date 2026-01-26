@@ -50,7 +50,7 @@ post-install hook job should match snapshot:
               env:
                 - name: GOMEMLIMIT
                   value: 205MiB
-              image: ghcr.io/dash0hq/operator-controller:0.0.0
+              image: ghcr.io/au-ee/operator-controller:0.0.0
               imagePullPolicy: null
               name: post-install-job
               resources:

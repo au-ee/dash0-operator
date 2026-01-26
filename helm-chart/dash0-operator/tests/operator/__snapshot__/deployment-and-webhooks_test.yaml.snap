@@ -69,19 +69,19 @@ deployment should match snapshot (default values):
                 - name: OTEL_TARGET_ALLOCATOR_NAME_PREFIX
                   value: RELEASE-NAME
                 - name: DASH0_OPERATOR_IMAGE
-                  value: ghcr.io/dash0hq/operator-controller:0.0.0
+                  value: ghcr.io/au-ee/operator-controller:0.0.0
                 - name: DASH0_INIT_CONTAINER_IMAGE
-                  value: ghcr.io/dash0hq/instrumentation:0.0.0
+                  value: ghcr.io/au-ee/instrumentation:0.0.0
                 - name: DASH0_COLLECTOR_IMAGE
-                  value: ghcr.io/dash0hq/collector:0.0.0
+                  value: ghcr.io/au-ee/collector:0.0.0
                 - name: DASH0_TARGET_ALLOCATOR_IMAGE
-                  value: ghcr.io/dash0hq/target-allocator:0.0.0
+                  value: ghcr.io/au-ee/target-allocator:0.0.0
                 - name: DASH0_CONFIGURATION_RELOADER_IMAGE
-                  value: ghcr.io/dash0hq/configuration-reloader:0.0.0
+                  value: ghcr.io/au-ee/configuration-reloader:0.0.0
                 - name: DASH0_FILELOG_OFFSET_SYNC_IMAGE
-                  value: ghcr.io/dash0hq/filelog-offset-sync:0.0.0
+                  value: ghcr.io/au-ee/filelog-offset-sync:0.0.0
                 - name: DASH0_FILELOG_OFFSET_VOLUME_OWNERSHIP_IMAGE
-                  value: ghcr.io/dash0hq/filelog-offset-volume-ownership:0.0.0
+                  value: ghcr.io/au-ee/filelog-offset-volume-ownership:0.0.0
                 - name: K8S_POD_UID
                   valueFrom:
                     fieldRef:
@@ -102,7 +102,7 @@ deployment should match snapshot (default values):
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.name
-              image: ghcr.io/dash0hq/operator-controller:0.0.0
+              image: ghcr.io/au-ee/operator-controller:0.0.0
               livenessProbe:
                 httpGet:
                   path: /healthz
@@ -229,19 +229,19 @@ deployment should match snapshot when using cert-manager:
                 - name: OTEL_TARGET_ALLOCATOR_NAME_PREFIX
                   value: RELEASE-NAME
                 - name: DASH0_OPERATOR_IMAGE
-                  value: ghcr.io/dash0hq/operator-controller:0.0.0
+                  value: ghcr.io/au-ee/operator-controller:0.0.0
                 - name: DASH0_INIT_CONTAINER_IMAGE
-                  value: ghcr.io/dash0hq/instrumentation:0.0.0
+                  value: ghcr.io/au-ee/instrumentation:0.0.0
                 - name: DASH0_COLLECTOR_IMAGE
-                  value: ghcr.io/dash0hq/collector:0.0.0
+                  value: ghcr.io/au-ee/collector:0.0.0
                 - name: DASH0_TARGET_ALLOCATOR_IMAGE
-                  value: ghcr.io/dash0hq/target-allocator:0.0.0
+                  value: ghcr.io/au-ee/target-allocator:0.0.0
                 - name: DASH0_CONFIGURATION_RELOADER_IMAGE
-                  value: ghcr.io/dash0hq/configuration-reloader:0.0.0
+                  value: ghcr.io/au-ee/configuration-reloader:0.0.0
                 - name: DASH0_FILELOG_OFFSET_SYNC_IMAGE
-                  value: ghcr.io/dash0hq/filelog-offset-sync:0.0.0
+                  value: ghcr.io/au-ee/filelog-offset-sync:0.0.0
                 - name: DASH0_FILELOG_OFFSET_VOLUME_OWNERSHIP_IMAGE
-                  value: ghcr.io/dash0hq/filelog-offset-volume-ownership:0.0.0
+                  value: ghcr.io/au-ee/filelog-offset-volume-ownership:0.0.0
                 - name: K8S_POD_UID
                   valueFrom:
                     fieldRef:
@@ -262,7 +262,7 @@ deployment should match snapshot when using cert-manager:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.name
-              image: ghcr.io/dash0hq/operator-controller:0.0.0
+              image: ghcr.io/au-ee/operator-controller:0.0.0
               livenessProbe:
                 httpGet:
                   path: /healthz

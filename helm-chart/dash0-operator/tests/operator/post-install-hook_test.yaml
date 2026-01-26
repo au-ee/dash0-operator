@@ -27,7 +27,7 @@ tests:
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/dash0hq/operator-controller:99.100.101
+          value: ghcr.io/au-ee/operator-controller:99.100.101
 
   - it: post-install hook job should not be deployed if no operator configuration auto resource is requested
     set:
