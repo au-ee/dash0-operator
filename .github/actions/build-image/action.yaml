@@ -24,14 +24,6 @@ inputs:
     description: "path to dockerfile, defaults to ${context}/Dockerfile"
     required: false
     default: ''
-  scan:
-    description: "whether to scan the built image with Trivy"
-    required: false
-    default: 'false'
-  scanSeverity:
-    description: "severity setting for the Trivy scanner, see https://trivy.dev/docs/latest/guide/configuration/filtering/#by-severity"
-    required: false
-    default: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
 
 runs:
   using: "composite"
@@ -52,7 +44,7 @@ runs:
       uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804
       with:
         images: |
-          ghcr.io/dash0hq/${{ inputs.imageName }}
+          ghcr.io/au-ee/${{ inputs.imageName }}
         tags: |
           type=semver,pattern={{major}}.{{minor}}.{{patch}}
           type=semver,pattern={{major}}.{{minor}}
@@ -94,38 +86,6 @@ runs:
         load: true
         push: false
 
-    - name: set short sha
-      shell: bash
-      run: |
-        echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-
-    # optionally scan the built container image with Trivy and upload the results
-    - name: run Trivy vulnerability scanner
-      if: ${{ inputs.scan == 'true' }}
-      uses: aquasecurity/trivy-action@0.28.0
-      with:
-        image-ref: 'ghcr.io/dash0hq/${{ inputs.imageName }}:sha-${{ env.SHORT_SHA }}'
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-        exit-code: '1' # fail build if vulnerabilities are found
-        severity: ${{ inputs.scanSeverity }}
-        limit-severities-for-sarif: true
-
-    # The scan results are also available at https://github.com/dash0hq/dash0-operator/security/code-scanning with
-    # query "is:open pr:xyz", but having them in the build log is just also handy sometimes.
-    - name: echo sarif file
-      if: ${{ always() && inputs.scan == 'true' }}
-      shell: bash
-      run: |
-        cat trivy-results.sarif
-
-    - name: upload Trivy scan results to GitHub Security tab
-      if: ${{ always() && inputs.scan == 'true' }}
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: 'trivy-results.sarif'
-        category: ".github/workflows/ci.yaml:build_and_push_images/${{ inputs.imageName }}"
-
     - name: push container image
       if: ${{ env.PUSH_ENABLED == 'true' }}
       uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4
@@ -134,7 +94,7 @@ runs:
         file: ${{ inputs.file != '' && inputs.file || format('{0}/Dockerfile', inputs.context) }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        platforms: 'linux/amd64,linux/arm64'
+        platforms: 'linux/amd64'
         cache-from: type=gha,scope=${{ inputs.imageName }}
         cache-to: type=gha,mode=max,scope=${{ inputs.imageName }}
         push: ${{ env.PUSH_ENABLED }}

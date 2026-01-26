@@ -15,7 +15,7 @@ keywords:
   # - Python
 home: https://www.dash0.com/
 sources:
-  - https://github.com/dash0hq/dash0-operator
+  - https://github.com/au-ee/dash0-operator
 maintainers:
   - name: Bastian Krol
     email: bastian.krol@dash0.com

@@ -56,7 +56,7 @@ To use the operator, you will need provide two configuration values:
 Before installing the operator, add the Dash0 operator's Helm repository as follows:
 
 ```console
-helm repo add dash0-operator https://dash0hq.github.io/dash0-operator
+helm repo add dash0-operator https://au-ee.github.io/dash0-operator
 helm repo update dash0-operator
 ```
 
