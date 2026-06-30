@@ -4,8 +4,10 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -15,6 +17,15 @@ import (
 var (
 	originalKubeContext       string
 	kubeContextHasBeenChanged bool
+
+	kubernetesMajor int
+	kubernetesMinor int
+
+	standardNamespaces = []string{
+		"cert-manager",
+		"default",
+		"ingress-nginx",
+	}
 )
 
 func setKubernetesContext(kubernetesContextForTest string) (bool, string) {
@@ -58,6 +69,58 @@ func setKubernetesContext(kubernetesContextForTest string) (bool, string) {
 	}
 }
 
+// readKubernetesServerVersion populates kubernetesMajor and kubernetesMinor from
+// `kubectl version -o json`. If parsing fails, it logs a warning and leaves both values at zero;
+// callers that gate behavior on the version should treat the zero value as unknown.
+func readKubernetesServerVersion() {
+	By("reading Kubernetes server version")
+	stdout, stderr, err := runAndReturnStdoutStderr(exec.Command("kubectl", "version", "-o", "json"))
+	if err != nil {
+		e2ePrint(
+			"could not run `kubectl version -o json`, Kubernetes version is unknown; stdout: %s; stderr: %s, error: %v\n",
+			stdout,
+			stderr,
+			err,
+		)
+	}
+	var parsed struct {
+		ServerVersion struct {
+			Major string `json:"major"`
+			Minor string `json:"minor"`
+		} `json:"serverVersion"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
+		e2ePrint(
+			"could not parse `kubectl version -o json` output, Kubernetes version is unknown; output: \"%s\"; error: %v\n",
+			stdout,
+			err,
+		)
+		return
+	}
+	major, errMajor := strconv.Atoi(stripVersionSuffix(parsed.ServerVersion.Major))
+	minor, errMinor := strconv.Atoi(stripVersionSuffix(parsed.ServerVersion.Minor))
+	if errMajor != nil || errMinor != nil {
+		e2ePrint(
+			"could not parse Kubernetes version (major=\"%s\", minor=\"%s\"), Kubernetes version is unknown; "+
+				"errMajor: %v, errMinor: %v\n",
+			parsed.ServerVersion.Major,
+			parsed.ServerVersion.Minor,
+			errMajor,
+			errMinor,
+		)
+		return
+	}
+	kubernetesMajor = major
+	kubernetesMinor = minor
+	By(fmt.Sprintf("Kubernetes version: %d.%d", kubernetesMajor, kubernetesMinor))
+}
+
+// stripVersionSuffix trims non-digit characters from the end of a Kubernetes version component
+// (e.g. "35+" on managed distributions becomes "35").
+func stripVersionSuffix(s string) string {
+	return strings.TrimRightFunc(s, func(r rune) bool { return r < '0' || r > '9' })
+}
+
 func revertKubernetesContext(originalCtx string) {
 	if originalCtx != "" {
 		By("switching back to original Kubernetes context " + originalCtx)
@@ -77,6 +140,10 @@ func revertKubernetesContext(originalCtx string) {
 }
 
 func recreateNamespace(namespace string) {
+	recreateNamespaceWithLabel(namespace, nil)
+}
+
+func recreateNamespaceWithLabel(namespace string, labels map[string]string) {
 	By(fmt.Sprintf("(re)creating namespace %s", namespace))
 	output, err := run(exec.Command("kubectl", "get", "ns", namespace))
 	if err != nil {
@@ -93,8 +160,23 @@ func recreateNamespace(namespace string) {
 				exec.Command("kubectl", "wait", "--for=delete", "ns", namespace, "--timeout=60s"))).To(Succeed())
 	}
 
-	Expect(
-		runAndIgnoreOutput(exec.Command("kubectl", "create", "ns", namespace))).To(Succeed())
+	if labels == nil {
+		Expect(runAndIgnoreOutput(exec.Command("kubectl", "create", "ns", namespace))).To(Succeed())
+	} else {
+		labelLines := ""
+		for k, v := range labels {
+			labelLines += fmt.Sprintf("    %s: %s\n", k, v)
+		}
+		namespaceYaml := fmt.Sprintf(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+  labels:
+%s`, namespace, labelLines)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(namespaceYaml)
+		Expect(runAndIgnoreOutput(cmd)).To(Succeed())
+	}
 }
 
 func ensureNamespaceExists(namespace string) {
@@ -107,4 +189,60 @@ func ensureNamespaceExists(namespace string) {
 			Fail(fmt.Sprintf("kubectl get ns %s failed with unexpected error: %v", namespace, err))
 		}
 	}
+}
+
+func setAutoMonitoringOptOutLabelForStandardNamespaces(cleanupSteps *neccessaryCleanupSteps) {
+	for _, namespace := range standardNamespaces {
+		setAutoMonitoringOptOutLabelForNamespace(namespace)
+		cleanupSteps.removeAutoMonitoringOptLabelForStandardNamespaces = true
+	}
+}
+
+func setAutoMonitoringOptOutLabelForNamespace(namespace string) {
+	output, err := run(exec.Command("kubectl", "get", "ns", namespace))
+	if err != nil {
+		if strings.Contains(output, "(NotFound)") {
+			return
+		}
+		Expect(err).NotTo(HaveOccurred())
+	}
+	By(fmt.Sprintf("setting the auto-monitoring opt-out label on namespace %s", namespace))
+	Expect(
+		runAndIgnoreOutput(exec.Command(
+			"kubectl",
+			"label",
+			"namespace",
+			namespace,
+			"--overwrite",
+			"dash0.com/enable=false",
+		)),
+	).To(Succeed())
+}
+
+func removeAutoMonitoringOptOutLabelFromStandardNamespaces(cleanupSteps *neccessaryCleanupSteps) {
+	if cleanupSteps.removeAutoMonitoringOptLabelForStandardNamespaces {
+		for _, namespace := range standardNamespaces {
+			removeAutoMonitoringOptOutLabelFromNamespace(namespace)
+		}
+	}
+}
+
+func removeAutoMonitoringOptOutLabelFromNamespace(namespace string) {
+	output, err := run(exec.Command("kubectl", "get", "ns", namespace))
+	if err != nil {
+		if strings.Contains(output, "(NotFound)") {
+			return
+		}
+		Expect(err).NotTo(HaveOccurred())
+	}
+	By(fmt.Sprintf("removing the auto-monitoring opt-out label from namespace %s", namespace))
+	Expect(
+		runAndIgnoreOutput(exec.Command(
+			"kubectl",
+			"label",
+			"namespace",
+			namespace,
+			"dash0.com/enable-",
+		)),
+	).To(Succeed())
 }

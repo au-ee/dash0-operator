@@ -8,13 +8,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+)
+
+var (
+	monitoringTemplateDefaults = dash0v1beta1.Dash0MonitoringSpec{
+		InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+			Mode:          dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+			LabelSelector: "dash0.com/enable!=false",
+		},
+		LogCollection: dash0common.LogCollection{
+			Enabled: new(true),
+		},
+		EventCollection: dash0common.EventCollection{
+			Enabled: new(true),
+		},
+		PrometheusScraping: dash0common.PrometheusScraping{
+			Enabled: new(true),
+		},
+	}
 )
 
 type OperatorConfigurationMutatingWebhookHandler struct {
@@ -43,19 +66,28 @@ func (h *OperatorConfigurationMutatingWebhookHandler) SetupWebhookWithManager(mg
 	return nil
 }
 
-func (h *OperatorConfigurationMutatingWebhookHandler) Handle(_ context.Context, request admission.Request) admission.Response {
+func (h *OperatorConfigurationMutatingWebhookHandler) Handle(ctx context.Context, request admission.Request) admission.Response {
 	// Note: The mutating webhook is called before the validating webhook, so we can normalize the resource here and
 	// verify that it is valid (after having been normalized) in the validating webhook.
 	// Note that default values from // +kubebuilder:default comments from
 	// api/operator/v1alpha1/operator_configuration_types.go have already been applied by the time this webhook
 	// is called.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#admission-control-phases.
+	logger := logd.FromContext(ctx)
 	operatorConfigurationResource := &dash0v1alpha1.Dash0OperatorConfiguration{}
 	if _, _, err := decoder.Decode(request.Object.Raw, nil, operatorConfigurationResource); err != nil {
+		logger.Warn("rejecting invalid operator configuration resource", "error", err)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	patchRequired := h.normalizeOperatorConfigurationResourceSpec(&operatorConfigurationResource.Spec)
+	patchRequired, errorResponse := h.normalizeOperatorConfigurationResourceSpec(
+		request,
+		&operatorConfigurationResource.Spec,
+		logger,
+	)
+	if errorResponse != nil {
+		return *errorResponse
+	}
 
 	if !patchRequired {
 		return admission.Allowed("no changes")
@@ -64,14 +96,46 @@ func (h *OperatorConfigurationMutatingWebhookHandler) Handle(_ context.Context, 
 	marshalled, err := json.Marshal(operatorConfigurationResource)
 	if err != nil {
 		wrappedErr := fmt.Errorf("error when marshalling modfied operator configuration resource to JSON: %w", err)
+		logger.Error(wrappedErr, "error when marshalling modified operator configuration resource to JSON")
 		return admission.Errored(http.StatusInternalServerError, wrappedErr)
 	}
 
 	return admission.PatchResponseFromRaw(request.Object.Raw, marshalled)
 }
 
-func (h *OperatorConfigurationMutatingWebhookHandler) normalizeOperatorConfigurationResourceSpec(spec *dash0v1alpha1.Dash0OperatorConfigurationSpec) bool {
+func (h *OperatorConfigurationMutatingWebhookHandler) normalizeOperatorConfigurationResourceSpec(
+	request admission.Request,
+	spec *dash0v1alpha1.Dash0OperatorConfigurationSpec,
+	logger logd.Logger,
+) (bool, *admission.Response) {
 	patchRequired := false
+
+	// Migrate deprecated export field to exports, or strip it if exports is already set.
+	// - If only export is set: migrate export → exports (the common upgrade path).
+	// - If both are set on UPDATE and exports matches the stored resource: kubectl's three-way merge carried over the
+	//   old exports from the stored resource. The user's real change is in export, so we migrate export → exports.
+	// - If both are set and exports differs from the stored resource (or this is a CREATE): the user intentionally
+	//   changed exports directly (or is actively migrating). We honor exports and discard export.
+	//nolint:staticcheck
+	if spec.Export != nil {
+		if len(spec.Exports) == 0 {
+			//nolint:staticcheck
+			spec.Exports = []dash0common.Export{*spec.Export}
+		} else {
+			unchanged, errorResponse := isExportsUnchangedFromOldOperatorConfigurationResource(request, spec.Exports, logger)
+			if errorResponse != nil {
+				return false, errorResponse
+			}
+			if unchanged {
+				//nolint:staticcheck
+				spec.Exports = []dash0common.Export{*spec.Export}
+			}
+		}
+		//nolint:staticcheck
+		spec.Export = nil
+		patchRequired = true
+	}
+
 	if spec.TelemetryCollection.Enabled == nil {
 		spec.TelemetryCollection.Enabled = ptr.To(true)
 		patchRequired = true
@@ -95,9 +159,87 @@ func (h *OperatorConfigurationMutatingWebhookHandler) normalizeOperatorConfigura
 		spec.CollectPodLabelsAndAnnotations.Enabled = ptr.To(telemetryCollectionEnabled)
 		patchRequired = true
 	}
+	if spec.CollectNamespaceLabelsAndAnnotations.Enabled == nil {
+		// collecting namespace labels and annotations is opt-in, so it defaults to false if unset
+		spec.CollectNamespaceLabelsAndAnnotations.Enabled = ptr.To(false)
+		patchRequired = true
+	}
 	if spec.PrometheusCrdSupport.Enabled == nil {
 		spec.PrometheusCrdSupport.Enabled = ptr.To(false)
 		patchRequired = true
 	}
+
+	patchRequiredForMonitoringTemplate := h.setMonitoringTemplateDefaults(spec)
+	patchRequired = patchRequired || patchRequiredForMonitoringTemplate
+
+	return patchRequired, nil
+}
+
+func (h *OperatorConfigurationMutatingWebhookHandler) setMonitoringTemplateDefaults(
+	spec *dash0v1alpha1.Dash0OperatorConfigurationSpec,
+) bool {
+	if !spec.AutoMonitorNamespaces.IsEnabled() && spec.MonitoringTemplate == nil {
+		// If AutoMonitorNamespaces is not enabled and there is no monitoring template at all, we do not need to set
+		// defaults for the monitoring template. However, if at least a partial monitoring template has been provided,
+		// defaults should be set, hence the " && spec.MonitoringTemplate == nil" in the condition.
+		return false
+	}
+
+	patchRequired := false
+
+	if spec.MonitoringTemplate == nil {
+		spec.MonitoringTemplate = new(dash0v1alpha1.MonitoringTemplate{})
+		patchRequired = true
+	}
+	monitoringTemplateSpec := &spec.MonitoringTemplate.Spec
+	if monitoringTemplateSpec.InstrumentWorkloads.Mode == "" {
+		monitoringTemplateSpec.InstrumentWorkloads.Mode = monitoringTemplateDefaults.InstrumentWorkloads.Mode
+		patchRequired = true
+	}
+	if monitoringTemplateSpec.InstrumentWorkloads.LabelSelector == "" {
+		monitoringTemplateSpec.InstrumentWorkloads.LabelSelector = monitoringTemplateDefaults.InstrumentWorkloads.LabelSelector
+		patchRequired = true
+	}
+	if monitoringTemplateSpec.LogCollection.Enabled == nil {
+		monitoringTemplateSpec.LogCollection.Enabled = monitoringTemplateDefaults.LogCollection.Enabled
+		patchRequired = true
+	}
+	if monitoringTemplateSpec.EventCollection.Enabled == nil {
+		monitoringTemplateSpec.EventCollection.Enabled = monitoringTemplateDefaults.EventCollection.Enabled
+		patchRequired = true
+	}
+	if monitoringTemplateSpec.PrometheusScraping.Enabled == nil {
+		monitoringTemplateSpec.PrometheusScraping.Enabled = monitoringTemplateDefaults.PrometheusScraping.Enabled
+		patchRequired = true
+	}
 	return patchRequired
+}
+
+// isExportsUnchangedFromOldOperatorConfigurationResource checks whether the incoming exports slice matches the
+// previously stored exports on an UPDATE operation. This detects when kubectl's three-way merge carried over the old
+// exports field (set by a prior webhook migration), so the user's real intent is in the deprecated export field.
+// Returns false for CREATE operations or when exports differ. Returns an error response if the OldObject cannot be
+// decoded.
+func isExportsUnchangedFromOldOperatorConfigurationResource(
+	request admission.Request,
+	incomingExports []dash0common.Export,
+	logger logd.Logger,
+) (bool, *admission.Response) {
+	if request.Operation != admissionv1.Update {
+		return false, nil
+	}
+	if request.OldObject.Raw == nil {
+		return false, nil
+	}
+	oldResource := &dash0v1alpha1.Dash0OperatorConfiguration{}
+	if _, _, err := decoder.Decode(request.OldObject.Raw, nil, oldResource); err != nil {
+		msg := "could not decode OldObject for export migration"
+		logger.Error(err, msg)
+		errResponse := admission.Errored(
+			http.StatusBadRequest,
+			fmt.Errorf("%s: %w", msg, err),
+		)
+		return false, &errResponse
+	}
+	return reflect.DeepEqual(incomingExports, oldResource.Spec.Exports), nil
 }

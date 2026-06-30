@@ -4,6 +4,8 @@
 package e2e
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -17,19 +19,27 @@ func runAndIgnoreOutput(cmd *exec.Cmd, logCommandArgs ...bool) error {
 	return err
 }
 
-// run executes the provided command within this context
+// run executes the provided command and returns the combined output from stdout and stderr.
+//
+// The command takes optional boolean flags that control what is logged while executing the command:
+//   - argument 1 is the command to be executed
+//   - argument 2 determines whether the command is logged (default: true)
+//   - argument 3 determines whether the output is logged when the command has been successful (default: false);
+//     even when this is set to false, the output will still be logged in case the command has failed
+//     (but see argument 4)
+//   - argument 4 determines whether the command is logged when the command has failed (default: true)
 func run(cmd *exec.Cmd, logCommandArgs ...bool) (string, error) {
-	var logCommand bool
-	var alwaysLogOutput bool
+	logCommand := true
+	logOutputOnSuccess := false
+	logOutputOnError := true
 	if len(logCommandArgs) >= 1 {
 		logCommand = logCommandArgs[0]
-	} else {
-		logCommand = true
 	}
 	if len(logCommandArgs) >= 2 {
-		alwaysLogOutput = logCommandArgs[1]
-	} else {
-		alwaysLogOutput = false
+		logOutputOnSuccess = logCommandArgs[1]
+	}
+	if len(logCommandArgs) >= 3 {
+		logOutputOnError = logCommandArgs[2]
 	}
 
 	command := strings.Join(cmd.Args, " ")
@@ -37,15 +47,70 @@ func run(cmd *exec.Cmd, logCommandArgs ...bool) (string, error) {
 		e2ePrint("running: %s\n", command)
 	}
 	output, err := cmd.CombinedOutput()
-	if alwaysLogOutput {
+	if err != nil {
+		if logOutputOnError {
+			e2ePrint(fmt.Sprintf("%s failed with error: (%v) %s", command, err, string(output)))
+		}
+		return string(output), fmt.Errorf("%s failed with error: (%v) %s", command, err, string(output))
+	} else if logOutputOnSuccess {
 		e2ePrint("output: %s\n", string(output))
 	}
-	if err != nil {
-		e2ePrint(fmt.Sprintf("%s failed with error: (%v) %s", command, err, string(output)))
-		return string(output), fmt.Errorf("%s failed with error: (%v) %s", command, err, string(output))
+	return string(output), nil
+}
+
+// runAndReturnStdoutStderr executes the provided command, similar to the run function, but it returns stdout and stderr
+// as separate strings.
+//
+// The command takes optional boolean flags that control what is logged while executing the command:
+//   - argument 1 is the command to be executed
+//   - argument 2 determines whether the command is logged (default: true)
+//   - argument 3 determines whether the output is logged when the command has been successful (default: false);
+//     even when this is set to false, the output will still be logged in case the command has failed
+//     (but see argument 4)
+//   - argument 4 determines whether the command is logged when the command has failed (default: true)
+func runAndReturnStdoutStderr(cmd *exec.Cmd, logCommandArgs ...bool) (string, string, error) {
+	logCommand := true
+	logOutputOnSuccess := false
+	logOutputOnError := true
+	if len(logCommandArgs) >= 1 {
+		logCommand = logCommandArgs[0]
+	}
+	if len(logCommandArgs) >= 2 {
+		logOutputOnSuccess = logCommandArgs[1]
+	}
+	if len(logCommandArgs) >= 3 {
+		logOutputOnError = logCommandArgs[2]
 	}
 
-	return string(output), nil
+	command := strings.Join(cmd.Args, " ")
+	if logCommand {
+		e2ePrint("running: %s\n", command)
+	}
+
+	if cmd.Stdout != nil {
+		return "", "", errors.New("exec: Stdout already set")
+	}
+	if cmd.Stderr != nil {
+		return "", "", errors.New("exec: Stderr already set")
+	}
+	var o bytes.Buffer
+	cmd.Stdout = &o
+	var e bytes.Buffer
+	cmd.Stderr = &e
+	err := cmd.Run()
+
+	stdout := string(o.Bytes())
+	stderr := string(e.Bytes())
+
+	if err != nil {
+		if logOutputOnError {
+			e2ePrint(fmt.Sprintf("%s failed with error: (%v), stdout: %s, stderr: %s", command, err, stdout, stderr))
+		}
+		return stdout, stderr, fmt.Errorf("%s failed with error: (%v)stdout: %s, stderr: %s\"", command, err, stdout, stderr)
+	} else if logOutputOnSuccess {
+		e2ePrint("stdout: %s; stderr: %s\n", stdout, stderr)
+	}
+	return stdout, stderr, nil
 }
 
 // getNonEmptyLines converts given command output string into individual objects

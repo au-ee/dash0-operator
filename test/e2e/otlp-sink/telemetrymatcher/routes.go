@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pprofile"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/dash0hq/dash0-operator/test/e2e/pkg/shared"
@@ -44,6 +46,7 @@ func (r *Routes) defineRoutes(router *gin.Engine) {
 	router.GET("/matching-logs", r.matchingLogsRouteHandler)
 	router.GET("/matching-metrics", r.matchingMetricsRouteHandler)
 	router.GET("/matching-events", r.matchingEventsRouteHandler)
+	router.GET("/matching-profiles", r.matchingProfilesRouteHandler)
 }
 
 func (r *Routes) readyCheckRouteHandler(c *gin.Context) {
@@ -281,6 +284,28 @@ func (r *Routes) matchingMetricsRouteHandler(c *gin.Context) {
 		resourceMatchFn = resourceAttributeMatcherSelfMonitoringCollector(commonParams.operatorNamespace)
 		metricMatchFn = hasOtelColPrefixMatcher()
 
+	case shared.MetricsMatchModeMetricNames:
+		raw := c.Query(shared.QueryParamMetricNames)
+		var metricNames []string
+		for _, name := range strings.Split(raw, ",") {
+			trimmed := strings.TrimSpace(name)
+			if trimmed != "" {
+				metricNames = append(metricNames, trimmed)
+			}
+		}
+		if len(metricNames) == 0 {
+			c.JSON(400, shared.ExpectationResult{
+				Success: false,
+				Description: fmt.Sprintf(
+					"the %s query parameter must contain at least one non-empty metric name",
+					shared.QueryParamMetricNames,
+				),
+			})
+			return
+		}
+		resourceMatchFn = matchAllResourceAttributeMatcher()
+		metricMatchFn = metricNameIsMemberOfList(metricNames)
+
 	case shared.MetricsMatchModeMatchAll:
 		resourceMatchFn = matchAllResourceAttributeMatcher()
 		metricMatchFn = matchAllMetricMatcher()
@@ -328,6 +353,42 @@ func (r *Routes) matchingMetricsRouteHandler(c *gin.Context) {
 		commonParams,
 		allMatchResults,
 		"metric",
+	)
+}
+
+// matchingProfilesRouteHandler checks for matching profiles using the given query parameters of the request.
+func (r *Routes) matchingProfilesRouteHandler(c *gin.Context) {
+	commonParams, ok := readCommonQueryParams(c)
+	if !ok {
+		return
+	}
+
+	expectedNamespace := c.Query(shared.QueryParamNamespace)
+
+	var resourceMatchFn func(pprofile.ResourceProfiles, *ResourceMatchResult[pprofile.ResourceProfiles])
+	if expectedNamespace != "" {
+		resourceMatchFn = profilesResourceMatcher(expectedNamespace)
+	}
+
+	allMatchResults, err := readFileAndGetMatchingProfiles(
+		r.Config.ProfilesFile,
+		resourceMatchFn,
+		matchAnyProfileMatcher(),
+		commonParams.timestampLowerBound,
+	)
+	if err != nil {
+		c.JSON(500, shared.ExpectationResult{
+			Success:     false,
+			Description: fmt.Sprintf("error: %v", err),
+		})
+		return
+	}
+
+	processMatchResults(
+		c,
+		commonParams,
+		allMatchResults,
+		"profile",
 	)
 }
 

@@ -6,40 +6,47 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 
-	"github.com/go-logr/logr"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
+	"github.com/dash0hq/dash0-operator/internal/agent0connector"
 	"github.com/dash0hq/dash0-operator/internal/collectors"
+	"github.com/dash0hq/dash0-operator/internal/intelligentedge"
 	"github.com/dash0hq/dash0-operator/internal/resources"
 	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/targetallocator"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/cluster"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 type OperatorConfigurationReconciler struct {
 	client.Client
-	clientset                   *kubernetes.Clientset
-	apiClients                  []ApiClient
-	authTokenClients            []selfmonitoringapiaccess.AuthTokenClient
-	collectorManager            *collectors.CollectorManager
-	targetAllocatorManager      *targetallocator.TargetAllocatorManager
-	pseudoClusterUid            types.UID
-	operatorDeploymentNamespace string
-	operatorDeploymentUID       types.UID
-	operatorDeploymentName      string
-	OperatorManagerPodName      string
-	oTelSdkStarter              *selfmonitoringapiaccess.OTelSdkStarter
-	DanglingEventsTimeouts      *util.DanglingEventsTimeouts
-	images                      util.Images
-	operatorNamespace           string
-	developmentMode             bool
+	clientset                    *kubernetes.Clientset
+	apiClients                   []ApiClient
+	collectorManager             *collectors.CollectorManager
+	targetAllocatorManager       *targetallocator.TargetAllocatorManager
+	agent0ConnectorManager       *agent0connector.Agent0ConnectorManager
+	intelligentEdgeManager       *intelligentedge.IntelligentEdgeManager
+	clusterInstrumentationConfig *util.ClusterInstrumentationConfig
+	pseudoClusterUid             types.UID
+	operatorDeploymentNamespace  string
+	operatorDeploymentUID        types.UID
+	operatorDeploymentName       string
+	OperatorManagerPodName       string
+	oTelSdkStarter               *selfmonitoringapiaccess.OTelSdkStarter
+	DanglingEventsTimeouts       *util.DanglingEventsTimeouts
+	images                       util.Images
+	operatorNamespace            string
+	developmentMode              bool
 }
 
 const (
@@ -57,6 +64,9 @@ func NewOperatorConfigurationReconciler(
 	apiClients []ApiClient,
 	collectorManager *collectors.CollectorManager,
 	targetAllocatorManager *targetallocator.TargetAllocatorManager,
+	agent0ConnectorManager *agent0connector.Agent0ConnectorManager,
+	intelligentEdgeManager *intelligentedge.IntelligentEdgeManager,
+	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
 	pseudoClusterUid types.UID,
 	operatorDeploymentNamespace string,
 	operatorDeploymentUID types.UID,
@@ -67,24 +77,23 @@ func NewOperatorConfigurationReconciler(
 	developmentMode bool,
 ) *OperatorConfigurationReconciler {
 	return &OperatorConfigurationReconciler{
-		Client:                      k8sClient,
-		clientset:                   clientset,
-		apiClients:                  apiClients,
-		collectorManager:            collectorManager,
-		targetAllocatorManager:      targetAllocatorManager,
-		pseudoClusterUid:            pseudoClusterUid,
-		operatorDeploymentNamespace: operatorDeploymentNamespace,
-		operatorDeploymentUID:       operatorDeploymentUID,
-		operatorDeploymentName:      operatorDeploymentName,
-		oTelSdkStarter:              oTelSdkStarter,
-		images:                      images,
-		operatorNamespace:           operatorNamespace,
-		developmentMode:             developmentMode,
+		Client:                       k8sClient,
+		clientset:                    clientset,
+		apiClients:                   apiClients,
+		collectorManager:             collectorManager,
+		targetAllocatorManager:       targetAllocatorManager,
+		agent0ConnectorManager:       agent0ConnectorManager,
+		intelligentEdgeManager:       intelligentEdgeManager,
+		clusterInstrumentationConfig: clusterInstrumentationConfig,
+		pseudoClusterUid:             pseudoClusterUid,
+		operatorDeploymentNamespace:  operatorDeploymentNamespace,
+		operatorDeploymentUID:        operatorDeploymentUID,
+		operatorDeploymentName:       operatorDeploymentName,
+		oTelSdkStarter:               oTelSdkStarter,
+		images:                       images,
+		operatorNamespace:            operatorNamespace,
+		developmentMode:              developmentMode,
 	}
-}
-
-func (r *OperatorConfigurationReconciler) SetAuthTokenClients(authTokenClients []selfmonitoringapiaccess.AuthTokenClient) {
-	r.authTokenClients = authTokenClients
 }
 
 func (r *OperatorConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -94,13 +103,14 @@ func (r *OperatorConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) err
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dash0v1alpha1.Dash0OperatorConfiguration{}).
+		WithEventFilter(operatorConfigurationPredicate{}).
 		Complete(r)
 }
 
 func (r *OperatorConfigurationReconciler) InitializeSelfMonitoringMetrics(
 	meter otelmetric.Meter,
 	metricNamePrefix string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	reconcileRequestMetricName := fmt.Sprintf("%s%s", metricNamePrefix, "operatorconfiguration.reconcile_requests")
 	var err error
@@ -113,23 +123,14 @@ func (r *OperatorConfigurationReconciler) InitializeSelfMonitoringMetrics(
 	}
 }
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// It is essential for the controller's reconciliation loop to be idempotent. By following the Operator
-// pattern you will create Controllers which provide a reconcile function
-// responsible for synchronizing resources until the desired state is reached on the cluster.
-// Breaking this recommendation goes against the design principles of controller-runtime.
-// and may lead to unforeseen consequences such as resources becoming stuck and requiring manual intervention.
-// For further info:
-// - About Operator Pattern: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
-// - About Controllers: https://kubernetes.io/docs/concepts/architecture/controller/
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.16.3/pkg/reconcile
+// Reconcile is part of the main kubernetes reconciliation loop which aims to move the current state of the cluster
+// closer to the desired state. Needs to be idempotent.
 func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if operatorReconcileRequestMetric != nil {
 		operatorReconcileRequestMetric.Add(ctx, 1)
 	}
 
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("processing reconcile request for an operator configuration resource")
 
 	resourceDeleted := false
@@ -138,7 +139,7 @@ func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctr
 		r.Client,
 		req,
 		&dash0v1alpha1.Dash0OperatorConfiguration{},
-		&logger,
+		logger,
 	)
 	if err != nil {
 		logger.Error(err, "operator configuration resource existence check failed")
@@ -153,16 +154,26 @@ func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctr
 	if resourceDeleted {
 		logger.Info("Reconciling the deletion of the operator configuration resource", "name", req.Name)
 		r.removeAllOperatorConfigurationSettings(ctx, logger)
-		if r.reconcileOpenTelemetryCollector(ctx, &logger) != nil {
+		if err = r.reconcileOpenTelemetryCollector(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
-		if r.reconcileOpenTelemetryTargetAllocator(ctx, &logger) != nil {
+		if err = r.reconcileOpenTelemetryTargetAllocator(ctx, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err = r.reconcileAgent0Connector(ctx, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err = r.reconcileIntelligentEdge(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
 	}
 
 	operatorConfigurationResource := checkResourceResult.Resource.(*dash0v1alpha1.Dash0OperatorConfiguration)
+	logger.Debug("operator configuration resource found, proceeding with reconciliation", "name", operatorConfigurationResource.Name)
+	defer func() {
+		operatorConfigurationResource.LogResourceAsEvent(logger)
+	}()
 
 	stopReconcile, err :=
 		resources.VerifyThatResourceIsUniqueInScope(
@@ -171,7 +182,7 @@ func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctr
 			req,
 			operatorConfigurationResource,
 			updateStatusFailedMessageOperatorConfiguration,
-			&logger,
+			logger,
 		)
 	if err != nil {
 		logger.Error(err, "error in operator configuration resource uniqueness check")
@@ -186,29 +197,26 @@ func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctr
 		r.Client,
 		operatorConfigurationResource,
 		operatorConfigurationResource.Status.Conditions,
-		&logger,
+		logger,
 	); err != nil {
 		logger.Error(err, "error when initializing operator configuration resource status conditions")
 		return ctrl.Result{}, err
 	}
 
-	err = r.handleDash0Authorization(ctx, operatorConfigurationResource, &logger)
-	if err != nil {
-		logger.Error(err, "error when handling the Dash0 authorization information in the operator configuration resource")
-		return ctrl.Result{}, err
-	}
-
 	selfMonitoringConfiguration, err :=
 		selfmonitoringapiaccess.ConvertOperatorConfigurationResourceToSelfMonitoringConfiguration(
+			ctx,
+			r.Client,
+			r.operatorNamespace,
 			operatorConfigurationResource,
-			&logger,
+			logger,
 		)
 	if err != nil {
 		logger.Error(
 			err,
 			"cannot generate self-monitoring configuration from operator configuration resource",
 		)
-		r.oTelSdkStarter.RemoveOTelSdkParameters(ctx, &logger)
+		r.oTelSdkStarter.RemoveOTelSdkParameters(ctx, logger)
 		return ctrl.Result{}, err
 	}
 
@@ -217,83 +225,60 @@ func (r *OperatorConfigurationReconciler) Reconcile(ctx context.Context, req ctr
 		ctx,
 		selfMonitoringConfiguration,
 		operatorConfigurationResource.Spec.ClusterName,
-		&logger,
+		logger,
 	)
 
 	r.applyApiAccessSettings(ctx, operatorConfigurationResource, logger)
 
-	if r.reconcileOpenTelemetryCollector(ctx, &logger) != nil {
+	r.applyInstrumentationDelivery(operatorConfigurationResource, logger)
+
+	if err = r.reconcileOpenTelemetryCollector(ctx, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if r.reconcileOpenTelemetryTargetAllocator(ctx, &logger) != nil {
+	if err = r.reconcileOpenTelemetryTargetAllocator(ctx, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	if err = r.reconcileAgent0Connector(ctx, logger); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err = r.reconcileIntelligentEdge(ctx, logger); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Get(
+		ctx,
+		types.NamespacedName{
+			Namespace: "",
+			Name:      operatorConfigurationResource.Name,
+		},
+		operatorConfigurationResource); err != nil {
+		logger.Error(err, "failed to reload the operator configuration to update its status")
+		return ctrl.Result{}, err
+	}
 	operatorConfigurationResource.EnsureResourceIsMarkedAsAvailable()
 	if err = r.Status().Update(ctx, operatorConfigurationResource); err != nil {
 		logger.Error(err, updateStatusFailedMessageOperatorConfiguration)
 		return ctrl.Result{}, fmt.Errorf("cannot mark the Dash0 operator configuration resource as available: %w", err)
 	}
 
+	logger.Debug("reconciliations triggered by operator configuration were successful")
 	return ctrl.Result{}, nil
-}
-
-func (r *OperatorConfigurationReconciler) handleDash0Authorization(
-	ctx context.Context,
-	operatorConfigurationResource *dash0v1alpha1.Dash0OperatorConfiguration,
-	logger *logr.Logger,
-) error {
-	if operatorConfigurationResource.Spec.Export != nil &&
-		operatorConfigurationResource.Spec.Export.Dash0 != nil {
-		if operatorConfigurationResource.Spec.Export.Dash0.Authorization.SecretRef != nil {
-			// The operator configuration resource uses a secret ref to provide the Dash0 auth token, exchange the secret
-			// ref for an actual token and distribute the token value to all clients that need an auth token.
-			if err := selfmonitoringapiaccess.ExchangeSecretRefForToken(
-				ctx,
-				r.Client,
-				r.authTokenClients,
-				r.operatorNamespace,
-				operatorConfigurationResource,
-				logger,
-			); err != nil {
-				logger.Error(err, "cannot exchange secret ref for token")
-				return err
-			}
-		} else if operatorConfigurationResource.Spec.Export.Dash0.Authorization.Token != nil &&
-			*operatorConfigurationResource.Spec.Export.Dash0.Authorization.Token != "" {
-			// The operator configuration resource uses a token literal to provide the Dash0 auth token, distribute the
-			// token value to all clients that need an auth token.
-			for _, authTokenClient := range r.authTokenClients {
-				authTokenClient.SetAuthToken(ctx, *operatorConfigurationResource.Spec.Export.Dash0.Authorization.Token, logger)
-			}
-		} else {
-			// The operator configuration resource neither has a secret ref nor a token literal, remove the auth token
-			// from all clients.
-			for _, authTokenClient := range r.authTokenClients {
-				authTokenClient.RemoveAuthToken(ctx, logger)
-			}
-		}
-	} else {
-		// The operator configuration resource has no Dash0 export and hence also no auth token, remove the auth token
-		// from all clients.
-		for _, authTokenClient := range r.authTokenClients {
-			authTokenClient.RemoveAuthToken(ctx, logger)
-		}
-	}
-	return nil
 }
 
 func (r *OperatorConfigurationReconciler) applyOperatorManagerSelfMonitoringSettings(
 	ctx context.Context,
 	selfMonitoringAndApiAccessConfiguration selfmonitoringapiaccess.SelfMonitoringConfiguration,
 	clusterName string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	if selfMonitoringAndApiAccessConfiguration.SelfMonitoringEnabled {
 		r.oTelSdkStarter.SetOTelSdkParameters(
 			ctx,
 			selfMonitoringAndApiAccessConfiguration.Export,
+			selfMonitoringAndApiAccessConfiguration.Token,
 			r.pseudoClusterUid,
 			clusterName,
 			r.operatorDeploymentNamespace,
@@ -314,49 +299,120 @@ func (r *OperatorConfigurationReconciler) applyOperatorManagerSelfMonitoringSett
 func (r *OperatorConfigurationReconciler) applyApiAccessSettings(
 	ctx context.Context,
 	operatorConfigurationResource *dash0v1alpha1.Dash0OperatorConfiguration,
-	logger logr.Logger,
+	logger logd.Logger,
 ) {
-	if operatorConfigurationResource.HasDash0ApiAccessConfigured() {
-		dataset := operatorConfigurationResource.Spec.Export.Dash0.Dataset
-		if dataset == "" {
-			dataset = util.DatasetDefault
-		}
+	if !operatorConfigurationResource.HasDash0ApiAccessConfigured() {
+		logger.Warn(
+			"The API endpoint setting required for managing dashboards, check rules, synthetic checks and	 " +
+				"views via the operator is missing or has been removed, the operator will not update these resources " +
+				"in Dash0.",
+		)
 		for _, apiClient := range r.apiClients {
-			apiClient.SetApiEndpointAndDataset(
-				ctx,
-				&ApiConfig{
-					Endpoint: operatorConfigurationResource.Spec.Export.Dash0.ApiEndpoint,
-					Dataset:  dataset,
-				}, &logger)
+			apiClient.RemoveDefaultApiConfigs(ctx, logger)
+		}
+		return
+	}
 
+	exportsWithApiAccess := operatorConfigurationResource.GetDash0ExportsWithApiAccess()
+	var apiConfigs []ApiConfig
+	for idx, dash0Export := range exportsWithApiAccess {
+		dataset := dash0Export.Dataset
+		token, err := selfmonitoringapiaccess.GetAuthTokenForDash0Export(
+			ctx,
+			r.Client,
+			r.operatorNamespace,
+			dash0Export,
+			logger,
+		)
+		if err != nil || token == nil || *token == "" {
+			logger.Error(
+				err,
+				fmt.Sprintf(
+					"The operator could not get the auth token for export #%d (endpoint: %s) or the token was empty. "+
+						"This export will be skipped, but other exports will continue to be processed.",
+					idx+1,
+					dash0Export.ApiEndpoint,
+				),
+			)
+			continue
 		}
-	} else {
-		logger.Info("The API endpoint setting required for managing dashboards, check rules, synthetic checks and	 " +
-			"views via the operator is missing or has been removed, the operator will not update these resources " +
-			"in Dash0.")
+		apiConfigs = append(
+			apiConfigs, ApiConfig{
+				Endpoint: dash0Export.ApiEndpoint,
+				Dataset:  dataset,
+				Token:    *token,
+			},
+		)
+	}
+
+	if len(apiConfigs) == 0 {
+		logger.Warn(
+			"None of the configured exports have valid API access settings. " +
+				"The operator will not update dashboards, check rules, synthetic checks or views in Dash0.",
+		)
 		for _, apiClient := range r.apiClients {
-			apiClient.RemoveApiEndpointAndDataset(ctx, &logger)
+			apiClient.RemoveDefaultApiConfigs(ctx, logger)
 		}
+		return
+	}
+
+	for _, apiClient := range r.apiClients {
+		apiClient.SetDefaultApiConfigs(ctx, apiConfigs, logger)
 	}
 }
 
-func (r *OperatorConfigurationReconciler) removeAllOperatorConfigurationSettings(ctx context.Context, logger logr.Logger) {
+// applyInstrumentationDelivery resolves spec.instrumentWorkloads.instrumentationDelivery against the detected
+// Kubernetes version and stores the result into the clusterInstrumentationConfig.
+func (r *OperatorConfigurationReconciler) applyInstrumentationDelivery(
+	operatorConfigurationResource *dash0v1alpha1.Dash0OperatorConfiguration,
+	logger logd.Logger,
+) {
+	if r.clusterInstrumentationConfig == nil {
+		return
+	}
+	originalDeliverySetting := string(operatorConfigurationResource.Spec.InstrumentWorkloads.InstrumentationDelivery)
+	resolvedDelivery := cluster.ResolveInstrumentationDelivery(
+		originalDeliverySetting,
+		r.clusterInstrumentationConfig.KubernetesVersion,
+		r.clusterInstrumentationConfig.KubernetesVersionDetected,
+		true,
+		logger,
+	)
+	previous := r.clusterInstrumentationConfig.SetInstrumentationDelivery(resolvedDelivery)
+	if previous != resolvedDelivery {
+		logger.Info(
+			"Changed spec.instrumentWorkloads.instrumentationDelivery detected. The new setting will become effective for "+
+				"subsequent workload instrumentations. (Existing instrumented workloads will not be re-instrumented.)",
+			"instrumentation delivery setting in operator configuration", originalDeliverySetting,
+			"previous instrumentation delivery setting", previous,
+			"updated instrumentation delivery setting", resolvedDelivery,
+		)
+	}
+}
+
+func (r *OperatorConfigurationReconciler) removeAllOperatorConfigurationSettings(
+	ctx context.Context,
+	logger logd.Logger,
+) {
 	for _, apiClient := range r.apiClients {
-		apiClient.RemoveApiEndpointAndDataset(ctx, &logger)
+		apiClient.RemoveDefaultApiConfigs(ctx, logger)
 	}
 	r.oTelSdkStarter.RemoveOTelSdkParameters(
 		ctx,
-		&logger,
+		logger,
 	)
-	for _, authTokenClient := range r.authTokenClients {
-		authTokenClient.RemoveAuthToken(ctx, &logger)
-	}
 }
 
 func (r *OperatorConfigurationReconciler) reconcileOpenTelemetryCollector(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
+	if r.collectorManager == nil {
+		// If telemetry collection is disabled via Helm, the collector manager is not initialized.
+		logger.Debug("collector manager is not initialized, possibly due to telemetry collection being disabled, " +
+			"skipping OpenTelemetry collector reconciliation")
+		return nil
+	}
 	if _, err := r.collectorManager.ReconcileOpenTelemetryCollector(
 		ctx,
 	); err != nil {
@@ -368,8 +424,14 @@ func (r *OperatorConfigurationReconciler) reconcileOpenTelemetryCollector(
 
 func (r *OperatorConfigurationReconciler) reconcileOpenTelemetryTargetAllocator(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
+	if r.targetAllocatorManager == nil {
+		// If telemetry collection is disabled via Helm, the target allocator manager is not initialized.
+		logger.Debug("target allocator manager is not initialized, possibly due to telemetry collection being disabled, " +
+			"skipping OpenTelemetry target allocator reconciliation")
+		return nil
+	}
 	logger.Info("Reconciling OpenTelemetry target allocator.")
 	if _, err := r.targetAllocatorManager.ReconcileTargetAllocator(
 		ctx,
@@ -379,4 +441,73 @@ func (r *OperatorConfigurationReconciler) reconcileOpenTelemetryTargetAllocator(
 		return err
 	}
 	return nil
+}
+
+func (r *OperatorConfigurationReconciler) reconcileAgent0Connector(
+	ctx context.Context,
+	logger logd.Logger,
+) error {
+	if r.agent0ConnectorManager == nil {
+		logger.Debug("agent0-connector manager is not initialized, skipping agent0-connector reconciliation")
+		return nil
+	}
+	if _, err := r.agent0ConnectorManager.ReconcileAgent0Connector(
+		ctx,
+		agent0connector.TriggeredByDash0OperatorConfigurationResourceReconcile,
+	); err != nil {
+		logger.Error(err, "Failed to reconcile the agent0-connector resources, requeuing reconcile request.")
+		return err
+	}
+	return nil
+}
+
+func (r *OperatorConfigurationReconciler) reconcileIntelligentEdge(
+	ctx context.Context,
+	logger logd.Logger,
+) error {
+	if r.intelligentEdgeManager == nil {
+		// Intelligent edge feature is disabled via Helm, skip.
+		return nil
+	}
+	if _, err := r.intelligentEdgeManager.Reconcile(ctx); err != nil {
+		logger.Error(err, "Failed to reconcile intelligent edge, requeuing reconcile request.")
+		return err
+	}
+	return nil
+}
+
+// An event filter that ignores changes in the status subresource but reacts on changes to spec, labels and
+// annotations. This is necessary because we update the status subresource when reconciling the resource, and without
+// the filter this would cause another no-op reconcile request.
+//
+// We also allow the transition of the Available condition to True to trigger a reconcile. This is needed because
+// reconcileOpenTelemetryCollector uses amendDeploymentAndDaemonSetWithSelfReferenceUIDs, which can only set the
+// DaemonSet/Deployment UID env var on the second reconcile (after the resource has been created). Without this, the
+// UID-setting reconcile would be deferred until an unrelated spec change triggers a reconcile.
+type operatorConfigurationPredicate struct {
+	predicate.Funcs
+}
+
+func (p operatorConfigurationPredicate) Update(e event.UpdateEvent) bool {
+	if e.ObjectOld == nil || e.ObjectNew == nil {
+		return true
+	}
+
+	oldObj, okOld := e.ObjectOld.(*dash0v1alpha1.Dash0OperatorConfiguration)
+	newObj, okNew := e.ObjectNew.(*dash0v1alpha1.Dash0OperatorConfiguration)
+
+	if !okOld || !okNew {
+		return true
+	}
+
+	if oldObj.DeletionTimestamp == nil && newObj.DeletionTimestamp != nil {
+		return true
+	}
+
+	specChanged := !reflect.DeepEqual(oldObj.Spec, newObj.Spec)
+	labelsChanged := !reflect.DeepEqual(oldObj.Labels, newObj.Labels)
+	annotationsChanged := !reflect.DeepEqual(oldObj.Annotations, newObj.Annotations)
+	availableBecameTrue := util.AvailableConditionBecameTrue(oldObj.Status.Conditions, newObj.Status.Conditions)
+
+	return specChanged || labelsChanged || annotationsChanged || availableBecameTrue
 }

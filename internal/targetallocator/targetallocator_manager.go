@@ -9,13 +9,13 @@ import (
 	"reflect"
 	"sync/atomic"
 
-	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	taresources "github.com/dash0hq/dash0-operator/internal/targetallocator/taresources"
+	"github.com/dash0hq/dash0-operator/internal/targetallocator/taresources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 	"github.com/dash0hq/dash0-operator/internal/util/resources"
 )
 
@@ -52,15 +52,15 @@ func NewTargetAllocatorManager(
 	return m
 }
 
-func (m *TargetAllocatorManager) UpdateExtraConfig(ctx context.Context, newConfig util.ExtraConfig, logger *logr.Logger) {
+func (m *TargetAllocatorManager) UpdateExtraConfig(ctx context.Context, newConfig util.ExtraConfig, logger logd.Logger) {
 	previousConfig := m.extraConfig.Swap(&newConfig)
 	if previousConfig == nil || !reflect.DeepEqual(*previousConfig, newConfig) {
 		hasBeenReconciled, err := m.ReconcileTargetAllocator(ctx, TriggeredByWatchEvent)
 		if err != nil {
-			logger.Error(err, "Failed to create/update collector resources after extra config map update.")
+			logger.ErrorTelemetryCollectionIssue(err, "Failed to create/update target-allocator resources after extra config map update.")
 		}
 		if hasBeenReconciled {
-			logger.Info("successfully reconciled collector resources after extra config map update")
+			logger.Info("successfully reconciled target-allocator resources after extra config map update")
 		}
 	} else {
 		logger.Info("ignoring extra config map update, both the new and the old extra config map have the same content")
@@ -80,12 +80,12 @@ func (m *TargetAllocatorManager) ReconcileTargetAllocator(
 	ctx context.Context,
 	trigger TargetAllocatorReconcileTrigger,
 ) (bool, error) {
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("ReconcileTargetAllocator", "trigger", trigger)
 
 	if m.updateInProgress.Load() {
 		if m.developmentMode {
-			logger.Info("creation/update of the OpenTelemetry collector resources is already in progress, skipping " +
+			logger.Info("creation/update of the OpenTelemetry target-allocator resources is already in progress, skipping " +
 				"additional reconciliation request.")
 		}
 		return false, nil
@@ -95,23 +95,30 @@ func (m *TargetAllocatorManager) ReconcileTargetAllocator(
 		m.updateInProgress.Store(false)
 	}()
 
-	operatorConfigurationResource, err := resources.FindOperatorConfigurationResource(ctx, m.Client, &logger)
+	operatorConfigurationResource, err := resources.FindOperatorConfigurationResource(ctx, m.Client, logger)
 	if err != nil {
 		return false, err
 	}
-	allMonitoringResources, err := resources.FindAllMonitoringResources(ctx, m.Client, &logger)
+	if operatorConfigurationResource != nil {
+		logger.Debug("found operator configuration resource for target allocator reconciliation", "name", operatorConfigurationResource.Name)
+	} else {
+		logger.Debug("no operator configuration resource found for target allocator reconciliation")
+	}
+	allMonitoringResources, err := resources.FindAllMonitoringResources(ctx, m.Client, logger)
 	if err != nil {
 		return false, err
 	}
+	logger.Debug("found monitoring resources for target allocator reconciliation", "count", len(allMonitoringResources))
 
 	namespacesWithPrometheusScraping := make([]string, 0, len(allMonitoringResources))
 	for _, monitoringResource := range allMonitoringResources {
 		namespace := monitoringResource.Namespace
-		if util.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
+		if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
 			namespacesWithPrometheusScraping = append(namespacesWithPrometheusScraping, namespace)
 		}
 	}
 	hasPrometheusScrapingEnabledForAtLeastOneNamespace := len(namespacesWithPrometheusScraping) > 0
+	logger.Debug("determined namespaces with Prometheus scraping enabled", "namespaces", namespacesWithPrometheusScraping)
 
 	extraConfig := m.extraConfig.Load()
 	if extraConfig == nil {
@@ -123,37 +130,37 @@ func (m *TargetAllocatorManager) ReconcileTargetAllocator(
 			"target-allocator will be created, the existing Dash0 OpenTelemetry target-allocator (if present) will " +
 			"be removed.",
 		)
-		err = m.removeTargetAllocator(ctx, *extraConfig, &logger)
+		err = m.removeTargetAllocator(ctx, *extraConfig, logger)
 		return err == nil, err
 	}
 
-	if !util.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.TelemetryCollection.Enabled, true) {
+	if !pointers.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.TelemetryCollection.Enabled, true) {
 		logger.Info(
 			fmt.Sprintf("Telemetry collection has been disabled explicitly via the operator configuration "+
 				"resource (\"%s\"), property telemetryCollection.enabled=false, no Dash0 OpenTelemetry target-allocator "+
 				"will be created, the existing Dash0 OpenTelemetry target-allocator (if present) will be removed.",
 				operatorConfigurationResource.Name),
 		)
-		err = m.removeTargetAllocator(ctx, *extraConfig, &logger)
+		err = m.removeTargetAllocator(ctx, *extraConfig, logger)
 		return err == nil, err
-	} else if !util.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.PrometheusCrdSupport.Enabled, false) {
+	} else if !pointers.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.PrometheusCrdSupport.Enabled, false) {
 		logger.Info(
 			fmt.Sprintf("Support for Prometheus CRDs has been disabled explicitly via the operator configuration "+
 				"resource (\"%s\"), property prometheusCrdSupport.enabled=false, no Dash0 OpenTelemetry target-allocator "+
 				"will be created, the existing Dash0 OpenTelemetry target-allocator (if present) will be removed.",
 				operatorConfigurationResource.Name),
 		)
-		err = m.removeTargetAllocator(ctx, *extraConfig, &logger)
+		err = m.removeTargetAllocator(ctx, *extraConfig, logger)
 		return err == nil, err
 	} else if !hasPrometheusScrapingEnabledForAtLeastOneNamespace {
-		logger.Info(
+		logger.Warn(
 			fmt.Sprintf("Support for Prometheus CRDs has been enabled explicitly via the operator configuration "+
 				"resource (\"%s\"), property prometheusCrdSupport.enabled=true, but not a single namespace has "+
 				"`prometheusScraping.enabled` via the Dash0Monitoring resource. No Dash0 OpenTelemetry target-allocator "+
 				"will be created, the existing Dash0 OpenTelemetry target-allocator (if present) will be removed.",
 				operatorConfigurationResource.Name),
 		)
-		err = m.removeTargetAllocator(ctx, *extraConfig, &logger)
+		err = m.removeTargetAllocator(ctx, *extraConfig, logger)
 		return err == nil, err
 	} else {
 		logger.Info(
@@ -165,7 +172,7 @@ func (m *TargetAllocatorManager) ReconcileTargetAllocator(
 			ctx,
 			namespacesWithPrometheusScraping,
 			*extraConfig,
-			&logger,
+			logger,
 		)
 		return err == nil, err
 	}
@@ -175,7 +182,7 @@ func (m *TargetAllocatorManager) createOrUpdateTargetAllocator(
 	ctx context.Context,
 	namespacesWithPrometheusScraping []string,
 	extraConfig util.ExtraConfig,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	resourcesHaveBeenCreated, resourcesHaveBeenUpdated, err :=
 		m.targetAllocatorResourceManager.CreateOrUpdateTargetAllocatorResources(
@@ -185,7 +192,7 @@ func (m *TargetAllocatorManager) createOrUpdateTargetAllocator(
 			logger)
 
 	if err != nil {
-		logger.Error(
+		logger.ErrorTelemetryCollectionIssue(
 			err,
 			"failed to create one or more of the OpenTelemetry target-allocator resources, "+
 				"support for Prometheus CRDs might not work",
@@ -199,6 +206,8 @@ func (m *TargetAllocatorManager) createOrUpdateTargetAllocator(
 		logger.Info("OpenTelemetry target-allocator Kubernetes resources have been created.")
 	} else if resourcesHaveBeenUpdated {
 		logger.Info("OpenTelemetry target-allocator Kubernetes resources have been updated.")
+	} else {
+		logger.Debug("OpenTelemetry target-allocator Kubernetes resources are already up to date, no changes required")
 	}
 
 	return nil
@@ -207,7 +216,7 @@ func (m *TargetAllocatorManager) createOrUpdateTargetAllocator(
 func (m *TargetAllocatorManager) removeTargetAllocator(
 	ctx context.Context,
 	extraConfig util.ExtraConfig,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	resourcesHaveBeenDeleted, err := m.targetAllocatorResourceManager.DeleteResources(
 		ctx,
@@ -217,12 +226,14 @@ func (m *TargetAllocatorManager) removeTargetAllocator(
 	if err != nil {
 		logger.Error(
 			err,
-			"Failed to delete the OpenTelemetry collector Kubernetes resources, requeuing reconcile request.",
+			"Failed to delete the OpenTelemetry target-allocator Kubernetes resources, requeuing reconcile request.",
 		)
 		return err
 	}
 	if resourcesHaveBeenDeleted {
-		logger.Info("OpenTelemetry collector Kubernetes resources have been deleted.")
+		logger.Info("OpenTelemetry target-allocator Kubernetes resources have been deleted.")
+	} else {
+		logger.Debug("no OpenTelemetry target-allocator Kubernetes resources to delete")
 	}
 	return nil
 }

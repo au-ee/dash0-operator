@@ -46,6 +46,10 @@ const (
 	FilelogOffsetSyncImageTest            = "some-registry.com:1234/dash0hq/filelog-offset-sync:13.14.15"
 	FilelogOffsetVolumeOwnershipImageTest = "some-registry.com:1234/dash0hq/filelog-offset-volume-ownership:16.17.18"
 
+	OperatorWebhookServiceName              = "dash0-operator-webhook-service"
+	OperatorWebhookServicePort        int32 = 443
+	OperatorConfigurationResourceName       = "dash0-operator-configuration-test"
+
 	OTelCollectorNodeLocalBaseUrlTest = "http://$(DASH0_NODE_IP):40318"
 	OTelCollectorServiceBaseUrlTest   = //
 	"http://unit-test-opentelemetry-collector-service.test-operator-namespace.svc.cluster.local:4318"
@@ -57,12 +61,23 @@ const (
 	EndpointGrpcWithProtocolTest  = "dns://endpoint.backend.com:4317"
 	EndpointHttpTest              = "https://endpoint.backend.com:4318"
 
-	ApiEndpointTest   = "https://api.dash0.com"
-	DatasetCustomTest = "test-dataset"
+	ApiEndpointTest                        = "https://api.dash0.com"
+	ApiEndpointStandardizedTest            = "https://api.dash0.com/"
+	ApiEndpointTestAlternative             = "https://api-alt.dash0.com"
+	ApiEndpointStandardizedTestAlternative = "https://api-alt.dash0.com/"
+	DatasetCustomTest                      = "test-dataset"
+	DatasetCustomTestAlternative           = "test-dataset-alt"
+
+	Agent0ConnectorServerAddress = "api.dash0.com:8022"
 )
 
 var (
-	AuthorizationDefaultEnvVar         = "OTELCOL_AUTH_TOKEN_DEFAULT"
+	PossibleCollectorUrlsTest = util.PossibleCollectorUrls{
+		NodeLocalBaseUrl: OTelCollectorNodeLocalBaseUrlTest,
+		ServiceBaseUrl:   OTelCollectorServiceBaseUrlTest,
+	}
+
+	AuthorizationDefaultEnvVar         = "OTELCOL_AUTH_TOKEN_DEFAULT_0"
 	AuthorizationTokenTest             = "authorization-token-test"
 	AuthorizationHeaderTest            = fmt.Sprintf("Bearer %s", AuthorizationTokenTest)
 	AuthorizationTokenTestAlternative  = "authorization-token-test-alternative"
@@ -129,6 +144,12 @@ func Dash0ExportWithEndpointAndToken() *dash0common.Export {
 	}
 }
 
+func Dash0ExportsWithEndpointAndTokenSingle() []dash0common.Export {
+	return []dash0common.Export{
+		*Dash0ExportWithEndpointAndToken(),
+	}
+}
+
 func Dash0ExportWithEndpointTokenAndCustomDataset() *dash0common.Export {
 	return &dash0common.Export{
 		Dash0: &dash0common.Dash0Configuration{
@@ -137,6 +158,19 @@ func Dash0ExportWithEndpointTokenAndCustomDataset() *dash0common.Export {
 			Authorization: dash0common.Authorization{
 				Token: &AuthorizationTokenTest,
 			},
+		},
+	}
+}
+
+func Dash0ExportWithEndpointTokenAndCustomDatasetAndApiEndpoint() *dash0common.Export {
+	return &dash0common.Export{
+		Dash0: &dash0common.Dash0Configuration{
+			Endpoint: EndpointDash0Test,
+			Dataset:  DatasetCustomTest,
+			Authorization: dash0common.Authorization{
+				Token: &AuthorizationTokenTest,
+			},
+			ApiEndpoint: ApiEndpointTest,
 		},
 	}
 }

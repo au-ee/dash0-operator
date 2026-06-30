@@ -29,6 +29,7 @@ import (
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/cluster"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -46,8 +47,9 @@ var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	operatorConfigurationMutatingWebhookHandler *OperatorConfigurationMutatingWebhookHandler
-	monitoringMutatingWebhookHandler            *MonitoringMutatingWebhookHandler
+	operatorConfigurationMutatingWebhookHandler   *OperatorConfigurationMutatingWebhookHandler
+	operatorConfigurationValidationWebhookHandler *OperatorConfigurationValidationWebhookHandler
+	monitoringMutatingWebhookHandler              *MonitoringMutatingWebhookHandler
 )
 
 func TestWebhook(t *testing.T) {
@@ -126,9 +128,12 @@ var _ = BeforeSuite(func() {
 		manager.GetEventRecorder("dash0-webhook"),
 		util.NewClusterInstrumentationConfig(
 			TestImages,
+			PossibleCollectorUrlsTest,
 			OTelCollectorNodeLocalBaseUrlTest,
 			util.ExtraConfigDefaults,
+			cluster.ResolvedInstrumentationDeliveryInitContainer,
 			nil,
+			false,
 			false,
 		),
 	).SetupWebhookWithManager(manager)).To(Succeed())
@@ -136,14 +141,16 @@ var _ = BeforeSuite(func() {
 	operatorConfigurationMutatingWebhookHandler = NewOperatorConfigurationMutatingWebhookHandler(k8sClient)
 	Expect(operatorConfigurationMutatingWebhookHandler.SetupWebhookWithManager(manager)).To(Succeed())
 
-	Expect(NewOperatorConfigurationValidationWebhookHandler(k8sClient).SetupWebhookWithManager(manager)).To(Succeed())
+	operatorConfigurationValidationWebhookHandler = NewOperatorConfigurationValidationWebhookHandler(k8sClient, true)
+	Expect(operatorConfigurationValidationWebhookHandler.SetupWebhookWithManager(manager)).To(Succeed())
 
 	Expect(SetupDash0MonitoringConversionWebhookWithManager(manager)).To(Succeed())
 
 	monitoringMutatingWebhookHandler = NewMonitoringMutatingWebhookHandler(k8sClient, OperatorNamespace)
 	Expect(monitoringMutatingWebhookHandler.SetupWebhookWithManager(manager)).To(Succeed())
 
-	Expect(NewMonitoringValidationWebhookHandler(k8sClient).SetupWebhookWithManager(manager)).To(Succeed())
+	Expect(NewMonitoringValidationWebhookHandler(k8sClient, OperatorNamespace).
+		SetupWebhookWithManager(manager)).To(Succeed())
 
 	//+kubebuilder:scaffold:webhook
 

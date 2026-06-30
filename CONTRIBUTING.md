@@ -3,7 +3,8 @@ Contributing
 
 ## Prerequisites
 
-- Go (version >= v1.25)
+- Signing the [Contributor License Agreement](https://github.com/cla-assistant/cla-assistant)
+- Go (version >= v1.26)
 - Docker
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
@@ -189,11 +190,13 @@ Moving beyond the quickstart instructions, here are more details on the test scr
       will refuse to deploy to/delete from any context not on this list. This is a protection against accidentally
       deploying something to or deleting something from a production Kubernetes context.
       It is recommended to set this in `test-resources/.env`.
+    * `AUTO_MONITOR_NAMESPACES_ENABLED`: Set this to "true" to have the operator automatically monitor all namespaces.
+      Using `test-scenario-08-auto-namespace-monitoring.sh` implies `AUTO_MONITOR_NAMESPACES_ENABLED=true`.
     * `COLLECT_POD_LABELS_AND_ANNOTATIONS_ENABLED`: Set this to "false" to disable collecting pod labels and annotations
       as resource attributes.
       This defaults to `$TELEMETRY_COLLECTION_ENABLED`, which in turn defaults to "true".
     * `COLLECTOR_ENABLE_PPROF`: Set to "true" to enable the pprof extension in the collector containers.
-      See <helm-chart/dash0-operator/README.md#create-heap-profiles> for instructions for creating heap profiles.
+      See [Creatig Heap Profiles](helm-chart/dash0-operator/docs/troubleshooting.md#create-heap-profiles) for instructions on creating heap profiles.
     * `DASH0_API_ENDPOINT`: The endpoint for API requests (for synchronizing Perses dashboards, Prometheus check rules,
       synthetic checks and views). It is recommended to set this in `test-resources/.env`.
     * `DASH0_AUTHORIZATION_TOKEN`: The authorization token for sending telemetry to the Dash0 ingress endpoint and
@@ -213,12 +216,11 @@ Moving beyond the quickstart instructions, here are more details on the test scr
     * `DEPLOY_MONITORING_RESOURCE`: Set this to "false" to skip deploying the Dash0 monitoring resource to the test
       namespace.
       This is assumed to be "true" by default.
-    * `DEPLOY_OPERATOR_CONFIGURATION_VIA_HELM`: Omit the Helm settings to have the operator's Helm chart deploy the
-      Dash0 operator configuration resource (aka auto configuration resource) automatically at operator manager startup.
-      This is assumed to be "true" by default.
-    * `DEPLOY_PERSES_DASHBOARD`: Set to "true" to deploy a Perses dashboard resource that will be synchronized to Dash0
-      via the Dash0 API.
-      This defaults to "false".
+    * `DEPLOY_OPERATOR_CONFIGURATION_VIA_HELM`: Set this to "false" to omit the Helm settings which make the operator
+      deploy the Dash0 operator configuration resource (aka auto configuration resource) automatically at startup.
+      This defaults to "true".
+    * `DEPLOY_PERSES_DASHBOARD`: Set to "v1alpha2" or "v1alpha1" to deploy a Perses dashboard resource that will be
+      synchronized to Dash0 via the Dash0 API. This defaults to "false". Use "true" to deploy the latest version.
     * `DEPLOY_PROMETHEUS_RULE`: Set to "true" to deploy Prometheus rule resource that will be synchronized to Dash0 via
       the Dash0 API.
       This defaults to "false".
@@ -227,13 +229,21 @@ Moving beyond the quickstart instructions, here are more details on the test scr
       This defaults to "false".
     * `DEPLOY_VIEW`: Set to "true" to deploy a view resource that will be synchronized to Dash0 via the Dash0 API.
       This defaults to "false".
+    * `DEPLOY_SPAM_FILTER`: Set to "true" to deploy a spam filter resource that will be synchronized to Dash0 via the Dash0 API.
+      This defaults to "false".
+    * `DEPLOY_NOTIFICATION_CHANNEL`: Set to the name of one of the example files in
+    `test-resources/customresources/dash0notificationchannel` to deploy a notification channel resource that will be
+    synchronized to Dash0 via the Dash0 API. E.g. `DEPLOY_NOTIFICATION_CHANNEL=slack` will deploy `slack.yaml`.
+    This defaults to being empty, which means no resource will be deployed.
+    * `DEPLOY_SIGNAL_TO_METRICS`: Set to the name of one of the example files in
+    `test-resources/customresources/dash0signaltometrics` to deploy a signal-to-metrics resource that will be
+    synchronized to Dash0 via the Dash0 API. E.g. `DEPLOY_SIGNAL_TO_METRICS=spans` will deploy `spans.yaml`.
+    This defaults to being empty, which means no resource will be deployed.
     * `FILELOG_OFFSETS_PVC`: Use a persistent volume claim to store filelog offsets, instead of the default config map
       based storage. Possible values:
         * `FILELOG_OFFSETS_PVC=kind`: deploy a PersistentVolume and PersistentVolumeClaim suitable for kind clusters
           created via test-resources/bin/create_cluster_and_registry.sh or based on `test-resources/kind-config.yaml`
           (i.e. clusters that have the `offset-storage` extra mounts), then use this for filelog offset storage
-        * `FILELOG_OFFSETS_PVC=docker`: deploy a StorageClass and PersistentVolumeClaim suitable for Docker Desktop,
-          then use this for filelog offset storage
         * `FILELOG_OFFSETS_PVC=gke`: deploy a PersistentVolumeClaim suitable for GCP GKE clusters, then use this for
           filelog offset storage
         * `FILELOG_OFFSETS_PVC=aws-efs-dp`: deploy a StorageClass and PersistentVolumeClaim suitable for an AWS EKS
@@ -260,14 +270,24 @@ Moving beyond the quickstart instructions, here are more details on the test scr
     * `OPERATOR_HELM_CHART`: The name of the Helm chart to use for deploying the operator. Defaults to the local Helm
       chart sources in `helm-chart/dash0-operator`.
     * `OPERATOR_MANAGER_PPROF_PORT`: Set this to a numeric value to enable pprof in the operator manager container.
-      See <helm-chart/dash0-operator/README.md#create-heap-profiles> for instructions for creating heap profiles.
+      See [Creating Heap Profiles](helm-chart/dash0-operator/docs/troubleshooting.md#create-heap-profiles) for instructions on creating heap profiles.
     * `OTEL_COLLECTOR_DEBUG_VERBOSITY_DETAILED`: Add a debug exporter to the OTel collectors with `verbosity: detailed`.
-    * `OTEL_COLLECTOR_SEND_BATCH_MAX_SIZE`: Set the `send_batch_max_size parameter` of the batch processor of the
+    * `OTEL_COLLECTOR_SEND_BATCH_SIZE`: Set the `send_batch_size` parameter of the batch processor of the collectors
+      managed by the operator. There is usually no need to configure this. The default value used by the batch processor
+      is 8192.
+    * `OTEL_COLLECTOR_SEND_BATCH_MAX_SIZE`: Set the `send_batch_max_size` parameter of the batch processor of the
       collectors managed by the operator. There is usually no need to configure this. The value must be greater than or
       equal to 8192, which is the default value for `send_batch_size`.
+    * `PROFILING_ENABLED`: Set this to "true" to enable profiling data pipelines in the operator's OpenTelemetry
+      collectors. When enabled, the daemonset collector will accept, process, and export OTLP profiles data.
+      See [PROFILING](helm-chart/dash0-operator/docs/profiling.md) for more details.
+      This defaults to "false".
     * `PROMETHEUS_SCRAPING_ENABLED`: Set this to "false" to disable Prometheus scraping in the test namespace via the
       monitoring resource.
       This defaults to `$TELEMETRY_COLLECTION_ENABLED`, which in turn defaults to "true".
+    * `PROMETHEUS_CRD_SUPPORT_ENABLED`: Set this to `true` to enable support for Prometheus CRDs (e.g. ServiceMonitor).
+      If at least one namespace has a monitoring resource with Prometheus scraping enabled, the OpenTelemetry
+      target-allocator will be deployed.
     * `SELF_MONITORING_ENABLED`: Set this to "false" to disable the operator's self monitoring.
       This defaults to "true".
     * `SYNCHRONIZE_PERSES_DASHBOARDS`: Set this to "false" to disable synchronizing Perses dashboard resources via the
@@ -277,7 +297,7 @@ Moving beyond the quickstart instructions, here are more details on the test scr
       Dash0 API.
       This defaults to "true".
     * `TELEMETRY_COLLECTION_ENABLED`: Set this to "false" to instruct the operator to not deploy OpenTelemetry
-      collectors.
+      collectors and the target allocator.
       This defaults to "true".
     * `USE_CERT_MANAGER`: Set this to "true" to have the operator use cert-manager to manage TLS certificates, instead
       of generating certificates on the fly during Helm install.
@@ -292,6 +312,15 @@ Moving beyond the quickstart instructions, here are more details on the test scr
       The default is to use the secret ref.
       This setting is used in both modes, that is, independent of whether `DEPLOY_OPERATOR_CONFIGURATION_VIA_HELM=false`
       has been provided.
+    * `ALLOW_MORE_TIME_FOR_COLLECTOR_STARTUP` set to `true` increases the `failureThreshold` for the startup probes of
+      collectors to support slower environments (e.g. running kind with limited resources).
+    * `USE_MULTI_CAST` set to `true` to deploy
+      `test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.multi.yaml.template`
+      which has two Dash0 exports with different datasets and tokens. Note: Setting this only makes sense when also
+      setting `DEPLOY_OPERATOR_CONFIGURATION_VIA_HELM="false"` and defining `DASH0_SECOND_DATASET` and
+      `DASH0_SECOND_AUTHORIZATION_TOKEN`.
+    * `DASH0_SECOND_DATASET` the dataset of the second Dash0 export (when using `USE_MULTI_CAST`)
+    * `DASH0_SECOND_AUTHORIZATION_TOKEN` the auth token for the second Dash0 export (when using `USE_MULTI_CAST`)
     * Additional configuration for the Helm deployment can be put into `test-resources/bin/extra-values.yaml` (create
       the file if necessary).
 * Last but not least, there are a couple of environment variables that control which images are built and used, and whether
@@ -421,6 +450,7 @@ OPERATOR_HELM_CHART=dash0-operator/dash0-operator \
 ```
 
 When running with a remote Helm chart like this, the images from the chart are used by default, instead of local images.
+Running the end-to-end tests against a specific version of the Helm chart is not supported.
 
 When an end-to-end test case fails, the test suite automatically collects pod descriptions, config maps and pod logs
 from the Kubernetes cluster at the time of the failure.
@@ -481,7 +511,7 @@ architecture of the machine running `make build-all-push-all-test-e2e` and the c
 
 Assuming worloads in the cluster can be reached, running the end-to-end tests can be done as follows:
 
-**With locally build images and the local Helm chart:**
+**With locally built images and the local Helm chart:**
 
 These require a remote registry that you can push to, which is network-reachable from the test cluster.
 If the registry requires authentication, additional steps are necessary.
@@ -511,3 +541,23 @@ new volumes etc.), we need to make sure that previously instrumented workloads a
 be accompanied by corresponding tests (for example new test cases in `workload_modifier_test.go`, see the test suite
 `"when updating instrumentation from 0.5.1 to 0.6.0"` in commit 300a765a64a42d98dcc6d9a66dccc534b610ab65 for an
 example).
+
+## Intelligent Edge Development
+
+### Prerequisites
+
+- IE images are currently not publicly available, for this reason, access to a private container registry that
+serves these images is required.
+
+Hint: Alternatively, follow `test-resources/intelligentedge/README.md` to build and push the images (requires access
+to the source code).
+
+### Testing
+
+- Set `IMAGE_REPOSITORY_PREFIX` to a repo containing the images or set the individual images explicitly via helm values.
+- Install the operator helm chart with `operator.intelligentEdge.enabled=true`
+  - This will instruct helm to set the right collector image and also install the IE CRDs.
+- You can now create a `Dash0IntelligentEdge` CR and add `Dash0SamplingRule`s.
+
+A test scenario is available in [test-resources/bin/test-scenario-10-intelligent-edge.sh](test-resources/bin/test-scenario-10-intelligent-edge.sh)
+and example sampling rules can be found in [test-resources/customresources/dash0samplingrule](test-resources/customresources/dash0samplingrule).

@@ -5,6 +5,7 @@ package e2e
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,19 +15,23 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
+	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 type dash0OperatorConfigurationValues struct {
-	SelfMonitoringEnabled      bool
-	Endpoint                   string
-	Token                      string
-	ApiEndpoint                string
-	ClusterName                string
-	TelemetryCollectionEnabled bool
+	SelfMonitoringEnabled          bool
+	Endpoint                       string
+	Token                          string
+	ApiEndpoint                    string
+	ClusterName                    string
+	TelemetryCollectionEnabled     bool
+	AutoNamespaceMonitoringEnabled bool
 }
 
 const (
@@ -90,7 +95,7 @@ func deployRenderedOperatorConfigurationResourceWithRetry(
 	}()
 	By(fmt.Sprintf(
 		"deploying the Dash0 operator configuration resource with values %v", dash0OperatorConfigurationValues))
-	retryLogger := zap.New()
+	retryLogger := logd.NewLogger(zap.New())
 	err := util.RetryWithCustomBackoff("deploying the Dash0 operator configuration resource", func() error {
 		return runAndIgnoreOutput(exec.Command(
 			"kubectl",
@@ -105,7 +110,7 @@ func deployRenderedOperatorConfigurationResourceWithRetry(
 		},
 		true,
 		true,
-		&retryLogger,
+		retryLogger,
 	)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -119,20 +124,33 @@ func deployRenderedOperatorConfigurationResourceWithRetry(
 }
 
 func waitForOperatorConfigurationResourceToBecomeAvailable() {
-	By("waiting for the Dash0 operator configuration resource to become available")
+	waitForOperatorConfigurationResourceWithNameToBecomeAvailable(dash0OperatorConfigurationResourceName)
+}
+
+func waitForAutoOperatorConfigurationResourceToBecomeAvailable() {
+	waitForOperatorConfigurationResourceWithNameToBecomeAvailable(util.OperatorConfigurationAutoResourceName)
+}
+
+func waitForOperatorConfigurationResourceWithNameToBecomeAvailable(operatorConfigurationResourceName string) {
+	By(
+		fmt.Sprintf("waiting for the Dash0 operator configuration resource %s to become available",
+			operatorConfigurationResourceName,
+		))
 	Eventually(func(g Gomega) {
 		g.Expect(
 			runAndIgnoreOutput(exec.Command(
 				"kubectl",
 				"get",
-				"dash0operatorconfigurations.operator.dash0.com/dash0-operator-configuration-resource-e2e",
+				"Dash0OperatorConfiguration",
+				operatorConfigurationResourceName,
 			))).To(Succeed())
 	}, 60*time.Second, 1*time.Second).Should(Succeed())
 	Expect(
 		runAndIgnoreOutput(exec.Command(
 			"kubectl",
 			"wait",
-			"dash0operatorconfigurations.operator.dash0.com/dash0-operator-configuration-resource-e2e",
+			"Dash0OperatorConfiguration",
+			operatorConfigurationResourceName,
 			"--for",
 			"condition=Available",
 			"--timeout",
@@ -140,22 +158,87 @@ func waitForOperatorConfigurationResourceToBecomeAvailable() {
 		))).To(Succeed())
 }
 
-func updateEndpointOfDash0OperatorConfigurationResource(
+func loadOperatorConfigurationResource(
+	g Gomega,
+	operatorConfigurationResourceName string,
+) dash0v1alpha1.Dash0OperatorConfiguration {
+	output, err := run(exec.Command(
+		"kubectl",
+		"get",
+		"Dash0OperatorConfiguration",
+		operatorConfigurationResourceName,
+		"-o",
+		"json",
+	))
+	g.Expect(err).NotTo(HaveOccurred())
+	operatorConfiguration := dash0v1alpha1.Dash0OperatorConfiguration{}
+	g.Expect(json.Unmarshal([]byte(output), &operatorConfiguration)).To(Succeed())
+	return operatorConfiguration
+}
+
+func verifyThatAllTelemetrySettingsAreDisabledInOperatorConfiguration(
+	g Gomega,
+	operatorConfiguration dash0v1alpha1.Dash0OperatorConfiguration,
+) {
+	spec := operatorConfiguration.Spec
+	g.Expect(spec.TelemetryCollection.Enabled).ToNot(BeNil())
+	g.Expect(*spec.TelemetryCollection.Enabled).To(BeFalse())
+	g.Expect(spec.SelfMonitoring.Enabled).ToNot(BeNil())
+	g.Expect(*spec.SelfMonitoring.Enabled).To(BeFalse())
+	g.Expect(spec.KubernetesInfrastructureMetricsCollection.Enabled).ToNot(BeNil())
+	g.Expect(*spec.KubernetesInfrastructureMetricsCollection.Enabled).To(BeFalse())
+	g.Expect(spec.CollectPodLabelsAndAnnotations.Enabled).ToNot(BeNil())
+	g.Expect(*spec.CollectPodLabelsAndAnnotations.Enabled).To(BeFalse())
+	g.Expect(spec.CollectNamespaceLabelsAndAnnotations.Enabled).ToNot(BeNil())
+	g.Expect(*spec.CollectNamespaceLabelsAndAnnotations.Enabled).To(BeFalse())
+	g.Expect(spec.PrometheusCrdSupport.Enabled).ToNot(BeNil())
+	g.Expect(*spec.PrometheusCrdSupport.Enabled).To(BeFalse())
+	g.Expect(spec.Profiling.Enabled).ToNot(BeNil())
+	g.Expect(*spec.Profiling.Enabled).To(BeFalse())
+}
+
+func updateOperatorConfigurationExportEndpoint(
 	newEndpoint string,
 ) {
-	updateDash0OperatorConfigurationResource(
-		fmt.Sprintf(`
-{
-  "spec": {
-    "export": {
-      "dash0": {
-        "endpoint": "%s"
-      }
-    }
-   }
+	jsonPatch := fmt.Sprintf(`[{
+    "op":"replace",
+    "path":"/spec/exports/0/dash0/endpoint",
+    "value":"%s"
+	}]`, newEndpoint)
+	updateDash0OperatorConfigurationResource(jsonPatch)
 }
-`, newEndpoint),
-	)
+
+func updateOperatorConfigurationAutoNamespaceMonitoringLabelSelector(
+	newLabelSelector string,
+) {
+	jsonPatch := fmt.Sprintf(`[{
+   "op":"replace",
+   "path":"/spec/autoMonitorNamespaces/labelSelector",
+   "value":"%s"
+	}]`, newLabelSelector)
+	updateDash0OperatorConfigurationResource(jsonPatch)
+}
+
+func updateOperatorConfigurationAutoNamespaceMonitoringEnabled(
+	enabled bool,
+) {
+	jsonPatch := fmt.Sprintf(`[{
+   "op":"replace",
+   "path":"/spec/autoMonitorNamespaces/enabled",
+   "value":%t
+	}]`, enabled)
+	updateDash0OperatorConfigurationResource(jsonPatch)
+}
+
+func updateOperatorConfigurationMonitoringTemplateInstrumentWorkloadsMode(
+	newInstrumentWorkloadsMode dash0common.InstrumentWorkloadsMode,
+) {
+	jsonPatch := fmt.Sprintf(`[{
+   "op":"replace",
+   "path":"/spec/monitoringTemplate/spec/instrumentWorkloads/mode",
+   "value":"%s"
+	}]`, newInstrumentWorkloadsMode)
+	updateDash0OperatorConfigurationResource(jsonPatch)
 }
 
 func updateDash0OperatorConfigurationResource(
@@ -168,7 +251,7 @@ func updateDash0OperatorConfigurationResource(
 			"Dash0OperatorConfiguration",
 			dash0OperatorConfigurationResourceName,
 			"--type",
-			"merge",
+			"json",
 			"-p",
 			jsonPatch,
 		))).To(Succeed())

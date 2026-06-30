@@ -14,20 +14,24 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
+	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/internal_/filter/filterottl"
 	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/processor/transformprocessor/internal_/common"
 	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/processor/transformprocessor/internal_/logs"
 	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/processor/transformprocessor/internal_/metrics"
+	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/processor/transformprocessor/internal_/profiles"
 	"github.com/dash0hq/dash0-operator/internal/webhooks/vendored/opentelemetry-collector-contrib/processor/transformprocessor/internal_/traces"
 )
 
@@ -35,23 +39,26 @@ const ErrorMessageMonitoringGrpcExportInvalidInsecure = "The provided Dash0 moni
 	"explicitly enabled for the GRPC export. This is an invalid combination. " +
 	"Please set at most one of these two flags to true."
 
+const ErrorMessageMonitoringExportAndExportsAreMutuallyExclusive = "The provided Dash0 monitoring resource has both the " +
+	"deprecated `export` and the `exports` field set. These fields are mutually exclusive. Please use only the " +
+	"`exports` field and remove the `export` field."
+
 type MonitoringValidationWebhookHandler struct {
-	Client client.Client
+	Client            client.Client
+	operatorNamespace string
 }
 
 func NewMonitoringValidationWebhookHandler(
 	k8sClient client.Client,
+	operatorNamespace string,
 ) *MonitoringValidationWebhookHandler {
 	return &MonitoringValidationWebhookHandler{
-		Client: k8sClient,
+		Client:            k8sClient,
+		operatorNamespace: operatorNamespace,
 	}
 }
 
 var (
-	restrictedNamespaces = []string{
-		"kube-system",
-		"kube-node-lease",
-	}
 	// See https://opentelemetry.io/docs/languages/sdk-configuration/general/#otel_propagators.
 	validTraceContextPropagators = []string{
 		"tracecontext",
@@ -83,59 +90,168 @@ func (h *MonitoringValidationWebhookHandler) Handle(ctx context.Context, request
 	// Note: The mutating webhook is called before the validating webhook, so we can assume the resource has already
 	// been normalized by the mutating webhook.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#admission-control-phases.
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	monitoringResource := &dash0v1beta1.Dash0Monitoring{}
 	if _, _, err := decoder.Decode(request.Object.Raw, nil, monitoringResource); err != nil {
-		logger.Info("rejecting invalid monitoring resource", "error", err)
+		logger.Warn("rejecting invalid monitoring resource", "error", err)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
+	if request.Operation == admissionv1.Update {
+		if !slices.Contains(monitoringResource.Finalizers, dash0common.MonitoringFinalizerId) {
+			// Always allow requests that remove the finalizer. Otherwise, we might accidentally block removing a manually
+			// managed monitoring resource from a namespace that is enabled for auto-namespace monitoring.
+			return admission.Allowed("")
+		}
+	}
+
 	instrumentWorkloadsMode := monitoringResource.Spec.InstrumentWorkloads.Mode
-	if slices.Contains(restrictedNamespaces, request.Namespace) && instrumentWorkloadsMode != dash0common.InstrumentWorkloadsModeNone {
-		return admission.Denied(
-			fmt.Sprintf(
-				"Rejecting the deployment of Dash0 monitoring resource \"%s\" to the Kubernetes system namespace "+
-					"\"%s\" with instrumentWorkloads.mode=%s, use instrumentWorkloads.mode=none instead.",
-				request.Name,
-				request.Namespace,
-				instrumentWorkloadsMode,
-			))
+	if slices.Contains(util.RestrictedNamespaces, request.Namespace) && instrumentWorkloadsMode != dash0common.InstrumentWorkloadsModeNone {
+		msg := fmt.Sprintf(
+			"Rejecting the deployment of Dash0 monitoring resource \"%s\" to the Kubernetes system namespace "+
+				"\"%s\" with instrumentWorkloads.mode=%s, use instrumentWorkloads.mode=none instead.",
+			request.Name,
+			request.Namespace,
+			instrumentWorkloadsMode,
+		)
+		logger.Warn(msg)
+		return admission.Denied(msg)
+	}
+	if request.Namespace == h.operatorNamespace && instrumentWorkloadsMode != dash0common.InstrumentWorkloadsModeNone {
+		msg := fmt.Sprintf(
+			"Rejecting the deployment of Dash0 monitoring resource \"%s\" to the Dash0 operator namespace "+
+				"\"%s\" with instrumentWorkloads.mode=%s, use instrumentWorkloads.mode=none instead.",
+			request.Name,
+			request.Namespace,
+			instrumentWorkloadsMode,
+		)
+		logger.Warn(msg)
+		return admission.Denied(msg)
 	}
 
 	availableOperatorConfigurations, errorResponse := loadAvailableOperatorConfigurationResources(ctx, h.Client)
 	if errorResponse != nil {
 		return *errorResponse
 	}
-	admissionResponse, done := h.validateExport(availableOperatorConfigurations, monitoringResource)
+	admissionResponse, done :=
+		h.rejectCustomMonitoringResourceInAutomaticallyMonitoredNamespace(
+			ctx,
+			request.Operation,
+			availableOperatorConfigurations,
+			monitoringResource,
+			logger,
+		)
 	if done {
+		logger.Info(admissionResponse.Result.Message)
+		return admissionResponse
+	}
+	admissionResponse, done = h.validateExport(availableOperatorConfigurations, monitoringResource)
+	if done {
+		logger.Info(admissionResponse.Result.Message)
 		return admissionResponse
 	}
 	admissionResponse, done = h.validateTelemetryRelatedSettingsIfTelemetryCollectionIsDisabled(availableOperatorConfigurations, monitoringResource)
 	if done {
+		logger.Info(admissionResponse.Result.Message)
 		return admissionResponse
 	}
 	admissionResponse, done = h.validateLabelSelector(monitoringResource)
 	if done {
+		logger.Info(admissionResponse.Result.Message)
 		return admissionResponse
 	}
 	admissionResponse, done = h.validateTraceContextPropagators(monitoringResource)
 	if done {
+		logger.Info(admissionResponse.Result.Message)
 		return admissionResponse
 	}
 	admissionResponse, done = h.validateOttl(monitoringResource)
 	if done {
+		logger.Info(admissionResponse.Result.Message)
 		return admissionResponse
 	}
 
 	return admission.Allowed("")
 }
 
+func (h *MonitoringValidationWebhookHandler) rejectCustomMonitoringResourceInAutomaticallyMonitoredNamespace(
+	ctx context.Context,
+	operation admissionv1.Operation,
+	availableOperatorConfigurations []dash0v1alpha1.Dash0OperatorConfiguration,
+	monitoringResource *dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) (admission.Response, bool) {
+	if len(availableOperatorConfigurations) == 0 {
+		// If we cannot check whether autoMonitorNamespaces is enabled on the operator configuration resource, allow the
+		// request.
+		return admission.Response{}, false
+	}
+	autoMonitorNamespaces := availableOperatorConfigurations[0].Spec.AutoMonitorNamespaces
+	if !autoMonitorNamespaces.IsEnabled() {
+		return admission.Response{}, false
+	}
+	if monitoringResource.Labels[util.AutoMonitoredNamespaceLabel] == "true" {
+		// This is a monitoring resource created by the auto_namespace_monitoring_controller, allow it.
+		return admission.Response{}, false
+	}
+	if monitoringResource.Namespace == h.operatorNamespace {
+		// Do not reject manually managed monitoring resource in the operator namespace,
+		// auto_namespace_monitoring_controller will not install auto-monitoring resources there.
+		return admission.Response{}, false
+	}
+	if slices.Contains(util.RestrictedNamespaces, monitoringResource.Namespace) {
+		// Do not reject manually managed monitoring resource in the restricted namespaces,
+		// auto_namespace_monitoring_controller will not install auto-monitoring resources there.
+		return admission.Response{}, false
+	}
+
+	if operation != admissionv1.Create {
+		// Allow deleting or updating manually managed resources in auto-monitoring-enabled namespaces, only disallow
+		// creating a new manually managed monitoring resource.
+		return admission.Response{}, false
+	}
+
+	selector, err := labels.Parse(autoMonitorNamespaces.LabelSelector)
+	if err != nil {
+		// Invalid label selector – be permissive rather than blocking all resources.
+		return admission.Response{}, false
+	}
+	namespace := &corev1.Namespace{}
+	if err = h.Client.Get(ctx, client.ObjectKey{Name: monitoringResource.Namespace}, namespace); err != nil {
+		logger.Error(
+			err,
+			fmt.Sprintf("Cannot load namespace %s to validate monitoring resource request.", monitoringResource.Namespace),
+		)
+		return admission.Response{}, false
+	}
+
+	if selector.Matches(labels.Set(namespace.Labels)) {
+		return admission.Denied(
+			fmt.Sprintf(
+				"Namespace \"%s\" is automatically managed by Dash0. Adding a custom Dash0 monitoring resource "+
+					"to an automatically managed namespace is not allowed.",
+				monitoringResource.Namespace,
+			),
+		), true
+	}
+
+	// Namespace is not subject to automatic monitoring, allow.
+	return admission.Response{}, false
+}
+
 func (h *MonitoringValidationWebhookHandler) validateExport(
 	availableOperatorConfigurations []dash0v1alpha1.Dash0OperatorConfiguration,
 	monitoringResource *dash0v1beta1.Dash0Monitoring,
 ) (admission.Response, bool) {
-	if monitoringResource.Spec.Export == nil {
+
+	// Reject if both the deprecated export and the new exports field are set.
+	//nolint:staticcheck
+	if monitoringResource.Spec.Export != nil && len(monitoringResource.Spec.Exports) > 0 {
+		return admission.Denied(ErrorMessageMonitoringExportAndExportsAreMutuallyExclusive), true
+	}
+
+	if len(monitoringResource.Spec.Exports) == 0 {
 		if len(availableOperatorConfigurations) == 0 {
 			return admission.Denied(
 				"The provided Dash0 monitoring resource does not have an export configuration, and no Dash0 operator " +
@@ -149,14 +265,19 @@ func (h *MonitoringValidationWebhookHandler) validateExport(
 
 		operatorConfiguration := availableOperatorConfigurations[0]
 
-		if operatorConfiguration.Spec.Export == nil {
+		if len(operatorConfiguration.Spec.Exports) == 0 {
 			return admission.Denied(
 				"The provided Dash0 monitoring resource does not have an export configuration, and the existing Dash0 " +
 					"operator configuration does not have an export configuration either."), true
 		}
-	} else if !validateGrpcExportInsecureFlags(monitoringResource.Spec.Export) {
-		return admission.Denied(ErrorMessageMonitoringGrpcExportInvalidInsecure), true
 	}
+
+	for _, export := range monitoringResource.Spec.Exports {
+		if !validateGrpcExportInsecureFlags(&export) {
+			return admission.Denied(ErrorMessageMonitoringGrpcExportInvalidInsecure), true
+		}
+	}
+
 	return admission.Response{}, false
 }
 
@@ -171,7 +292,7 @@ func (h *MonitoringValidationWebhookHandler) validateTelemetryRelatedSettingsIfT
 		return admission.Response{}, false
 	}
 	operatorConfigurationSpec := availableOperatorConfigurations[0].Spec
-	if util.ReadBoolPointerWithDefault(operatorConfigurationSpec.TelemetryCollection.Enabled, true) {
+	if pointers.ReadBoolPointerWithDefault(operatorConfigurationSpec.TelemetryCollection.Enabled, true) {
 		return admission.Response{}, false
 	}
 
@@ -186,21 +307,21 @@ func (h *MonitoringValidationWebhookHandler) validateTelemetryRelatedSettingsIfT
 				monitoringResource.Spec.InstrumentWorkloads.Mode,
 			)), true
 	}
-	if util.ReadBoolPointerWithDefault(monitoringResource.Spec.LogCollection.Enabled, true) {
+	if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.LogCollection.Enabled, true) {
 		return admission.Denied("The Dash0 operator configuration resource has telemetry collection disabled " +
 			"(telemetryCollection.enabled=false), and yet the monitoring resource has the setting " +
 			"logCollection.enabled=true. This is an invalid combination. Please either set " +
 			"telemetryCollection.enabled=true in the operator configuration resource or set " +
 			"logCollection.enabled=false in the monitoring resource (or leave it unspecified)."), true
 	}
-	if util.ReadBoolPointerWithDefault(monitoringResource.Spec.EventCollection.Enabled, true) {
+	if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.EventCollection.Enabled, true) {
 		return admission.Denied("The Dash0 operator configuration resource has telemetry collection disabled " +
 			"(telemetryCollection.enabled=false), and yet the monitoring resource has the setting " +
 			"eventCollection.enabled=true. This is an invalid combination. Please either set " +
 			"telemetryCollection.enabled=true in the operator configuration resource or set " +
 			"eventCollection.enabled=false in the monitoring resource (or leave it unspecified)."), true
 	}
-	if util.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
+	if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
 		return admission.Denied("The Dash0 operator configuration resource has telemetry collection disabled " +
 			"(telemetryCollection.enabled=false), and yet the monitoring resource has the setting " +
 			"prometheusScraping.enabled=true. This is an invalid combination. Please either set " +
@@ -244,8 +365,8 @@ func (h *MonitoringValidationWebhookHandler) validateTraceContextPropagators(mon
 	if propagatorsRaw == nil || strings.TrimSpace(*propagatorsRaw) == "" {
 		return admission.Response{}, false
 	}
-	propagators := strings.Split(*propagatorsRaw, ",")
-	for _, propagatorRaw := range propagators {
+	propagators := strings.SplitSeq(*propagatorsRaw, ",")
+	for propagatorRaw := range propagators {
 		propagator := strings.TrimSpace(propagatorRaw)
 		if propagator == "" {
 			return admission.Denied(
@@ -277,28 +398,28 @@ func (h *MonitoringValidationWebhookHandler) validateOttl(monitoringResource *da
 	// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.126.0/processor/filterprocessor and
 	// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.126.0/processor/transformprocessor,
 	// we need to vendor in quite a bit of internal code from the collector-contrib repo, see
-	// internal/webhooks/vendored/opentelemetry-collector-contrib. Would be worth trying to refactor
-	// dash0common.Filter and dash0common.Transform to directly use the types from the collector-contrib repo, then
-	// we might be able to get away with only using collector-contrib's public API only, in particular,
-	// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.126.0/processor/filterprocessor/config.go,
-	// func (cfg *Config) Validate() error, and
-	// https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector-contrib/refs/tags/v0.126.0/processor/transformprocessor/config.go,
-	// func (cfg *Config) Validate() error.
-	if monitoringResource.Spec.Filter != nil {
-		if err := validateFilter(monitoringResource.Spec.Filter); err != nil {
-			return admission.Denied(err.Error()), true
-		}
+	// internal/webhooks/vendored/opentelemetry-collector-contrib.
+
+	var errors error
+
+	filter := monitoringResource.Spec.Filter
+	if filter != nil {
+		errors = multierr.Append(errors, validateFilter(filter))
 	}
-	if monitoringResource.Spec.NormalizedTransformSpec != nil {
-		if err := validateTransform(monitoringResource.Spec.NormalizedTransformSpec); err != nil {
-			return admission.Denied(err.Error()), true
-		}
+
+	normalizedTransformSpec := monitoringResource.Spec.NormalizedTransformSpec
+	if normalizedTransformSpec != nil {
+		errors = multierr.Append(errors, validateTransform(normalizedTransformSpec))
+	}
+
+	if errors != nil {
+		return admission.Denied(errors.Error()), true
 	}
 	return admission.Response{}, false
 }
 
 // validateFilter is a modified copy of
-// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.126.0/processor/filterprocessor/config.go,
+// https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector-contrib/refs/tags/v0.126.0/processor/filterprocessor/config.go,
 // func (cfg *Config) Validate() error {
 func validateFilter(filter *dash0common.Filter) error {
 	var errors error
@@ -328,6 +449,13 @@ func validateFilter(filter *dash0common.Filter) error {
 	if filter.Logs != nil {
 		if filter.Logs.LogRecordFilter != nil {
 			_, err := filterottl.NewBoolExprForLog(filter.Logs.LogRecordFilter, filterottl.StandardLogFuncs(), ottl.PropagateError, component.TelemetrySettings{Logger: zap.NewNop()})
+			errors = multierr.Append(errors, err)
+		}
+	}
+
+	if filter.Profiles != nil {
+		if filter.Profiles.ProfileFilter != nil {
+			_, err := filterottl.NewBoolExprForProfile(filter.Profiles.ProfileFilter, filterottl.StandardProfileFuncs(), ottl.PropagateError, component.TelemetrySettings{Logger: zap.NewNop()})
 			errors = multierr.Append(errors, err)
 		}
 	}
@@ -380,20 +508,33 @@ func validateTransform(transform *dash0common.NormalizedTransformSpec) error {
 		}
 	}
 
+	if len(transform.Profiles) > 0 {
+		pc, err := common.NewProfileParserCollection(component.TelemetrySettings{Logger: zap.NewNop()}, common.WithProfileParser(profiles.ProfileFunctions()))
+		if err != nil {
+			return err
+		}
+		for _, cs := range transform.Profiles {
+			_, err = pc.ParseContextStatements(toContextStatements(cs))
+			if err != nil {
+				errors = multierr.Append(errors, err)
+			}
+		}
+	}
+
 	return errors
 }
 
 func toContextStatements(transformGroup dash0common.NormalizedTransformGroup) common.ContextStatements {
-	var context common.ContextID
+	var ctx common.ContextID
 	if transformGroup.Context != nil {
-		context = common.ContextID(*transformGroup.Context)
+		ctx = common.ContextID(*transformGroup.Context)
 	}
 	var errorMode ottl.ErrorMode
 	if transformGroup.ErrorMode != nil {
 		errorMode = ottl.ErrorMode(*transformGroup.ErrorMode)
 	}
 	return common.ContextStatements{
-		Context:    context,
+		Context:    ctx,
 		Conditions: transformGroup.Conditions,
 		Statements: transformGroup.Statements,
 		ErrorMode:  errorMode,

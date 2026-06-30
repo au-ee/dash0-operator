@@ -9,11 +9,27 @@ operator:
   # will be created right away, when starting the operator. If left empty, you can always create a
   # Dash0OperatorConfiguration resource manually later.
   dash0Export:
-    # Set this to true to enable the creation of a Dash0OperatorConfiguration resource at startup. If a
-    # Dash0OperatorConfiguration already exists in the cluster, no action will be taken. Note that if this is set to
-    # true, you will also need to provide a valid endpoint (operator.dash0Export.endpoint), and either an auth token
-    # (operator.dash0Export.token) or a reference to a Kubernetes secret containing that token
+    # Set this to true to enable the creation of a Dash0OperatorConfiguration resource at startup. Note that if this is
+    # set to true, you will also need to provide a valid endpoint (operator.dash0Export.endpoint), and either an auth
+    # token (operator.dash0Export.token) or a reference to a Kubernetes secret containing that token
     # (operator.dash0Export.secretRef).
+    #
+    # The automatically created operator configuration resource will have the name
+    # dash0-operator-configuration-auto-resource. If an operator configuration resource with a different name exists in
+    # the cluster (e.g. a manually created operator configuration resource), the operator will log this as an error
+    # and ignore the operator.dash0Export.* settings.
+    #
+    # If an operator configuration resource with the name dash0-operator-configuration-auto-resource already exists in
+    # the cluster (e.g. a previous startup of the operator manager has created the resource), the operator manager will
+    # update/overwrite this resource with the values provided here.
+    #
+    # Manual changes to the dash0-operator-configuration-auto-resource will be overwritten with the settings provided
+    # via Helm the next time the operator manager pod is restarted. Possible reasons for a restart of the operator
+    # manager pod include upgrading to a new operator version, running helm upgrade etc.
+    #
+    # If you would rather retain manual control over the operator configuration resource, you should omit any
+    # operator.dash0Export.* Helm values and create and manage the operator configuration resource manually (that is,
+    # via kubectl, ArgoCD etc.).
     enabled: false
 
     # The URL of the Dash0 ingress endpoint to which telemetry data will be sent. This property is mandatory if
@@ -24,7 +40,7 @@ operator:
     endpoint:
 
     # The dataset to be used for reported telemetry and API access. This property is optional, it defaults to "default".
-    # See https://www.dash0.com/documentation/dash0/key-concepts/datasets.
+    # See https://www.dash0.com/docs/dash0/miscellaneous/glossary/datasets.
     dataset:
 
     # The base URL of the Dash0 API to talk to. This is not where telemetry will be sent, but it is used for managing
@@ -60,10 +76,16 @@ operator:
       # secret with the command above (see property "name"), then you would set the property to "token".
       key:
 
-    # If secretRef is used, the Helm chart will check if the provided secret actually exists. Set this to true to
-    # disable this check. This can be useful if you want to render the manifests via the Helm charts without accessing a
-    # live Kubernetes cluster.
-    disableSecretValidation: false
+    # The client-side gRPC keepalive configuration for the connection to the Dash0 backend.
+    # See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+    # This setting is optional and there should usually be no need to configure it.
+    keepalive:
+      # Period after which a keepalive ping is sent on the transport (e.g. "30s").
+      time:
+      # Time to wait for a keepalive ping acknowledgement (e.g. "10s").
+      timeout:
+      # Allow keepalive pings when there are no active streams.
+      permit_without_stream:
 
   # An opt-out for operator self-monitoring. If set to false, self monitoring for the operator will be disabled, that
   # is, the operator will not send self-monitoring telemetry to the configured Dash0 backend. This setting is optional,
@@ -78,6 +100,8 @@ operator:
   #
   # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
   # resource will be created by the Helm chart then.
+  # This setting has no effect if operator.telemetryCollectionEnabled is set to false, Kubernetes infrastructure metrics
+  # collection will be disabled implicitly.
   kubernetesInfrastructureMetricsCollectionEnabled: true
 
   # An opt-out for collecting pod labels and annotations as resource attributes. If set to false, the operator will
@@ -86,7 +110,18 @@ operator:
   #
   # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
   # resource will be created by the Helm chart then.
+  # This setting has no effect if operator.telemetryCollectionEnabled is set to false, collecting pod labels and
+  # annotations will be disabled implicitly.
   collectPodLabelsAndAnnotationsEnabled: true
+
+  # An opt-in for collecting namespace labels and annotations as resource attributes. If set to true, the operator will
+  # convert namespace labels and annotations to resource attributes. This setting is optional, it defaults to false.
+  #
+  # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
+  # resource will be created by the Helm chart then.
+  # This setting has no effect if operator.telemetryCollectionEnabled is set to false, collecting namespace labels and
+  # annotations will be disabled implicitly.
+  collectNamespaceLabelsAndAnnotationsEnabled: false
 
   # An opt-in for enabling support for Prometheus CRDs (PodMonitor, ServiceMonitor, ScrapeConfig). If set to true,
   # the operator will deploy an OpenTelemetry target-allocator that watches Prometheus CRDs and provides an API that
@@ -94,7 +129,44 @@ operator:
   #
   # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
   # resource will be created by the Helm chart then.
+  # This setting has no effect if operator.telemetryCollectionEnabled is set to false, support for Prometheus CRDs will
+  # be disabled implicitly.
   prometheusCrdSupportEnabled: false
+
+  # An opt-in for enabling profiling data pipelines. If set to true, the operator will configure its OpenTelemetry
+  # collectors to accept, process and export profiling data over OTLP.
+  #
+  # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
+  # resource will be created by the Helm chart then.
+  # This setting has no effect if operator.telemetryCollectionEnabled is set to false, profiling pipelines will be
+  # disabled implicitly.
+  profilingEnabled: false
+
+  # An opt-out for telemetry collection. If set to false, the operator will not deploy any OpenTelemetry collectors
+  # to the cluster, and no telemetry will be collected. This is useful if you want to use the operator only for
+  # infrastructure-as-code purposes (dashboards, check rules, etc.) without having it collect telemetry. Setting this to
+  # false also implicitly disables all other telemetry-collection related settings (see above), except for
+  # self-monitoring telemetry from the operator (which can be enabled or disabled independently).
+  #
+  # This setting is optional, it defaults to true.
+  #
+  # By default (i.e. if this setting is true), the operator Helm chart will set up all necessary permissions to manage
+  # OpenTelemetry collectors and the target allocator, including permissions to create ClusterRoles. If set to false,
+  # these RBAC permissions will not be granted, and the operator will run with a reduced set of RBAC permissions.
+  #
+  # If this is set to false, and operator.dash0Export.enabled is also false (i.e. the Dash0OperatorConfiguration
+  # resource is managed manually), it will not be possible to set spec.telemetryCollection.enabled to true in the
+  # Dash0OperatorConfiguration, since the required RBAC permissions have not been granted. To enable telemetry
+  # collection later, it is required to change this Helm value to true and perform a "helm upgrade --install" with the
+  # updated setting.
+  #
+  # If the operator is installed with telemetryCollectionEnabled=true, and the flag is later flipped to false via
+  # helm upgrade, the operator will not remove its managed OpenTelemetry collectors, nor the associated resources
+  # (config maps, cluster roles, roles & bindings, services etc.) from the cluster. It cannot, because
+  # telemetryCollectionEnabled=false implies that the necessary RBAC permissions for managing these resources (including
+  # the permission to delete these resources) are not granted to the operator manger. The recommended resolution is to
+  # uninstall the operator from the cluster entirely, then re-install with telemetryCollectionEnabled=false.
+  telemetryCollectionEnabled: true
 
   # If set, the value will be added as the resource attribute k8s.cluster.name to all telemetry. This setting is
   # optional. Per default, the resource attribute k8s.cluster.name will not be added.
@@ -132,7 +204,7 @@ operator:
       # your GKE Autopilot cluster.
       # The default is true, there should usually be no reason to override this.
       # See
-      # https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-the-allowlistsynchronizer-manually
+      # https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/platform-specific.md#managing-the-allowlistsynchronizer-manually
       # for more information.
       deployAllowlistSynchronizer: true
 
@@ -166,7 +238,7 @@ operator:
 
   # Settings for using cert-manager instead of auto-generating TLS certificates.
   #
-  # See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#using-cert-manager
+  # See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/advanced-configuration.md#using-cert-manager
   # for details on how to use cert-manager with the Dash0 operator.
   certManager:
 
@@ -198,6 +270,42 @@ operator:
 
     # the port for the webhook service
     port: 443
+
+  # Settings related to the operator's infrastructure-as-code (IaC) features, i.e. synchronizing Prometheus rules, dashboards,
+  # views etc.
+  iac:
+    # Settings for periodically retrying the synchronization of IaC resources (Prometheus rules, Perses
+    # dashboards, ...) to Dash0. Whenever the operator synchronizes such a resource and the synchronization fails due to
+    # a transient error (a server error or rate limiting from the Dash0 API), the operator periodically retries the
+    # synchronization. Synchronization failures caused by validation issues or other client errors are not retried, as
+    # retrying them would not change the outcome.
+    periodicRetry:
+      # Whether to periodically retry failed synchronizations. Defaults to true. Set this to false to disable the
+      # periodic retry job entirely.
+      enabled: true
+
+      # How often the operator checks for and retries failed synchronizations. The value is a duration string as
+      # understood by Go's time.ParseDuration, that is, a sequence of decimal numbers each with a unit suffix, such as
+      # "30s", "10m", "2h" or "1h30m". Valid time units are "s" (seconds), "m" (minutes) and "h" (hours).
+      # Defaults to "10m" (ten minutes). Values that cannot be parsed, or that are zero or negative, are ignored and the
+      # default ("10m") is used instead.
+      interval: 10m
+
+    # Settings for synchronizing perses.dev PersesDashboard resources to Dash0 dashboards.
+    persesDashboard:
+      # As of Perses operator 0.3.0, the PersesDashboard CRD has two versions (v1alpha1, v1alpha2) with v1alpha2 as the
+      # storage version. Converting between them requires a conversion webhook. If the Perses operator (which ships its
+      # own conversion webhook) is not installed in the cluster, the Dash0 operator can host that conversion webhook
+      # itself. When this setting is true (the default), and the Dash0 operator detects the PersesDashboard CRD in the
+      # cluster with no conversion webhook configured, it will patch the CRD's spec.conversion stanza to point at its
+      # own webhook endpoint. If the Perses operator is installed and has already configured a conversion webhook on the
+      # CRD, the Dash0 operator ignores the autoPatchConversionWebhook setting and leaves the CRD untouched.
+      #
+      # If you manage the PersesDashboard CRD via GitOps (Argo CD, Flux, etc.) and do not want the Dash0 operator to
+      # patch it, set this to false. With auto-patch disabled, you are responsible for ensuring that some conversion
+      # webhook for the PersesDashboard CRD is configured; or to only deploy v1alpha2 resources. Otherwise, v1alpha1 dashboard
+      # resources will lose fields when stored.
+      autoPatchConversionWebhook: true
 
   # settings for the service account to be used
   serviceAccount:
@@ -257,7 +365,7 @@ operator:
   # managerPriorityClassName:
 
   # Resource settings for the dash0-instrumentation init container that will be added to each pod when automatic
-  # workload instrumentation is enabled.
+  # workload instrumentation is enabled, and the instrumentation delivery is using the init-container mode.
   initContainerResources: {}
     # By default, this container defines no resource limits, but if required, they can be set here.
     # Note that putting a low CPU limit on the init container might slow down pod startup for instrumented pods
@@ -296,9 +404,9 @@ operator:
 
   # the container image to use for the instrumentation init container
   # (there should usually be no reason to override this)
-  initContainerImage:
-    # Use a different image for the init container entirely. Note that Dash0 does not offer support for Dash0 operator
-    # setups that do not use Dash0's official init container image.
+  instrumentationImage:
+    # Use a different image for instrumentation entirely. Note that Dash0 does not offer support for Dash0 operator
+    # setups that do not use Dash0's official instrumentation image.
     repository: "ghcr.io/au-ee/instrumentation"
     # overrides the image tag, which defaults to the chart appVersion.
     tag:
@@ -338,7 +446,7 @@ operator:
     # override the default image pull policy
     pullPolicy:
 
-  # the container image to use for synchronizing the offset files for the filelog receiver to the filelog offset config
+  # the container image to use for synchronizing the offset files for the file_log receiver to the filelog offset config
   # map; will not be used if a filelog offset storage volume is provided via
   # operator.collectors.filelogOffsetSyncStorageVolume
   # (there should usually be no reason to override this)
@@ -364,16 +472,48 @@ operator:
     # override the default image pull policy
     pullPolicy:
 
+  # the container image to use for the intelligent edge collector (there should usually be no reason to override this)
+  intelligentEdgeCollectorImage:
+    repository: "ghcr.io/dash0hq/intelligent-edge-collector"
+    # overrides the image tag, which defaults to the chart appVersion.
+    tag: "v2.0.2051"
+    # pull image by digest instead of tag; if this is set, the tag value will be ignored
+    digest:
+    # override the default image pull policy
+    pullPolicy:
+
+  # the container image to use for the barker component (there should usually be no reason to override this)
+  barkerImage:
+    repository: "ghcr.io/dash0hq/barker"
+    # overrides the image tag, which defaults to the chart appVersion.
+    tag: "v2.0.2051"
+    # pull image by digest instead of tag; if this is set, the tag value will be ignored
+    digest:
+    # override the default image pull policy
+    pullPolicy:
+
+  # the container image to use for the agent0-connector component (there should usually be no reason to override this)
+  agent0ConnectorImage:
+    repository: "ghcr.io/dash0hq/agent0-connector"
+    # overrides the image tag, which defaults to the chart appVersion.
+    tag:
+    # pull image by digest instead of tag; if this is set, the tag value will be ignored
+    digest:
+    # override the default image pull policy
+    pullPolicy:
+
   # the image pull secrets to pull the container images
   imagePullSecrets: []
 
+  # The log level for the operator manager. Valid values: debug, info, warn, error.
+  # Has no effect when developmentMode is true (development mode always uses debug level).
+  logLevel: info
+
   # If set to true, it enables a set of config changes suitable for local development or troubleshooting:
-  # - instructs the logger (Zap) of the operator manager to use a Zap development config (stacktraces on warnings, no
-  #   sampling), otherwise a Zap production config will be used (stacktraces on errors, sampling)
   # - adds a debug exporter (with the default config) to the collectors managed by the operator
-  # - adds insecure_skip_verify: true to the kubeletstats receiver config, to enable the receiver to work on Docker
-  #   Desktop and similar setups, see helm-chart/dash0-operator/README.md ->
-  #   "Notes on Running The Operator on Docker Desktop"
+  # - sets the log level to debug (the logLevel setting will be ignored when developmentMode is set)
+  # - instructs the logger (Zap) of the operator manager to use a Zap development config (no sampling), otherwise a
+  #   Zap production config will be used (sampling)
   developmentMode: false
 
   # If set to a value, the operator manager will enable pprof and make it available on the specificied port.
@@ -385,6 +525,38 @@ operator:
 
   # Settings related to the modification and instrumentation of workloads in the cluster.
   instrumentation:
+    # Controls how the Dash0 instrumentation files (the OpenTelemetry injector and the auto-instrumentation agents)
+    # are made available to instrumented workload containers. The operator can either use a Kubernetes image volume
+    # sourced from the Dash0 instrumentation image, or the traditional init container plus emptyDir volume approach.
+    # Image volumes are a Kubernetes feature (introduced in 1.31 as alpha, graduated to beta/opt-in in 1.33,
+    # beta/enabled by default since 1.35, stable since 1.36). Using them removes the need to run an init container
+    # that copies the instrumentation files at pod startup, which saves ephemeral storage and improves pod startup
+    # time.
+    #
+    # Allowed values:
+    # - "auto": use image volumes if the Kubernetes version is 1.36 or later, otherwise use the init container
+    #   approach.
+    # - "image-volume": always use image volumes, also on Kubernetes versions older than 1.36. If the Kubernetes
+    #   version is older than 1.31, the operator manager will log a warning and fall back to the init container
+    #   approach, since image volumes are not supported in that version. Note that if you are using
+    #   Kubernetes 1.34 or earlier, and you want to use this setting, you need to enable image volumes when configuring
+    #   your cluster, since image volumes are disabled by default in versions older than 1.35.
+    # - "init-container": always use the init container approach, regardless of the Kubernetes version.
+    #   This is the default.
+    #
+    # Note: Changing the instrumentation delivery setting for an existing operator installation will not trigger a
+    # bulk re-instrumentation of all existing workloads, even for namespaces that are set to
+    # instrumentWorkloadsMode=all. Once a workload has been successfully instrumented, there is no benefit in
+    # re-instrumenting it with a different delivery mechanism. The new setting will be applied when instrumenting
+    # newly deployed workloads, or when a workload is updated/re-deployed.
+    #
+    # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
+    # resource will be created by the Helm chart then.
+    delivery: init-container
+
+    # If set to true, it enables Python auto-instrumentation (beta).
+    enablePythonAutoInstrumentation: false
+
     # An optional delay to stagger access to the Kubernetes API server to instrument existing workloads at operator
     # startup or when enabling instrumentation for a new namespace via the Dash0Monitoring resource. This delay will be
     # applied after each individual workload.
@@ -416,15 +588,17 @@ operator:
     # This setting produces a large amount of logs and is not suitable for extended production use.
     debugVerbosityDetailed: false
 
+    # If set to a value > 0, the send_batch_size parameter will be set for the batch processor of the collectors
+    # managed by the operator, otherwise it uses the processor's default (8192)
+    # (see https://github.com/open-telemetry/opentelemetry-collector/blob/main/processor/batchprocessor/README.md).
+    # There is usually no need to configure this.
+    sendBatchSize: 0
+
     # If set to a value > 0, the send_batch_max_size parameter will be set for the batch processor of the collectors
     # managed by the operator. There is usually no need to configure this. The value must be greater than or equal to
-    # 8192, which is the default value for send_batch_size.
+    # sendBatchSize, which defaults to 8192. If you need to use a smaller number, make sure to set both sendBatchSize
+    # and sendBatchMaxSize.
     sendBatchMaxSize: 0
-
-    # Disables the replicaset informer for the k8sattributes processor. This will lead to not collecting the resource
-    # attribute k8s.deployment.uid, and might lead to wrong values k8s.deployment.name in some edge cases.
-    # The default is false, do not override this unless explicitly instructed by Dash0 support.
-    disableReplicasetInformer: false
 
     # If set to true, instrumented workloads will be instructed to use the service URL of the OpenTelemetry collector
     # DaemonSet, instead of sending telemetry via a node-local route to the node's IP address and the collector's host
@@ -439,6 +613,17 @@ operator:
     # The default is false, do not override this unless explicitly instructed by Dash0 support. Remove the override
     # after the collector troubleshooting is finished.
     enablePprofExtension: false
+
+    # If set to true, the collector configuration will be stored in the config map as gzip-compressed binary data.
+    # This can reduce the size of the config map and may help in clusters with many monitoring resources.
+    # The default is false. Set this to true if your cluster has a lot of namespaces with Dash0Monitoring resources,
+    # and you run into the Kubernetes size limitation for the collector configuration limit. E.g., you see error
+    # messages like the following
+    #   ConfigMap "dash0-operator-opentelemetry-collector-agent-cm" is invalid: []: Too long: may not be more than
+    #   1048576 bytes.
+    # You usually do not need this setting for monitoring up to around 2000 namespaces. If your Dash0Monitoring
+    # resources contain a lot of filters or transforms, this limit might be smaller.
+    compressConfigMaps: false
 
     # A reference to a persistent volume to use for the filelog offset sync. Specify this is you have a cluster
     # with more than pods 100 pods active at the same time. By default, the filelog offset sync will use a config map
@@ -519,6 +704,18 @@ operator:
         memory: 32Mi
         # ephemeral-storage: (no ephemeral-storage request by default)
 
+    # Additional labels to be set on the collector DaemonSet managed by the operator.
+    daemonSetLabels: {}
+
+    # Additional annotations to be set on the collector DaemonSet managed by the operator.
+    daemonSetAnnotations: {}
+
+    # Additional labels to be set on the collector DaemonSet pods managed by the operator.
+    daemonSetPodLabels: {}
+
+    # Additional annotations to be set on the collector DaemonSet pods managed by the operator.
+    daemonSetPodAnnotations: {}
+
     # An array of tolerations for the collector DaemonSet pods managed by the operator. This can be used to make sure
     # that collector pods are scheduled on nodes where they would not be scheduled otherwise due to Kubernetes taints.
     # Example:
@@ -547,6 +744,22 @@ operator:
                 operator: "In"
                 values: ["linux"]
 
+    # An array of pod-level sysctls applied to the collector DaemonSet pods (spec.securityContext.sysctls). Disabled by
+    # default. The primary use case is forcing TCP keepalive below the connection-tracking idle timeout of some
+    # environments (notably AWS Nitro v6 nodes, where established TCP connections are reaped after 350s); this keeps the
+    # collector's sparse self-monitoring gRPC connection alive and avoids reload failures.
+    # net.ipv4.tcp_keepalive_* are "safe" sysctls only on Kubernetes >= 1.29 (kernel 4.5+). On older clusters or under a
+    # strict Pod Security Admission / kubelet forbiddenSysctls configuration the kubelet rejects them and the pod will
+    # not be scheduled, hence this is opt-in. tcp_keepalive_time must be lower than the environment's idle timeout.
+    # Example:
+    # daemonSetSysctls:
+    #   - name: net.ipv4.tcp_keepalive_time
+    #     value: "240"
+    #   - name: net.ipv4.tcp_keepalive_intvl
+    #     value: "60"
+    #   - name: net.ipv4.tcp_keepalive_probes
+    #     value: "3"
+
     # The priority class name for the DaemonSet collector pods. If set, these manager pods will be scheduled with
     # the specified priority class.
     # This is useful if you want to make sure that the collector pods are scheduled with a higher priority than other
@@ -557,11 +770,17 @@ operator:
     # Parameters for the liveness, readiness and startup probes of the DaemonSet collectors.
     # See https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
     daemonSetProbes:
+      # Note: The liveness probe is also relevant for when new namespaces start to be monitored, or monitored namespaces
+      # are deleted. Both events will change the colletor config map and result in the collector reloading its
+      # configuration internally. This will make the collector fail the liveness probe temporarily. If the probe is
+      # configured too tightly, Kubernetes will restart the opentelemetry-collector container via SIGTERM. If you notice
+      # frequent collector restarts after adding or removing Dash0Monitoring resources, try to provide a higher
+      # failureThreshold value.
       liveness:
         initialDelaySeconds: 0
         periodSeconds: 2
         timeoutSeconds: 1
-        failureThreshold: 3
+        failureThreshold: 20
       readiness:
         initialDelaySeconds: 0
         periodSeconds: 2
@@ -571,7 +790,7 @@ operator:
         initialDelaySeconds: 0
         periodSeconds: 2
         timeoutSeconds: 1
-        failureThreshold: 30
+        failureThreshold: 45
 
     # Resource settings for the collector container of the Deployment collector pod (cluster-metrics-collector) managed
     # by the operator. There should usually be no reason to override this.
@@ -605,9 +824,36 @@ operator:
         memory: 12Mi
         # ephemeral-storage: (no ephemeral-storage request by default)
 
+    # An array of pod-level sysctls applied to the collector Deployment pod (cluster-metrics-collector), see
+    # spec.securityContext.sysctls. Disabled by default. See daemonSetSysctls above for the use case
+    # (forcing TCP keepalive below the connection-tracking idle timeout, e.g. on AWS Nitro v6 nodes) and the Kubernetes
+    # >= 1.29 / Pod Security Admission caveats.
+    # Example:
+    # deploymentSysctls:
+    #   - name: net.ipv4.tcp_keepalive_time
+    #     value: "240"
+    #   - name: net.ipv4.tcp_keepalive_intvl
+    #     value: "60"
+    #   - name: net.ipv4.tcp_keepalive_probes
+    #     value: "3"
+
     # The priority class name for the Deployment collector pod. If set, this pod will be scheduled with the specified
     # priority class. See https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/.
     # deploymentPriorityClassName:
+
+    # Additional labels to be set on the collector Deployment (cluster-metrics-collector) managed by the operator.
+    deploymentLabels: {}
+
+    # Additional annotations to be set on the collector Deployment (cluster-metrics-collector) managed by the
+    # operator.
+    deploymentAnnotations: {}
+
+    # Additional labels to be set on the collector Deployment pod (cluster-metrics-collector) managed by the operator.
+    deploymentPodLabels: {}
+
+    # Additional annotations to be set on the collector Deployment pod (cluster-metrics-collector) managed by the
+    # operator.
+    deploymentPodAnnotations: {}
 
     # An array of tolerations for the collector Deployment pod (cluster-metrics-collector) managed by the operator.
     # This can be used to make sure that collector pod can be scheduled on nodes where it would not be scheduled
@@ -641,11 +887,17 @@ operator:
     # Parameters for the liveness, readiness and startup probes of the collector Deployment (cluster-metrics-collector).
     # See https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
     deploymentProbes:
+      # Note: The liveness probe is also relevant for when new namespaces start to be monitored, or monitored namespaces
+      # are deleted. Both events will change the colletor config map and result in the collector reloading its
+      # configuration internally. This will make the collector fail the liveness probe temporarily. If the probe is
+      # configured too tightly, Kubernetes will restart the opentelemetry-collector container via SIGTERM. If you notice
+      # frequent collector restarts after adding or removing Dash0Monitoring resources, try to provide a higher
+      # failureThreshold value.
       liveness:
         initialDelaySeconds: 0
         periodSeconds: 2
         timeoutSeconds: 1
-        failureThreshold: 3
+        failureThreshold: 20
       readiness:
         initialDelaySeconds: 0
         periodSeconds: 2
@@ -655,7 +907,31 @@ operator:
         initialDelaySeconds: 0
         periodSeconds: 2
         timeoutSeconds: 1
-        failureThreshold: 30
+        failureThreshold: 45
+
+    # Settings for the k8s_attributes processor in the Dash0 operator collectors:
+    k8s_attributes:
+
+      # Disables the replicaset informer for the k8s_attributes processor. This will lead to not collecting the resource
+      # attribute k8s.deployment.uid, and might lead to wrong values k8s.deployment.name in some edge cases.
+      # The default is false, do not override this unless explicitly instructed by Dash0 support.
+      disableReplicasetInformer: false
+
+      # By default, the k8s_attributes processor will not wait until Kubernetes metadata has been fetched from the
+      # Kubernetes API. Telemetry which is collected before the Kubernetes metadata has been synchronized will not be
+      # enriched. That is, the first few spans, log records and metric data points will have less resource attributes
+      # than telemetry produced after the k8s_attributes has fetched all necessary data. For most use cases, this is
+      # not an issue at all, as the Dash0 backend backfills missing resource attributes later on.
+      #
+      # To wait for the metadata to be synchronized before the k8s_attributes processor is ready, set the
+      # wait_for_metadata option to true. Then the processor will not be ready until the metadata is fully synchronized.
+      # This also means that the start-up of the collectors will be *blocked*. If the metadata cannot be synchronized
+      # with in the configured timeout, the collectors will fail to start.
+      #
+      # See also:
+      # https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/k8sattributesprocessor#configuration.
+      wait_for_metadata: false
+      wait_for_metadata_timeout: 15s
 
   # Settings related to the target-allocator managed by the operator.
   targetAllocator:
@@ -680,8 +956,20 @@ operator:
         cpu: 200m
         memory: 128Mi
 
+    # Additional labels to be set on the target-allocator deployment managed by the operator.
+    labels: {}
+
+    # Additional annotations to be set on the target-allocator deployment managed by the operator.
+    annotations: {}
+
+    # Additional labels to be set on the target-allocator deployment pods managed by the operator.
+    podLabels: {}
+
+    # Additional annotations to be set on the target-allocator deployment pods managed by the operator.
+    podAnnotations: {}
+
     # An array of tolerations for the target-allocator deployment pods managed by the operator.
-    # This can be used to make sure that target-allocator pod can be scheduled on nodes where it would not be scheduled
+    # This can be used to make sure the target-allocator pod can be scheduled on nodes where it would not be scheduled
     # otherwise due to Kubernetes taints.
     # Example:
     # deploymentTolerations:
@@ -708,3 +996,152 @@ operator:
               - key: "kubernetes.io/os"
                 operator: "In"
                 values: ["linux"]
+
+  # Settings for automatically monitoring namespaces.
+  #
+  # These settings have no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration
+  # resource will be created by the Helm chart then.
+  autoMonitorNamespaces:
+
+    # Set enabled to true to have namespaces monitored automatically. By default, a Dash0Monitoring resource has to
+    # be added to each namespace that you want to monitor. With automatic namespace monitoring, you can let the Dash0
+    # operator automate this. This is useful if you want to monitor all or almost all namespaces in your cluster. It is
+    # also useful if you create new namespaces frequently and want to have them monitored right away, without additional
+    # setup. It is best suited if almost all namespace should be monitored in the same fashion.
+    #
+    # If enabled, the operator will:
+    # * automatically add monitoring to all existing namespaces at startup, and
+    # * automatically add monitoring to new namespaces, as they are created.
+    #
+    # Even when enabled, individual namespaces can opt out of automatic monitoring via label selectors
+    # (see operator.autoMonitorNamespaces.labelSelector).
+    #
+    # Namespaces which are subject to automatic namespace monitoring will be monitored according to the settings of
+    # operator.monitoringTemplate.
+    enabled: false
+
+    # An optional configurable label selector for controlling which namespaces are automatically monitored. Namespaces
+    # which match this label selector will be monitored automatically (if operator.dash0Export.enabled and
+    # operator.autoMonitorNamespaces.enabled are also set to true).
+    # Namespaces which do not match this label selector will not be monitored, regardless of the value of
+    # operator.autoMonitorNamespaces.enabled.
+    #
+    # This attribute is ignored if operator.autoMonitorNamespaces.enabled has not been set to true explicitly.
+    #
+    # By default, this label selector has the value "dash0.com/enable!=false" - that is, the following namespaces will
+    # be monitored:
+    # - namespaces which do not have the label dash0.com/enable at all, and
+    # - namespaces which have the label dash0.com/enable with a value other than "false".
+    #
+    # Namespaces which are subject to automatic namespace monitoring will be monitored according to the settings of
+    # operator.monitoringTemplate.
+    labelSelector: dash0.com/enable!=false
+
+  # The monitoring template describes the Dash0Monitoring resources that will be created for namespaces in case
+  # automatic namespace monitoring is enabled.
+  #
+  # This setting has no effect if operator.dash0Export.enabled is false, as no Dash0OperatorConfiguration resource will
+  # be created by the Helm chart then. This setting also has no effect if operator.autoMonitorNamespaces.enabled is
+  # false. If omitted, the Dash0 operator will use default values for automatically created Dash0Monitoring resources.
+  # The commeted out monitoringTemplate below shows the default values.
+  #
+  # NOTE: This is a top level value, e.g. it is **operator.monitoringTemplate**,
+  #       _not_ **operator.autoMonitorNamespaces.monitoringTemplate**.
+  #monitoringTemplate:
+  #  spec:
+  #    instrumentWorkloads:
+  #      mode: created-and-updated
+  #    logCollection:
+  #      enabled: true
+  #    eventCollection:
+  #      enabled: true
+  #    prometheusScraping:
+  #      enabled: true
+  #    synchronizePersesDashboards: true
+  #    synchronizePrometheusRules: true
+
+  # Settings related to Intelligent Edge. This feature is currently under development and should
+  # not be enabled.
+  intelligentEdge:
+    # Whether to enable Intelligent Edge features for this operator install.
+    enabled: false
+
+    # Settings for the barker proxy deployed when intelligentEdge.enabled=true.
+    barker:
+      # Resource settings for the barker container of the barker deployment managed by the operator.
+      containerResources:
+        limits:
+          memory: 128Mi
+        # The GOMEMLIMIT environment variable value for the barker container, the recommended value is 80% of
+        # containerResources.limits.memory. Note that valid units are different from Kubernetes resource settings, use
+        # MiB or GiB (see https://pkg.go.dev/runtime#hdr-Environment_Variables).
+        gomemlimit: 100MiB
+        requests:
+          memory: 64Mi
+
+      # An array of tolerations for the barker deployment managed by the operator. This can be used to make sure that
+      # the barker pod can be scheduled on nodes where it would not be scheduled otherwise due to Kubernetes taints.
+      # Example:
+      # tolerations:
+      #   - key: "key1"
+      #     operator: "Equal"
+      #     value: "value1"
+      #     effect: "NoSchedule"
+      #   - key: "key2"
+      #     operator: "Exists"
+      #     effect: "NoSchedule"
+      tolerations: []
+
+      # The nodeAffinity for the barker deployment managed by the operator. This can be used to constrain which nodes
+      # the barker pod will be scheduled on.
+      #
+      # See https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#node-affinity
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: "dash0.com/enable"
+                  operator: "NotIn"
+                  values: ["false"]
+                - key: "kubernetes.io/os"
+                  operator: "In"
+                  values: ["linux"]
+
+  # Settings related to the Agent0 connector (experimental/beta).
+  agent0Connector:
+
+    # The agent0-connector feature is currently experimental, do not enable it (yet).
+    enabled: false
+
+    # The address (host:port) of the Dash0 backend service the agent0-connector pod connects to. This value is mandatory
+    # when operator.agent0Connector.enabled is true; the Helm installation will fail if it is left empty in that case.
+    # If operator.agent0Connector.enabled is false, this value will be ignored.
+    serverAddress: ""
+
+    # The Dash0 authorization token for the agent0-connector. Either this value or the
+    # operator.agent0Connector.secretRef configuration has to be provided if operator.agent0Connector.enabled is true.
+    # If operator.agent0Connector.enabled is false, this value will be ignored.
+    # If both token and secretRef are provided, the token will be used and secretRef will be ignored. The authorization
+    # token for your Dash0 organization can be copied from https://app.dash0.com -> organization settings ->
+    # "Auth Tokens".
+    token:
+
+    # A reference to a Kubernetes secret containing the Dash0 authorization token for the agent0-connector. This
+    # property is optional, and is ignored if either operator.agent0Connector.enabled is false or
+    # operator.agent0Connector.token is set. The authorization token for your Dash0 organization can be copied from
+    # https://app.dash0.com -> organization settings -> "Auth Tokens".
+    secretRef:
+      # The name of the secret containing the Dash0 authorization token. For a secret created with:
+      # kubectl create secret generic \
+      #   dash0-agent0-connector-authorization-secret \
+      #   --namespace dash0-system \
+      #   --from-literal=token=auth_...your-token-here...
+      # you would set this to "dash0-agent0-connector-authorization-secret".
+      name:
+      # The key of the value which contains the Dash0 authorization token. Assuming you have created the Kubernetes
+      # secret with the command above (see property "name"), you would set the property to "token".
+      key:
+
+    # Disables TLS for the agent0-connector workload's connection to the Dash0 backend, connecting via plaintext
+    # instead. This is only intended for local development.
+    insecure: false

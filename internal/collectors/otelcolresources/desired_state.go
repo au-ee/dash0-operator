@@ -5,6 +5,8 @@ package otelcolresources
 
 import (
 	"fmt"
+	"maps"
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -23,26 +25,74 @@ import (
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
+
+type IntelligentEdgeConfig struct {
+	Enabled                            bool
+	SamplingEnabled                    bool
+	SamplingFallbackSampleRatio        string
+	SamplingDebug                      bool
+	SamplingReservoirMaxDiskBytes      int64
+	SamplingReservoirMetricLevel       string
+	SignalToMetricsEnabled             bool
+	SignalToMetricsMaxTimeSeries       *int32
+	SignalToMetricsFlushInterval       string
+	RedMetricsMaxTimeSeries            *int32
+	RedMetricsAdditionalSpanAttributes []string
+	SpamFilterEnabled                  bool
+	SpamFilterCacheExpiration          string
+	SpamFilterAllowNoSettingsExt       bool
+	OperationPreferSpanName            bool
+	OperationCardinalityRules          []IntelligentEdgeCardinalityRule
+	Endpoint                           string
+	ApiEndpoint                        string
+	AuthEnvVar                         string
+	Dataset                            string
+	Insecure                           bool
+	BarkerEnabled                      bool
+	BarkerName                         string
+}
+
+type IntelligentEdgeCardinalityRule struct {
+	Id                string
+	SourceAttribute   string
+	QuickFilter       string
+	OperationMatchers []IntelligentEdgeOperationMatcher
+}
+
+type IntelligentEdgeOperationMatcher struct {
+	Regex        string
+	Replacements []string
+	QuickFilter  string
+	Literal      bool
+}
 
 type oTelColConfig struct {
 	// OperatorNamespace is the namespace of the Dash0 operator
 	OperatorNamespace string
-
-	// NamePrefix is used as a prefix for OTel collector Kubernetes resources created by the operator, set to value of
-	// the environment variable OTEL_COLLECTOR_NAME_PREFIX, which is set to the Helm release name by the operator Helm
-	// chart.
-	NamePrefix                                       string
+	// NamePrefix is used as a prefix for OTel collector Kubernetes resources created by the operator, set to
+	// value of the environment variable OTEL_COLLECTOR_NAME_PREFIX, which is set to the Helm release name by the operator
+	//Helm chart.
+	NamePrefix string
+	// OperatorManagerDeploymentName is the name of the operator manager deployment, used to exclude the operator
+	// manager's own metrics from namespace-based filtering.
+	OperatorManagerDeploymentName                    string
 	Exporters                                        otlpExporters
-	Authorizations                                   dash0ExporterAuthorizations
 	AllMonitoringResources                           []dash0v1beta1.Dash0Monitoring
+	SendBatchSize                                    *uint32
 	SendBatchMaxSize                                 *uint32
 	SelfMonitoringConfiguration                      selfmonitoringapiaccess.SelfMonitoringConfiguration
 	KubernetesInfrastructureMetricsCollectionEnabled bool
 	CollectPodLabelsAndAnnotationsEnabled            bool
-	DisableReplicasetInformer                        bool
+	CollectNamespaceLabelsAndAnnotationsEnabled      bool
+	K8sAttributesDisableReplicasetInformer           bool
+	K8sAttributesWaitForMetadata                     bool
+	K8sAttributesWaitForMetadataTimeout              string
 	PrometheusCrdSupportEnabled                      bool
 	TargetAllocatorNamePrefix                        string
+	Agent0ConnectorEnabled                           bool
+	Agent0ConnectorDeploymentName                    string
 	KubeletStatsReceiverConfig                       KubeletStatsReceiverConfig
 	UseHostMetricsReceiver                           bool
 	DisableHostPorts                                 bool
@@ -52,9 +102,13 @@ type oTelColConfig struct {
 	IsIPv6Cluster                                    bool
 	IsGkeAutopilot                                   bool
 	OffsetStorageVolume                              *corev1.Volume
+	IntelligentEdge                                  IntelligentEdgeConfig
+	AutoNamespaceMonitoringEnabled                   bool
 	DevelopmentMode                                  bool
 	DebugVerbosityDetailed                           bool
 	EnableProfExtension                              bool
+	ProfilingEnabled                                 bool
+	CompressConfigMap                                bool
 }
 
 func (c *oTelColConfig) usesOffsetStorageVolume() bool {
@@ -117,17 +171,28 @@ const (
 	appKubernetesIoInstanceValue  = "dash0-operator"
 	appKubernetesIoManagedByValue = "dash0-operator"
 
-	configMapVolumeName            = "opentelemetry-collector-configmap"
-	collectorConfigurationYaml     = "config.yaml"
-	collectorConfigurationFilePath = "/etc/otelcol/conf/" + collectorConfigurationYaml
+	// config paths / config volume mount paths
+	collectorConfigurationYaml        = "config.yaml"
+	collectorConfigDirPath            = "/etc/otelcol/conf"
+	collectorConfigurationFilePath    = collectorConfigDirPath + "/" + collectorConfigurationYaml
+	collectorConfigCompressedDirPath  = "/etc/otelcol/conf-compressed"
+	collectorConfigCompressedFilePath = collectorConfigCompressedDirPath + "/" + collectorConfigurationYaml
+
+	// config volume names -- the collectors will either use only the collectorConfigMapVolumeNamePlainText (when config
+	// map compression is disabled), or collectorConfigMapCompressedVolumeName + collectorConfigMapDecompressedVolumeName
+	// (when config map compression is enabled).
+	collectorConfigMapVolumeNamePlainText         = "opentelemetry-collector-configmap"
+	collectorConfigMapCompressedVolumeName        = "opentelemetry-collector-configmap-compressed"
+	collectorConfigMapDecompressedVolumeName      = "opentelemetry-collector-configmap-decompressed"
+	collectorConfigMapDecompressedVolumeSizeLimit = "50M"
 
 	collectorPidFilePath = "/etc/otelcol/run/pid.file"
 	pidFileVolumeName    = "opentelemetry-collector-pidfile"
 	offsetsDirPath       = "/var/otelcol/filelogreceiver_offsets"
 
 	gkeAutopilotAllowlistLabelKey             = "cloud.google.com/matching-allowlist"
-	gkeAutopilotAllowlistLabelDaemonsetValue  = "dash0-opentelemetry-collector-agent-v1.0.0"
-	gkeAutopilotAllowlistLabelDeploymentValue = "dash0-opentelemetry-cluster-metrics-collector-v1.0.0"
+	gkeAutopilotAllowlistLabelDaemonsetValue  = "dash0-opentelemetry-collector-agent-v1.0.3"
+	gkeAutopilotAllowlistLabelDeploymentValue = "dash0-opentelemetry-cluster-metrics-collector-v1.0.3"
 
 	targetAllocatorCertsVolumeName = "ta-mtls-certs"
 	targetAllocatorCertsVolumeDir  = "/etc/certs/ta-client"
@@ -198,11 +263,25 @@ var (
 		Path: collectorConfigurationYaml,
 	}}
 
-	collectorConfigVolume = corev1.VolumeMount{
-		Name:      configMapVolumeName,
-		MountPath: "/etc/otelcol/conf",
+	// The collectors will either use only the collectorConfigPlainTextVolumeMount (when config map compression is
+	// disabled), or collectorConfigCompressedVolumeMount + collectorConfigDecompressedVolumeMount (when config map
+	// compression is enabled).
+	collectorConfigPlainTextVolumeMount = corev1.VolumeMount{
+		Name:      collectorConfigMapVolumeNamePlainText,
+		MountPath: collectorConfigDirPath,
 		ReadOnly:  true,
 	}
+	collectorConfigCompressedVolumeMount = corev1.VolumeMount{
+		Name:      collectorConfigMapCompressedVolumeName,
+		MountPath: collectorConfigCompressedDirPath,
+		ReadOnly:  true,
+	}
+	collectorConfigDecompressedVolumeMount = corev1.VolumeMount{
+		Name:      collectorConfigMapDecompressedVolumeName,
+		MountPath: collectorConfigDirPath,
+		ReadOnly:  false,
+	}
+
 	collectorPidFileMountRW = corev1.VolumeMount{
 		Name:      pidFileVolumeName,
 		MountPath: filepath.Dir(collectorPidFilePath),
@@ -238,7 +317,7 @@ func assembleDesiredStateForUpsert(
 	for _, monitoringResource := range allMonitoringResources {
 		namespace := monitoringResource.Namespace
 		monitoredNamespaces = append(monitoredNamespaces, namespace)
-		if util.ReadBoolPointerWithDefault(monitoringResource.Spec.LogCollection.Enabled, true) &&
+		if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.LogCollection.Enabled, true) &&
 			// We deliberately do not allow collecting logs from the operator namespace, these are available via
 			// self-monitoring. Furthermore, if logs from the operator would be enabled via the normal log collection
 			// pipeline, and there was a log parsing error that is being logged into the collector log, this might
@@ -246,10 +325,10 @@ func assembleDesiredStateForUpsert(
 			namespace != config.OperatorNamespace {
 			namespacesWithLogCollection = append(namespacesWithLogCollection, namespace)
 		}
-		if util.ReadBoolPointerWithDefault(monitoringResource.Spec.EventCollection.Enabled, true) {
+		if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.EventCollection.Enabled, true) {
 			namespacesWithEventCollection = append(namespacesWithEventCollection, namespace)
 		}
-		if util.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
+		if pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.PrometheusScraping.Enabled, true) {
 			namespacesWithPrometheusScraping = append(namespacesWithPrometheusScraping, namespace)
 		}
 
@@ -568,7 +647,7 @@ func assembleService(config *oTelColConfig) *corev1.Service {
 					Port:        otlpGrpcPort,
 					TargetPort:  intstr.FromInt32(otlpGrpcPort),
 					Protocol:    corev1.ProtocolTCP,
-					AppProtocol: ptr.To("grpc"),
+					AppProtocol: new("grpc"),
 				},
 				{
 					Name:       "otlp-http",
@@ -616,16 +695,17 @@ func assembleCollectorDaemonSet(config *oTelColConfig, extraConfig util.ExtraCon
 		Tolerations:        extraConfig.DaemonSetTolerations,
 		ServiceAccountName: daemonsetServiceAccountName(config.NamePrefix),
 		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot: ptr.To(true),
+			RunAsNonRoot: new(true),
 			SeccompProfile: &corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
-			RunAsUser:  ptr.To(defaultUser),
-			RunAsGroup: ptr.To(defaultGroup),
+			RunAsUser:  new(defaultUser),
+			RunAsGroup: new(defaultGroup),
+			Sysctls:    extraConfig.DaemonSetSysctls,
 		},
 		// This setting is required to enable the configuration reloader process to send Unix signals to the
 		// collector process.
-		ShareProcessNamespace: ptr.To(true),
+		ShareProcessNamespace: new(true),
 
 		Containers: []corev1.Container{
 			collectorContainer,
@@ -677,13 +757,14 @@ func assembleCollectorDaemonSet(config *oTelColConfig, extraConfig util.ExtraCon
 		podSpec.PriorityClassName = priorityClassName
 	}
 
-	templateLabels := addGkeAutopilotAllowListMatchLabel(config, daemonSetMatchLabels, gkeAutopilotAllowlistLabelDaemonsetValue)
+	templateLabels := addGkeAutopilotAllowlistMatchLabel(config, daemonSetMatchLabels, gkeAutopilotAllowlistLabelDaemonsetValue)
 	collectorDaemonSet := &appsv1.DaemonSet{
 		TypeMeta: util.K8sTypeMetaDaemonSet,
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      daemonSetName,
-			Namespace: config.OperatorNamespace,
-			Labels:    labels(true),
+			Name:        daemonSetName,
+			Namespace:   config.OperatorNamespace,
+			Labels:      util.MergeMaps(labels(true), extraConfig.CollectorDaemonSetLabels),
+			Annotations: util.MergeMaps(nil, extraConfig.CollectorDaemonSetAnnotations),
 		},
 		Spec: appsv1.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
@@ -694,7 +775,8 @@ func assembleCollectorDaemonSet(config *oTelColConfig, extraConfig util.ExtraCon
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: templateLabels,
+					Labels:      util.MergeMaps(templateLabels, extraConfig.CollectorDaemonSetPodLabels),
+					Annotations: util.MergeMaps(nil, extraConfig.CollectorDaemonSetPodAnnotations),
 				},
 				Spec: podSpec,
 			},
@@ -725,9 +807,9 @@ func assembleFileLogOffsetSyncContainer(
 		Name: fileLogOffsetSync,
 		Args: []string{"--mode=sync"},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -812,17 +894,6 @@ func assembleCollectorDaemonSetVolumes(
 			},
 		},
 		{
-			Name: configMapVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: DaemonSetCollectorConfigConfigMapName(config.NamePrefix),
-					},
-					Items: configMapItems,
-				},
-			},
-		},
-		{
 			Name: pidFileVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				EmptyDir: &corev1.EmptyDirVolumeSource{
@@ -831,6 +902,44 @@ func assembleCollectorDaemonSetVolumes(
 			},
 		},
 	}
+
+	if !config.CompressConfigMap {
+		volumes = append(volumes, corev1.Volume{
+			Name: collectorConfigMapVolumeNamePlainText,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: DaemonSetCollectorConfigConfigMapName(config.NamePrefix),
+					},
+					Items: configMapItems,
+				},
+			},
+		})
+	} else {
+		volumes = append(
+			volumes,
+			corev1.Volume{
+				Name: collectorConfigMapCompressedVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: DaemonSetCollectorConfigConfigMapName(config.NamePrefix),
+						},
+						Items: configMapItems,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: collectorConfigMapDecompressedVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						SizeLimit: new(resource.MustParse(collectorConfigMapDecompressedVolumeSizeLimit)),
+					},
+				},
+			},
+		)
+	}
+
 	if !config.IsGkeAutopilot {
 		// On Docker desktop and other runtimes using docker, the files in /var/log/pods are symlinked to this folder.
 		// (In GKE Autopilot we know for sure that /var/lib/docker/containers does not exist, so there is no need to
@@ -869,7 +978,40 @@ func assembleCollectorDaemonSetVolumes(
 		})
 	}
 
+	if config.IntelligentEdge.Enabled && config.IntelligentEdge.SamplingEnabled {
+		traceReservoirSizeLimit := reservoirDerivedStorage(config.IntelligentEdge.SamplingReservoirMaxDiskBytes)
+		volumes = append(volumes, corev1.Volume{
+			Name: "trace-reservoir",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: &traceReservoirSizeLimit,
+				},
+			},
+		})
+	}
+
 	return volumes, filelogOffsetsVolume
+}
+
+// reservoirStorageMargin is the multiplicative headroom applied to the reservoir's max_disk_bytes when
+// deriving the Kubernetes storage size limit and ephemeral-storage request. The reservoir's actual on-disk
+// usage can exceed max_disk_bytes (per-shard division, active files that cannot be evicted, and eviction
+// running only on the rotation interval), so the requested storage must be larger than the cap itself.
+const reservoirStorageMargin = 1.25
+
+// reservoirDefaultMaxDiskBytes is the fallback used when the Dash0IntelligentEdge resource does not specify
+// a reservoir max_disk_bytes (matches the +kubebuilder:default of "1Gi").
+const reservoirDefaultMaxDiskBytes int64 = 1024 * 1024 * 1024 // 1Gi
+
+// reservoirMaxDiskBytesFloor is the minimum accepted reservoir max_disk_bytes. Smaller values are clamped to
+// this floor to keep the reservoir functional.
+const reservoirMaxDiskBytesFloor int64 = 64 * 1024 * 1024 // 64Mi
+
+// reservoirDerivedStorage returns the Kubernetes storage quantity derived from the reservoir's
+// max_disk_bytes by applying reservoirStorageMargin.
+func reservoirDerivedStorage(maxDiskBytes int64) resource.Quantity {
+	derived := int64(math.Ceil(float64(maxDiskBytes) * reservoirStorageMargin))
+	return *resource.NewQuantity(derived, resource.BinarySI)
 }
 
 func assembleCollectorDaemonSetVolumeMounts(
@@ -883,16 +1025,22 @@ func assembleCollectorDaemonSetVolumeMounts(
 	} else {
 		filelogOffsetVolumeMount = defaultFilelogReceiverOffsetsVolumeMount
 	}
-	volumeMounts := []corev1.VolumeMount{
-		collectorConfigVolume,
+	var volumeMounts []corev1.VolumeMount
+	if config.CompressConfigMap {
+		volumeMounts = []corev1.VolumeMount{collectorConfigCompressedVolumeMount, collectorConfigDecompressedVolumeMount}
+	} else {
+		volumeMounts = []corev1.VolumeMount{collectorConfigPlainTextVolumeMount}
+	}
+	volumeMounts = append(
+		volumeMounts,
 		collectorPidFileMountRW,
-		{
+		corev1.VolumeMount{
 			Name:      "node-pod-logs",
 			MountPath: "/var/log/pods",
 			ReadOnly:  true,
 		},
 		filelogOffsetVolumeMount,
-	}
+	)
 	if !config.IsGkeAutopilot {
 		// This volume mount is only useful for Docker Desktop and similar container runtimes. In GKE Autopilot we know
 		// for sure that /var/lib/docker/containers does not exist, so there is no need to mount it.
@@ -918,6 +1066,13 @@ func assembleCollectorDaemonSetVolumeMounts(
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      targetAllocatorCertsVolumeName,
 			MountPath: targetAllocatorCertsVolumeDir,
+		})
+	}
+
+	if config.IntelligentEdge.Enabled && config.IntelligentEdge.SamplingEnabled {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "trace-reservoir",
+			MountPath: "/var/lib/dash0/trace-reservoir",
 		})
 	}
 
@@ -963,15 +1118,29 @@ func assembleCollectorEnvVars(
 		},
 	}
 
-	for _, auth := range config.Authorizations.all() {
-		authTokenEnvVar, err := util.CreateEnvVarForAuthorization(
-			auth.Authorization,
-			auth.EnvVarName,
-		)
-		if err != nil {
-			return nil, err
+	for _, export := range config.Exporters.allExporters() {
+		if auth := export.Authorization; auth != nil {
+			authTokenEnvVar, err := util.CreateEnvVarForAuthorization(
+				auth.Authorization,
+				auth.EnvVarName,
+			)
+			if err != nil {
+				return nil, err
+			}
+			collectorEnv = append(collectorEnv, authTokenEnvVar)
 		}
-		collectorEnv = append(collectorEnv, authTokenEnvVar)
+	}
+
+	if config.IntelligentEdge.Enabled && config.IntelligentEdge.SamplingEnabled {
+		// Uses Kubernetes dependent variable expansion: $(VAR_NAME) references the exporter auth token env var
+		// defined earlier in this container's env list. The referenced env var (e.g., DASH0_AUTHORIZATION_DEFAULT_0)
+		// must appear before this one.
+		collectorEnv = append(collectorEnv,
+			corev1.EnvVar{
+				Name:  "DASH0_SAMPLING_AUTH_TOKEN",
+				Value: fmt.Sprintf("$(%s)", config.IntelligentEdge.AuthEnvVar),
+			},
+		)
 	}
 
 	return collectorEnv, nil
@@ -991,6 +1160,22 @@ func assembleDaemonSetCollectorContainer(
 		return corev1.Container{}, err
 	}
 
+	// When the trace reservoir is active, request ephemeral storage derived from its max_disk_bytes so the
+	// scheduler reserves enough node scratch space. An explicit user-provided ephemeral-storage request is
+	// never overridden.
+	collectorResources := resourceRequirements.ToResourceRequirements()
+	if config.IntelligentEdge.Enabled && config.IntelligentEdge.SamplingEnabled &&
+		collectorResources.Requests.StorageEphemeral().IsZero() {
+		// Clone the requests map so the shared resourceRequirements passed by the caller is not mutated.
+		requests := maps.Clone(collectorResources.Requests)
+		if requests == nil {
+			requests = corev1.ResourceList{}
+		}
+		requests[corev1.ResourceEphemeralStorage] =
+			reservoirDerivedStorage(config.IntelligentEdge.SamplingReservoirMaxDiskBytes)
+		collectorResources.Requests = requests
+	}
+
 	otlpPort := corev1.ContainerPort{
 		Name:          "otlp",
 		Protocol:      corev1.ProtocolTCP,
@@ -1006,16 +1191,21 @@ func assembleDaemonSetCollectorContainer(
 		httpPort.HostPort = int32(OtlpHttpHostPort)
 	}
 
+	collectorArgs := []string{
+		"--config=file:" + collectorConfigurationFilePath,
+		"--feature-gates=-processor.resourcedetection.propagateerrors",
+	}
+	if config.ProfilingEnabled {
+		collectorArgs = append(collectorArgs, "--feature-gates=service.profilesSupport")
+	}
+
 	collectorContainer := corev1.Container{
 		Name: openTelemetryCollector,
-		Args: []string{
-			"--config=file:" + collectorConfigurationFilePath,
-			"--feature-gates=-processor.resourcedetection.propagateerrors",
-		},
+		Args: collectorArgs,
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -1029,7 +1219,7 @@ func assembleDaemonSetCollectorContainer(
 		LivenessProbe:  WithProbeHandler(probes.Liveness),
 		StartupProbe:   WithProbeHandler(probes.Startup),
 		ReadinessProbe: WithProbeHandler(probes.Readiness),
-		Resources:      resourceRequirements.ToResourceRequirements(),
+		Resources:      collectorResources,
 		VolumeMounts:   collectorVolumeMounts,
 	}
 	if config.Images.CollectorImagePullPolicy != "" {
@@ -1045,16 +1235,47 @@ func assembleConfigurationReloaderContainer(
 ) corev1.Container {
 	collectorPidFileMountRO := collectorPidFileMountRW
 	collectorPidFileMountRO.ReadOnly = true
+
+	var reloaderVolumeMounts []corev1.VolumeMount
+	reloaderArgs := []string{
+		"--pidfile=" + collectorPidFilePath,
+	}
+
+	if config.CompressConfigMap {
+		reloaderArgs = append(reloaderArgs, "--decompressedoutput="+collectorConfigurationFilePath)
+		reloaderVolumeMounts = []corev1.VolumeMount{
+			collectorConfigCompressedVolumeMount,
+			collectorConfigDecompressedVolumeMount,
+			collectorPidFileMountRO,
+		}
+	} else {
+		reloaderVolumeMounts = []corev1.VolumeMount{
+			collectorConfigPlainTextVolumeMount,
+			collectorPidFileMountRO,
+		}
+	}
+
+	checkFrequency := "--frequency=5s"
+	if config.AutoNamespaceMonitoringEnabled {
+		// With AutoNamespaceMonitoringEnabled, a lot of namespaces are sometimes added en-masse (for example when the
+		// namespace watch starts). We do not want to churn the collector pipelines over and over.
+		checkFrequency = "--frequency=60s"
+	}
+	reloaderArgs = append(reloaderArgs, checkFrequency)
+
+	if config.CompressConfigMap {
+		reloaderArgs = append(reloaderArgs, collectorConfigCompressedFilePath)
+	} else {
+		reloaderArgs = append(reloaderArgs, collectorConfigurationFilePath)
+	}
+
 	configurationReloaderContainer := corev1.Container{
 		Name: configReloader,
-		Args: []string{
-			"--pidfile=" + collectorPidFilePath,
-			collectorConfigurationFilePath,
-		},
+		Args: reloaderArgs,
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -1083,7 +1304,7 @@ func assembleConfigurationReloaderContainer(
 			k8sPodNameEnvVar,
 		},
 		Resources:    resourceRequirements.ToResourceRequirements(),
-		VolumeMounts: []corev1.VolumeMount{collectorConfigVolume, collectorPidFileMountRO},
+		VolumeMounts: reloaderVolumeMounts,
 	}
 	if config.Images.ConfigurationReloaderImagePullPolicy != "" {
 		configurationReloaderContainer.ImagePullPolicy = config.Images.ConfigurationReloaderImagePullPolicy
@@ -1100,9 +1321,9 @@ func assembleFileLogOffsetSyncInitContainer(
 		Name: "filelog-offset-init",
 		Args: []string{"--mode=init"},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -1164,11 +1385,11 @@ func assembleFileLogVolumeOwnershipInitContainer(
 		},
 		SecurityContext: &corev1.SecurityContext{
 			// this container needs to run as root
-			RunAsUser:                ptr.To(int64(0)),
-			RunAsNonRoot:             ptr.To(false),
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			Privileged:               ptr.To(false),
+			RunAsUser:                new(int64(0)),
+			RunAsNonRoot:             new(false),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			Privileged:               new(false),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 				Add:  []corev1.Capability{"CHOWN"},
@@ -1346,14 +1567,15 @@ func assembleCollectorDeployment(
 		Tolerations:        extraConfig.DeploymentTolerations,
 		ServiceAccountName: deploymentServiceAccountName(config.NamePrefix),
 		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot: ptr.To(true),
+			RunAsNonRoot: new(true),
 			SeccompProfile: &corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
+			Sysctls: extraConfig.DeploymentSysctls,
 		},
 		// This setting is required to enable the configuration reloader process to send Unix signals to the
 		// collector process.
-		ShareProcessNamespace: ptr.To(true),
+		ShareProcessNamespace: new(true),
 		Containers: []corev1.Container{
 			collectorContainer,
 			assembleConfigurationReloaderContainer(
@@ -1377,13 +1599,14 @@ func assembleCollectorDeployment(
 		podSpec.PriorityClassName = priorityClassName
 	}
 
-	templateLabels := addGkeAutopilotAllowListMatchLabel(config, deploymentMatchLabels, gkeAutopilotAllowlistLabelDeploymentValue)
+	templateLabels := addGkeAutopilotAllowlistMatchLabel(config, deploymentMatchLabels, gkeAutopilotAllowlistLabelDeploymentValue)
 	collectorDeployment := &appsv1.Deployment{
 		TypeMeta: util.K8sTypeMetaDeployment,
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName,
-			Namespace: config.OperatorNamespace,
-			Labels:    labels(true),
+			Name:        deploymentName,
+			Namespace:   config.OperatorNamespace,
+			Labels:      util.MergeMaps(labels(true), extraConfig.CollectorDeploymentLabels),
+			Annotations: util.MergeMaps(nil, extraConfig.CollectorDeploymentAnnotations),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &deploymentReplicas,
@@ -1395,7 +1618,8 @@ func assembleCollectorDeployment(
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: templateLabels,
+					Labels:      util.MergeMaps(templateLabels, extraConfig.CollectorDeploymentPodLabels),
+					Annotations: util.MergeMaps(nil, extraConfig.CollectorDeploymentPodAnnotations),
 				},
 				Spec: podSpec,
 			},
@@ -1422,18 +1646,7 @@ func assembleCollectorDeploymentVolumes(
 	configMapItems []corev1.KeyToPath,
 ) []corev1.Volume {
 	pidFileVolumeSizeLimit := resource.MustParse("1M")
-	return []corev1.Volume{
-		{
-			Name: configMapVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: DeploymentCollectorConfigConfigMapName(config.NamePrefix),
-					},
-					Items: configMapItems,
-				},
-			},
-		},
+	volumes := []corev1.Volume{
 		{
 			Name: pidFileVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -1443,6 +1656,46 @@ func assembleCollectorDeploymentVolumes(
 			},
 		},
 	}
+
+	if !config.CompressConfigMap {
+		volumes = append(
+			volumes,
+			corev1.Volume{
+				Name: collectorConfigMapVolumeNamePlainText,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: DeploymentCollectorConfigConfigMapName(config.NamePrefix),
+						},
+						Items: configMapItems,
+					},
+				},
+			},
+		)
+	} else {
+		volumes = append(
+			volumes,
+			corev1.Volume{
+				Name: collectorConfigMapCompressedVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: DeploymentCollectorConfigConfigMapName(config.NamePrefix),
+						},
+						Items: configMapItems,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: collectorConfigMapDecompressedVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						SizeLimit: new(resource.MustParse(collectorConfigMapDecompressedVolumeSizeLimit)),
+					},
+				},
+			})
+	}
+	return volumes
 }
 
 func assembleDeploymentCollectorContainer(
@@ -1451,9 +1704,18 @@ func assembleDeploymentCollectorContainer(
 	resourceRequirements util.ResourceRequirementsWithGoMemLimit,
 	probes util.CollectorProbes,
 ) (corev1.Container, error) {
-	collectorVolumeMounts := []corev1.VolumeMount{
-		collectorConfigVolume,
-		collectorPidFileMountRW,
+	var collectorVolumeMounts []corev1.VolumeMount
+	if config.CompressConfigMap {
+		collectorVolumeMounts = []corev1.VolumeMount{
+			collectorConfigCompressedVolumeMount,
+			collectorConfigDecompressedVolumeMount,
+			collectorPidFileMountRW,
+		}
+	} else {
+		collectorVolumeMounts = []corev1.VolumeMount{
+			collectorConfigPlainTextVolumeMount,
+			collectorPidFileMountRW,
+		}
 	}
 	collectorEnv, err := assembleCollectorEnvVars(config, workloadNameEnvVar, resourceRequirements.GoMemLimit)
 	if err != nil {
@@ -1464,9 +1726,9 @@ func assembleDeploymentCollectorContainer(
 		Name: openTelemetryCollector,
 		Args: []string{"--config=file:" + collectorConfigurationFilePath},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(false),
-			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 			},
@@ -1589,7 +1851,7 @@ func addCommonMetadata(object client.Object) clientObject {
 	}
 }
 
-func addGkeAutopilotAllowListMatchLabel(
+func addGkeAutopilotAllowlistMatchLabel(
 	config *oTelColConfig,
 	originalLabels map[string]string,
 	gkeAutopilotAllowlistLabelValue string,
@@ -1598,9 +1860,7 @@ func addGkeAutopilotAllowListMatchLabel(
 		return originalLabels
 	}
 	modifiedLabels := make(map[string]string, len(originalLabels)+1)
-	for k, v := range originalLabels {
-		modifiedLabels[k] = v
-	}
+	maps.Copy(modifiedLabels, originalLabels)
 	modifiedLabels[gkeAutopilotAllowlistLabelKey] = gkeAutopilotAllowlistLabelValue
 	return modifiedLabels
 }

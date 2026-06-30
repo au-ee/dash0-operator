@@ -4,10 +4,16 @@
 package otelcolresources
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlmetric"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
@@ -20,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	. "github.com/dash0hq/dash0-operator/test/util"
+	. "github.com/dash0hq/dash0-operator/test/util/targetallocator"
 )
 
 type configMapType string
@@ -32,16 +39,24 @@ const (
 	signalTypeTraces        signalType    = "traces"
 	signalTypeMetrics       signalType    = "metrics"
 	signalTypeLogs          signalType    = "logs"
+	signalTypeProfiles      signalType    = "profiles"
 	objectTypeSpan          objectType    = "span"
 	objectTypeSpanEvent     objectType    = "spanevent"
 	objectTypeMetric        objectType    = "metric"
 	objectTypeDataPoint     objectType    = "datapoint"
 	objectTypeLogRecord     objectType    = "log_record"
+	objectTypeProfile       objectType    = "profile"
 )
 
 type configMapTypeDefinition struct {
 	cmType                    configMapType
-	assembleConfigMapFunction func(*oTelColConfig, []string, []NamespacedFilter, []NamespacedTransform, bool) (*corev1.ConfigMap, error)
+	assembleConfigMapFunction func(
+		*oTelColConfig,
+		[]string,
+		[]NamespacedFilter,
+		[]NamespacedTransform,
+		bool,
+	) (*corev1.ConfigMap, error)
 }
 
 type conditionExpectationsPerObjectType map[signalType]map[objectType][]string
@@ -59,8 +74,9 @@ type filterTestConfigExpectations struct {
 
 type filterTestConfig struct {
 	configMapTypeDefinition
-	filters      []NamespacedFilter
-	expectations filterTestConfigExpectations
+	filters          []NamespacedFilter
+	profilingEnabled bool
+	expectations     filterTestConfigExpectations
 }
 
 type groupExpectations struct {
@@ -83,8 +99,9 @@ type transformTestConfigExpectations struct {
 
 type transformTestConfig struct {
 	configMapTypeDefinition
-	transforms   []NamespacedTransform
-	expectations transformTestConfigExpectations
+	transforms       []NamespacedTransform
+	profilingEnabled bool
+	expectations     transformTestConfigExpectations
 }
 
 const (
@@ -96,14 +113,16 @@ const (
 )
 
 var (
-	bearerWithAuthToken                  = fmt.Sprintf("Bearer ${env:%s}", authEnvVarNameDefault)
+	bearerWithAuthToken                  = fmt.Sprintf("Bearer ${env:%s}", authEnvVarNameDefaultIndexed(0))
 	monitoredNamespaces                  = []string{namespace1, namespace2}
 	emptyTargetAllocatorMtlsConfig       = TargetAllocatorMtlsConfig{}
 	defaultNamespacesWithEventCollection = []string{namespace2, namespace3}
 )
 
 func cmTestSingleDefaultOtlpExporter() otlpExporters {
-	exporter, _ := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	exporter, _ := convertDash0ExporterToOtlpExporter(export.Dash0, "default", auth)
 	return otlpExporters{
 		Default:    []otlpExporter{*exporter},
 		Namespaced: make(map[string][]otlpExporter),
@@ -111,7 +130,9 @@ func cmTestSingleDefaultOtlpExporter() otlpExporters {
 }
 
 func cmTestSingleDefaultOtlpExporterWithCustomDs() otlpExporters {
-	exporter, _ := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointTokenAndCustomDataset().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointTokenAndCustomDataset()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	exporter, _ := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointTokenAndCustomDataset().Dash0, "default", auth)
 	return otlpExporters{
 		Default:    []otlpExporter{*exporter},
 		Namespaced: make(map[string][]otlpExporter),
@@ -119,7 +140,9 @@ func cmTestSingleDefaultOtlpExporterWithCustomDs() otlpExporters {
 }
 
 func cmTestDash0AndGrpcExporters() otlpExporters {
-	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", auth)
 	Expect(err).ToNot(HaveOccurred())
 	grpcExporter, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "default")
 	Expect(err).ToNot(HaveOccurred())
@@ -130,7 +153,9 @@ func cmTestDash0AndGrpcExporters() otlpExporters {
 }
 
 func cmTestDash0AndHttpExporters() otlpExporters {
-	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", auth)
 	Expect(err).ToNot(HaveOccurred())
 	httpExporter, err := convertHttpExporterToOtlpExporter(HttpExportTest().Http, "default")
 	Expect(err).ToNot(HaveOccurred())
@@ -141,7 +166,9 @@ func cmTestDash0AndHttpExporters() otlpExporters {
 }
 
 func cmTestDash0GrpcAndHttpExporters() otlpExporters {
-	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0Exporter, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", auth)
 	Expect(err).ToNot(HaveOccurred())
 	grpcExporter, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "default")
 	Expect(err).ToNot(HaveOccurred())
@@ -156,7 +183,7 @@ func cmTestDash0GrpcAndHttpExporters() otlpExporters {
 func cmTestGrpcExporterWithInsecure() otlpExporters {
 	grpcExporter, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
 		Endpoint: grpcEndpointTest,
-		Insecure: ptr.To(true),
+		Insecure: new(true),
 		Headers: []dash0common.Header{{
 			Name:  "Key",
 			Value: "Value",
@@ -173,10 +200,12 @@ func cmTestHttpExporterWithInsecure() otlpExporters {
 	httpExporter, err := convertHttpExporterToOtlpExporter(&dash0common.HttpConfiguration{
 		Endpoint: httpInsecureEndpointTest,
 		Encoding: dash0common.Proto,
-		Headers: []dash0common.Header{{
-			Name:  "Key",
-			Value: "Value",
-		}},
+		Headers: []dash0common.Header{
+			{
+				Name:  "Key",
+				Value: "Value",
+			},
+		},
 	}, "default")
 	Expect(err).ToNot(HaveOccurred())
 	return otlpExporters{
@@ -185,8 +214,136 @@ func cmTestHttpExporterWithInsecure() otlpExporters {
 	}
 }
 
+func cmTestDash0ExporterWithKeepalive() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	export.Dash0.Keepalive = &dash0common.KeepaliveClientConfig{
+		Time:                new("30s"),
+		Timeout:             new("10s"),
+		PermitWithoutStream: new(true),
+	}
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	exporter, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default", auth)
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*exporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+func cmTestGrpcExporterWithKeepalive() otlpExporters {
+	grpcExporter, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
+		Endpoint: grpcEndpointTest,
+		Keepalive: &dash0common.KeepaliveClientConfig{
+			Time:                new("30s"),
+			Timeout:             new("10s"),
+			PermitWithoutStream: new(true),
+		},
+	}, "default")
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*grpcExporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+func cmTestDash0ExporterWithPartialKeepalive() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	export.Dash0.Keepalive = &dash0common.KeepaliveClientConfig{
+		Time: new("60s"),
+	}
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	exporter, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default", auth)
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*exporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+func cmTestGrpcExporterWithPartialKeepalive() otlpExporters {
+	grpcExporter, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
+		Endpoint: grpcEndpointTest,
+		Keepalive: &dash0common.KeepaliveClientConfig{
+			Time: new("60s"),
+		},
+	}, "default")
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*grpcExporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+func cmTestGrpcExporterWithBalancerName() otlpExporters {
+	grpcExporter, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
+		Endpoint:     grpcEndpointTest,
+		BalancerName: dash0common.PickFirst,
+	}, "default")
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*grpcExporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+func cmTestNamespacedExportersWithBalancerName() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default", auth)
+	Expect(err).ToNot(HaveOccurred())
+
+	grpcExporterNs1, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
+		Endpoint:     grpcEndpointTest,
+		BalancerName: dash0common.PickFirst,
+	}, "ns/"+namespace1)
+	Expect(err).ToNot(HaveOccurred())
+
+	return otlpExporters{
+		Default: []otlpExporter{*dash0ExporterDefault},
+		Namespaced: map[string][]otlpExporter{
+			namespace1: {*grpcExporterNs1},
+		},
+	}
+}
+
+func cmTestNamespacedExportersWithKeepalive() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default", auth)
+	Expect(err).ToNot(HaveOccurred())
+
+	dash0ExportNs := Dash0ExportWithEndpointAndToken()
+	dash0ExportNs.Dash0.Keepalive = &dash0common.KeepaliveClientConfig{
+		Time:                new("30s"),
+		Timeout:             new("10s"),
+		PermitWithoutStream: new(true),
+	}
+	ns1 := namespace1
+	authNs, _ := dash0ExporterAuthorizationForExport(*dash0ExportNs, 0, false, &ns1)
+	dash0ExporterNs1, err := convertDash0ExporterToOtlpExporter(dash0ExportNs.Dash0, "ns/"+namespace1, authNs)
+	Expect(err).ToNot(HaveOccurred())
+
+	grpcExporterNs2, err := convertGrpcExporterToOtlpExporter(&dash0common.GrpcConfiguration{
+		Endpoint: grpcEndpointTest,
+		Keepalive: &dash0common.KeepaliveClientConfig{
+			Time: new("45s"),
+		},
+	}, "ns/"+namespace2)
+	Expect(err).ToNot(HaveOccurred())
+
+	return otlpExporters{
+		Default: []otlpExporter{*dash0ExporterDefault},
+		Namespaced: map[string][]otlpExporter{
+			namespace1: {*dash0ExporterNs1},
+			namespace2: {*grpcExporterNs2},
+		},
+	}
+}
+
 func cmTestNamespacedOtlpExporters() otlpExporters {
-	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", auth)
 	Expect(err).ToNot(HaveOccurred())
 	grpcExporterNs1, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "ns/"+namespace1)
 	Expect(err).ToNot(HaveOccurred())
@@ -202,24 +359,113 @@ func cmTestNamespacedOtlpExporters() otlpExporters {
 }
 
 func cmTestMultipleNamespacedOtlpExporters() otlpExporters {
-	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", authEnvVarNameDefault)
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "default", auth)
 	Expect(err).ToNot(HaveOccurred())
 	grpcExporterNs1, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "ns/"+namespace1)
 	Expect(err).ToNot(HaveOccurred())
 	httpExporterNs1, err := convertHttpExporterToOtlpExporter(HttpExportTest().Http, "ns/"+namespace1)
 	Expect(err).ToNot(HaveOccurred())
-	dash0ExporterNs2, err := convertDash0ExporterToOtlpExporter(&dash0common.Dash0Configuration{
+	export2 := Dash0ExportWithEndpointAndToken()
+	export2.Dash0 = &dash0common.Dash0Configuration{
 		Endpoint: EndpointDash0TestAlternative,
 		Authorization: dash0common.Authorization{
 			Token: &AuthorizationTokenTestAlternative,
 		},
-	}, "ns/"+namespace2, authEnvVarNameForNs(namespace2))
+	}
+	auth2, _ := dash0ExporterAuthorizationForExport(*export2, 0, true, nil)
+	dash0ExporterNs2, err := convertDash0ExporterToOtlpExporter(export2.Dash0, "ns/"+namespace2, auth2)
 	Expect(err).ToNot(HaveOccurred())
 	return otlpExporters{
 		Default: []otlpExporter{*dash0ExporterDefault},
 		Namespaced: map[string][]otlpExporter{
 			namespace1: {*grpcExporterNs1, *httpExporterNs1},
 			namespace2: {*dash0ExporterNs2},
+		},
+	}
+}
+
+// cmTestMultipleDefaultDash0Exporters creates two Dash0 default exporters (simulating two Exports entries
+// each with a Dash0 config), which is only possible with multiple Exports array elements.
+func cmTestMultipleDefaultDash0Exporters() otlpExporters {
+	export1 := Dash0ExportWithEndpointAndToken()
+	auth1, _ := dash0ExporterAuthorizationForExport(*export1, 0, true, nil)
+	dash0Exporter1, err := convertDash0ExporterToOtlpExporter(export1.Dash0, "default_0", auth1)
+	Expect(err).ToNot(HaveOccurred())
+
+	export2 := &dash0common.Export{
+		Dash0: &dash0common.Dash0Configuration{
+			Endpoint: EndpointDash0TestAlternative,
+			Authorization: dash0common.Authorization{
+				Token: &AuthorizationTokenTestAlternative,
+			},
+		},
+	}
+	auth2, _ := dash0ExporterAuthorizationForExport(*export2, 1, true, nil)
+	dash0Exporter2, err := convertDash0ExporterToOtlpExporter(export2.Dash0, "default_1", auth2)
+	Expect(err).ToNot(HaveOccurred())
+
+	return otlpExporters{
+		Default:    []otlpExporter{*dash0Exporter1, *dash0Exporter2},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+// cmTestMultipleExportsDefaultMixed creates three default exporters from multiple Exports entries:
+// Exports[0] has Dash0, Exports[1] has gRPC, Exports[2] has HTTP.
+func cmTestMultipleExportsDefaultMixed() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0Exporter, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default_0", auth)
+	Expect(err).ToNot(HaveOccurred())
+	grpcExporter, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "default_1")
+	Expect(err).ToNot(HaveOccurred())
+	httpExporter, err := convertHttpExporterToOtlpExporter(HttpExportTest().Http, "default_2")
+	Expect(err).ToNot(HaveOccurred())
+	return otlpExporters{
+		Default:    []otlpExporter{*dash0Exporter, *grpcExporter, *httpExporter},
+		Namespaced: make(map[string][]otlpExporter),
+	}
+}
+
+// cmTestMultipleExportsWithNamespacedMultiExporters creates a scenario where multiple Exports entries
+// produce multiple exporters per namespace.
+func cmTestMultipleExportsWithNamespacedMultiExporters() otlpExporters {
+	export := Dash0ExportWithEndpointAndToken()
+	auth, _ := dash0ExporterAuthorizationForExport(*export, 0, true, nil)
+	dash0ExporterDefault, err := convertDash0ExporterToOtlpExporter(export.Dash0, "default_0", auth)
+	Expect(err).ToNot(HaveOccurred())
+
+	// namespace-1: Exports[0] = Dash0, Exports[1] = gRPC (two separate Exports entries)
+	ns1 := namespace1
+	authNs1, _ := dash0ExporterAuthorizationForExport(*Dash0ExportWithEndpointAndToken(), 0, false, &ns1)
+	dash0ExporterNs1, err := convertDash0ExporterToOtlpExporter(Dash0ExportWithEndpointAndToken().Dash0, "ns/"+namespace1+"_0", authNs1)
+	Expect(err).ToNot(HaveOccurred())
+	grpcExporterNs1, err := convertGrpcExporterToOtlpExporter(GrpcExportTest().Grpc, "ns/"+namespace1+"_1")
+	Expect(err).ToNot(HaveOccurred())
+
+	// namespace-2: Exports[0] = HTTP, Exports[1] = Dash0 (two separate Exports entries)
+	ns2 := namespace2
+	export2 := &dash0common.Export{
+		Dash0: &dash0common.Dash0Configuration{
+			Endpoint: EndpointDash0TestAlternative,
+			Authorization: dash0common.Authorization{
+				Token: &AuthorizationTokenTestAlternative,
+			},
+		},
+	}
+	authNs2, _ := dash0ExporterAuthorizationForExport(*export2, 1, false, &ns2)
+	httpExporterNs2, err := convertHttpExporterToOtlpExporter(HttpExportTest().Http, "ns/"+namespace2+"_0")
+	Expect(err).ToNot(HaveOccurred())
+	dash0ExporterNs2, err := convertDash0ExporterToOtlpExporter(export2.Dash0, "ns/"+namespace2+"_1", authNs2)
+	Expect(err).ToNot(HaveOccurred())
+
+	return otlpExporters{
+		Default: []otlpExporter{*dash0ExporterDefault},
+		Namespaced: map[string][]otlpExporter{
+			namespace1: {*dash0ExporterNs1, *grpcExporterNs1},
+			namespace2: {*httpExporterNs2, *dash0ExporterNs2},
 		},
 	}
 }
@@ -237,7 +483,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		},
 	}
 
-	var daemonSetAndDeployment []TableEntry
+	daemonSetAndDeployment := make([]TableEntry, 0, len(configMapTypeDefinitions))
 	for _, cmTypeDef := range configMapTypeDefinitions {
 		daemonSetAndDeployment = append(
 			daemonSetAndDeployment,
@@ -258,17 +504,17 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(1))
 
-			exporter := exporters["otlp/dash0/default"]
+			exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(exporter).ToNot(BeNil())
-			dash0OtlpExporter := exporter.(map[string]interface{})
+			dash0OtlpExporter := exporter.(map[string]any)
 			Expect(dash0OtlpExporter).ToNot(BeNil())
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 			headersRaw := dash0OtlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers := headersRaw.(map[string]interface{})
+			headers := headersRaw.(map[string]any)
 			Expect(headers).To(HaveLen(1))
 			Expect(headers[util.AuthorizationHeaderName]).To(Equal(bearerWithAuthToken))
 			Expect(headers[util.Dash0DatasetHeaderName]).To(BeNil())
@@ -288,17 +534,17 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(1))
 
-			exporter := exporters["otlp/dash0/default"]
+			exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(exporter).ToNot(BeNil())
-			dash0OtlpExporter := exporter.(map[string]interface{})
+			dash0OtlpExporter := exporter.(map[string]any)
 			Expect(dash0OtlpExporter).ToNot(BeNil())
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 			headersRaw := dash0OtlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers := headersRaw.(map[string]interface{})
+			headers := headersRaw.(map[string]any)
 			Expect(headers).To(HaveLen(2))
 			Expect(headers[util.AuthorizationHeaderName]).To(Equal(bearerWithAuthToken))
 			Expect(headers[util.Dash0DatasetHeaderName]).To(Equal(DatasetCustomTest))
@@ -318,22 +564,22 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(2))
 
 			debugExporterRaw := exporters["debug"]
 			Expect(debugExporterRaw).ToNot(BeNil())
-			debugExporter := debugExporterRaw.(map[string]interface{})
+			debugExporter := debugExporterRaw.(map[string]any)
 			Expect(debugExporter).To(HaveLen(0))
 
-			exporter := exporters["otlp/dash0/default"]
+			exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(exporter).ToNot(BeNil())
-			dash0OtlpExporter := exporter.(map[string]interface{})
+			dash0OtlpExporter := exporter.(map[string]any)
 			Expect(dash0OtlpExporter).ToNot(BeNil())
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 			headersRaw := dash0OtlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers := headersRaw.(map[string]interface{})
+			headers := headersRaw.(map[string]any)
 			Expect(headers).To(HaveLen(1))
 			Expect(headers[util.AuthorizationHeaderName]).To(Equal(bearerWithAuthToken))
 			Expect(headers[util.Dash0DatasetHeaderName]).To(BeNil())
@@ -355,12 +601,12 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(2))
 
 			debugExporterRaw := exporters["debug"]
 			Expect(debugExporterRaw).ToNot(BeNil())
-			debugExporter := debugExporterRaw.(map[string]interface{})
+			debugExporter := debugExporterRaw.(map[string]any)
 			Expect(debugExporter).To(HaveLen(1))
 			Expect(debugExporter["verbosity"]).To(Equal("detailed"))
 
@@ -378,7 +624,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			extensionsRaw := collectorConfig["extensions"]
 			Expect(extensionsRaw).ToNot(BeNil())
-			extensions := extensionsRaw.(map[string]interface{})
+			extensions := extensionsRaw.(map[string]any)
 			Expect(maps.Keys(extensions)).ToNot(ContainElement("pprof"))
 
 			serviceExtensions := ReadFromMap(collectorConfig, []string{"service", "extensions"})
@@ -398,7 +644,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			extensionsRaw := collectorConfig["extensions"]
 			Expect(extensionsRaw).ToNot(BeNil())
-			extensions := extensionsRaw.(map[string]interface{})
+			extensions := extensionsRaw.(map[string]any)
 			Expect(maps.Keys(extensions)).To(ContainElement("pprof"))
 
 			serviceExtensions := ReadFromMap(collectorConfig, []string{"service", "extensions"})
@@ -418,27 +664,27 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(2))
 
 			// Verify Dash0 exporter
-			dash0Exporter := exporters["otlp/dash0/default"]
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(dash0Exporter).ToNot(BeNil())
-			dash0OtlpExporter := dash0Exporter.(map[string]interface{})
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 			headersRaw := dash0OtlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers := headersRaw.(map[string]interface{})
+			headers := headersRaw.(map[string]any)
 			Expect(headers[util.AuthorizationHeaderName]).To(Equal(bearerWithAuthToken))
 
 			// Verify gRPC exporter
-			grpcExporter := exporters["otlp/grpc/default"]
+			grpcExporter := exporters["otlp_grpc/default"]
 			Expect(grpcExporter).ToNot(BeNil())
-			grpcOtlpExporter := grpcExporter.(map[string]interface{})
+			grpcOtlpExporter := grpcExporter.(map[string]any)
 			Expect(grpcOtlpExporter["endpoint"]).To(Equal(EndpointGrpcTest))
 			grpcHeadersRaw := grpcOtlpExporter["headers"]
 			Expect(grpcHeadersRaw).ToNot(BeNil())
-			grpcHeaders := grpcHeadersRaw.(map[string]interface{})
+			grpcHeaders := grpcHeadersRaw.(map[string]any)
 			Expect(grpcHeaders["Key"]).To(Equal("Value"))
 		}, daemonSetAndDeployment)
 
@@ -454,24 +700,24 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(2))
 
 			// Verify Dash0 exporter
-			dash0Exporter := exporters["otlp/dash0/default"]
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(dash0Exporter).ToNot(BeNil())
-			dash0OtlpExporter := dash0Exporter.(map[string]interface{})
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 
 			// Verify HTTP exporter
-			httpExporter := exporters["otlphttp/default/proto"]
+			httpExporter := exporters["otlp_http/default/proto"]
 			Expect(httpExporter).ToNot(BeNil())
-			httpOtlpExporter := httpExporter.(map[string]interface{})
+			httpOtlpExporter := httpExporter.(map[string]any)
 			Expect(httpOtlpExporter["endpoint"]).To(Equal(EndpointHttpTest))
 			Expect(httpOtlpExporter["encoding"]).To(Equal("proto"))
 			httpHeadersRaw := httpOtlpExporter["headers"]
 			Expect(httpHeadersRaw).ToNot(BeNil())
-			httpHeaders := httpHeadersRaw.(map[string]interface{})
+			httpHeaders := httpHeadersRaw.(map[string]any)
 			Expect(httpHeaders["Key"]).To(Equal("Value"))
 		}, daemonSetAndDeployment)
 
@@ -487,25 +733,25 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(3))
 
 			// Verify Dash0 exporter
-			dash0Exporter := exporters["otlp/dash0/default"]
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(dash0Exporter).ToNot(BeNil())
-			dash0OtlpExporter := dash0Exporter.(map[string]interface{})
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
 
 			// Verify gRPC exporter
-			grpcExporter := exporters["otlp/grpc/default"]
+			grpcExporter := exporters["otlp_grpc/default"]
 			Expect(grpcExporter).ToNot(BeNil())
-			grpcOtlpExporter := grpcExporter.(map[string]interface{})
+			grpcOtlpExporter := grpcExporter.(map[string]any)
 			Expect(grpcOtlpExporter["endpoint"]).To(Equal(EndpointGrpcTest))
 
 			// Verify HTTP exporter
-			httpExporter := exporters["otlphttp/default/proto"]
+			httpExporter := exporters["otlp_http/default/proto"]
 			Expect(httpExporter).ToNot(BeNil())
-			httpOtlpExporter := httpExporter.(map[string]interface{})
+			httpOtlpExporter := httpExporter.(map[string]any)
 			Expect(httpOtlpExporter["endpoint"]).To(Equal(EndpointHttpTest))
 			Expect(httpOtlpExporter["encoding"]).To(Equal("proto"))
 		}, daemonSetAndDeployment)
@@ -522,19 +768,19 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(1))
 
 			// Verify gRPC exporter with insecure flag
-			grpcExporter := exporters["otlp/grpc/default"]
+			grpcExporter := exporters["otlp_grpc/default"]
 			Expect(grpcExporter).ToNot(BeNil())
-			grpcOtlpExporter := grpcExporter.(map[string]interface{})
+			grpcOtlpExporter := grpcExporter.(map[string]any)
 			Expect(grpcOtlpExporter["endpoint"]).To(Equal(grpcEndpointTest))
 
 			// Verify tls config with insecure = true
 			tlsRaw := grpcOtlpExporter["tls"]
 			Expect(tlsRaw).ToNot(BeNil())
-			tls := tlsRaw.(map[string]interface{})
+			tls := tlsRaw.(map[string]any)
 			Expect(tls["insecure"]).To(Equal(true))
 		}, daemonSetAndDeployment)
 
@@ -550,15 +796,266 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(1))
 
 			// Verify HTTP exporter with insecure endpoint
-			httpExporter := exporters["otlphttp/default/proto"]
+			httpExporter := exporters["otlp_http/default/proto"]
 			Expect(httpExporter).ToNot(BeNil())
-			httpOtlpExporter := httpExporter.(map[string]interface{})
+			httpOtlpExporter := httpExporter.(map[string]any)
 			Expect(httpOtlpExporter["endpoint"]).To(Equal(httpInsecureEndpointTest))
 			Expect(httpOtlpExporter["encoding"]).To(Equal("proto"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render Dash0 exporter with keepalive config", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestDash0ExporterWithKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
+			Expect(dash0Exporter).ToNot(BeNil())
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
+
+			keepaliveRaw := dash0OtlpExporter["keepalive"]
+			Expect(keepaliveRaw).ToNot(BeNil())
+			keepalive := keepaliveRaw.(map[string]any)
+			Expect(keepalive["time"]).To(Equal("30s"))
+			Expect(keepalive["timeout"]).To(Equal("10s"))
+			Expect(keepalive["permit_without_stream"]).To(Equal(true))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render gRPC exporter with keepalive config", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestGrpcExporterWithKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			grpcExporter := exporters["otlp_grpc/default"]
+			Expect(grpcExporter).ToNot(BeNil())
+			grpcOtlpExporter := grpcExporter.(map[string]any)
+
+			keepaliveRaw := grpcOtlpExporter["keepalive"]
+			Expect(keepaliveRaw).ToNot(BeNil())
+			keepalive := keepaliveRaw.(map[string]any)
+			Expect(keepalive["time"]).To(Equal("30s"))
+			Expect(keepalive["timeout"]).To(Equal("10s"))
+			Expect(keepalive["permit_without_stream"]).To(Equal(true))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render Dash0 exporter with partial keepalive config", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestDash0ExporterWithPartialKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
+			Expect(dash0Exporter).ToNot(BeNil())
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
+
+			keepaliveRaw := dash0OtlpExporter["keepalive"]
+			Expect(keepaliveRaw).ToNot(BeNil())
+			keepalive := keepaliveRaw.(map[string]any)
+			Expect(keepalive["time"]).To(Equal("60s"))
+			Expect(keepalive).ToNot(HaveKey("timeout"))
+			Expect(keepalive).ToNot(HaveKey("permit_without_stream"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render gRPC exporter with partial keepalive config", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestGrpcExporterWithPartialKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			grpcExporter := exporters["otlp_grpc/default"]
+			Expect(grpcExporter).ToNot(BeNil())
+			grpcOtlpExporter := grpcExporter.(map[string]any)
+
+			keepaliveRaw := grpcOtlpExporter["keepalive"]
+			Expect(keepaliveRaw).ToNot(BeNil())
+			keepalive := keepaliveRaw.(map[string]any)
+			Expect(keepalive["time"]).To(Equal("60s"))
+			Expect(keepalive).ToNot(HaveKey("timeout"))
+			Expect(keepalive).ToNot(HaveKey("permit_without_stream"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should not render keepalive when not configured", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
+			Expect(dash0Exporter).ToNot(BeNil())
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
+			Expect(dash0OtlpExporter).ToNot(HaveKey("keepalive"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render namespaced exporters with keepalive config", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedExportersWithKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+			Expect(exporters).To(HaveLen(3))
+
+			// Default exporter should have no keepalive
+			defaultExporter := exporters["otlp_grpc/dash0/default"]
+			Expect(defaultExporter).ToNot(BeNil())
+			defaultOtlpExporter := defaultExporter.(map[string]any)
+			Expect(defaultOtlpExporter).ToNot(HaveKey("keepalive"))
+
+			// Namespaced Dash0 exporter with full keepalive
+			dash0ExporterNs1 := exporters["otlp_grpc/dash0/ns/"+namespace1]
+			Expect(dash0ExporterNs1).ToNot(BeNil())
+			dash0OtlpExporterNs1 := dash0ExporterNs1.(map[string]any)
+			keepaliveRaw := dash0OtlpExporterNs1["keepalive"]
+			Expect(keepaliveRaw).ToNot(BeNil())
+			keepalive := keepaliveRaw.(map[string]any)
+			Expect(keepalive["time"]).To(Equal("30s"))
+			Expect(keepalive["timeout"]).To(Equal("10s"))
+			Expect(keepalive["permit_without_stream"]).To(Equal(true))
+
+			// Namespaced gRPC exporter with partial keepalive
+			grpcExporterNs2 := exporters["otlp_grpc/ns/"+namespace2]
+			Expect(grpcExporterNs2).ToNot(BeNil())
+			grpcOtlpExporterNs2 := grpcExporterNs2.(map[string]any)
+			keepaliveRaw2 := grpcOtlpExporterNs2["keepalive"]
+			Expect(keepaliveRaw2).ToNot(BeNil())
+			keepalive2 := keepaliveRaw2.(map[string]any)
+			Expect(keepalive2["time"]).To(Equal("45s"))
+			Expect(keepalive2).ToNot(HaveKey("timeout"))
+			Expect(keepalive2).ToNot(HaveKey("permit_without_stream"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should always render balancer_name: pick_first on the Dash0 exporter", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
+			Expect(dash0Exporter).ToNot(BeNil())
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
+			Expect(dash0OtlpExporter["balancer_name"]).To(Equal("pick_first"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render balancer_name on gRPC exporter when configured", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestGrpcExporterWithBalancerName(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			grpcExporter := exporters["otlp_grpc/default"]
+			Expect(grpcExporter).ToNot(BeNil())
+			grpcOtlpExporter := grpcExporter.(map[string]any)
+			Expect(grpcOtlpExporter["balancer_name"]).To(Equal("pick_first"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should not render balancer_name on gRPC exporter when not configured", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestGrpcExporterWithKeepalive(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			grpcExporter := exporters["otlp_grpc/default"]
+			Expect(grpcExporter).ToNot(BeNil())
+			grpcOtlpExporter := grpcExporter.(map[string]any)
+			Expect(grpcOtlpExporter).ToNot(HaveKey("balancer_name"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render balancer_name in namespaced exporters", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedExportersWithBalancerName(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+
+			// Default Dash0 exporter always pick_first
+			defaultDash0 := exporters["otlp_grpc/dash0/default"].(map[string]any)
+			Expect(defaultDash0["balancer_name"]).To(Equal("pick_first"))
+
+			// Namespaced gRPC exporter with the configured value
+			grpcNs1 := exporters["otlp_grpc/ns/"+namespace1].(map[string]any)
+			Expect(grpcNs1["balancer_name"]).To(Equal("pick_first"))
 		}, daemonSetAndDeployment)
 
 		DescribeTable("should render namespaced OTLP exporters", func(cmTypeDef configMapTypeDefinition) {
@@ -573,23 +1070,23 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(3))
 
 			// Verify default Dash0 exporter
-			dash0Exporter := exporters["otlp/dash0/default"]
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(dash0Exporter).ToNot(BeNil())
 
 			// Verify namespaced gRPC exporter for namespace1
-			grpcExporterNs1 := exporters["otlp/grpc/ns/"+namespace1]
+			grpcExporterNs1 := exporters["otlp_grpc/ns/"+namespace1]
 			Expect(grpcExporterNs1).ToNot(BeNil())
-			grpcOtlpExporter := grpcExporterNs1.(map[string]interface{})
+			grpcOtlpExporter := grpcExporterNs1.(map[string]any)
 			Expect(grpcOtlpExporter["endpoint"]).To(Equal(EndpointGrpcTest))
 
 			// Verify namespaced HTTP exporter for namespace2
-			httpExporterNs2 := exporters["otlphttp/ns/"+namespace2+"/proto"]
+			httpExporterNs2 := exporters["otlp_http/ns/"+namespace2+"/proto"]
 			Expect(httpExporterNs2).ToNot(BeNil())
-			httpOtlpExporter := httpExporterNs2.(map[string]interface{})
+			httpOtlpExporter := httpExporterNs2.(map[string]any)
 			Expect(httpOtlpExporter["endpoint"]).To(Equal(EndpointHttpTest))
 			Expect(httpOtlpExporter["encoding"]).To(Equal("proto"))
 		}, daemonSetAndDeployment)
@@ -606,26 +1103,264 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			collectorConfig := parseConfigMapContent(configMap)
 			exportersRaw := collectorConfig["exporters"]
 			Expect(exportersRaw).ToNot(BeNil())
-			exporters := exportersRaw.(map[string]interface{})
+			exporters := exportersRaw.(map[string]any)
 			Expect(exporters).To(HaveLen(4))
 
 			// Verify default Dash0 exporter
-			dash0Exporter := exporters["otlp/dash0/default"]
+			dash0Exporter := exporters["otlp_grpc/dash0/default"]
 			Expect(dash0Exporter).ToNot(BeNil())
 
 			// Verify namespace1 has both gRPC and HTTP exporters
-			grpcExporterNs1 := exporters["otlp/grpc/ns/"+namespace1]
+			grpcExporterNs1 := exporters["otlp_grpc/ns/"+namespace1]
 			Expect(grpcExporterNs1).ToNot(BeNil())
 
-			httpExporterNs1 := exporters["otlphttp/ns/"+namespace1+"/proto"]
+			httpExporterNs1 := exporters["otlp_http/ns/"+namespace1+"/proto"]
 			Expect(httpExporterNs1).ToNot(BeNil())
 
 			// Verify namespace2 has a Dash0 exporter
-			dash0ExporterNs2 := exporters["otlp/dash0/ns/"+namespace2]
+			dash0ExporterNs2 := exporters["otlp_grpc/dash0/ns/"+namespace2]
 			Expect(dash0ExporterNs2).ToNot(BeNil())
-			dash0OtlpExporter := dash0ExporterNs2.(map[string]interface{})
+			dash0OtlpExporter := dash0ExporterNs2.(map[string]any)
 			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0TestAlternative))
 		}, daemonSetAndDeployment)
+
+		DescribeTable("should render two Dash0 default exporters from multiple Exports entries", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleDefaultDash0Exporters(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+			Expect(exporters).To(HaveLen(2))
+
+			// Verify first Dash0 exporter
+			dash0Exporter1 := exporters["otlp_grpc/dash0/default_0"]
+			Expect(dash0Exporter1).ToNot(BeNil())
+			dash0OtlpExporter1 := dash0Exporter1.(map[string]any)
+			Expect(dash0OtlpExporter1["endpoint"]).To(Equal(EndpointDash0Test))
+			headers1 := dash0OtlpExporter1["headers"].(map[string]any)
+			Expect(headers1[util.AuthorizationHeaderName]).To(
+				Equal(fmt.Sprintf("Bearer ${env:%s}", authEnvVarNameDefaultIndexed(0))))
+
+			// Verify second Dash0 exporter (different endpoint and auth)
+			dash0Exporter2 := exporters["otlp_grpc/dash0/default_1"]
+			Expect(dash0Exporter2).ToNot(BeNil())
+			dash0OtlpExporter2 := dash0Exporter2.(map[string]any)
+			Expect(dash0OtlpExporter2["endpoint"]).To(Equal(EndpointDash0TestAlternative))
+			headers2 := dash0OtlpExporter2["headers"].(map[string]any)
+			Expect(headers2[util.AuthorizationHeaderName]).To(
+				Equal(fmt.Sprintf("Bearer ${env:%s}", authEnvVarNameDefaultIndexed(1))))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should render mixed default exporters from multiple Exports entries (Dash0 + gRPC + HTTP)", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsDefaultMixed(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+			Expect(exporters).To(HaveLen(3))
+
+			// Verify Dash0 exporter (index 0)
+			dash0Exporter := exporters["otlp_grpc/dash0/default_0"]
+			Expect(dash0Exporter).ToNot(BeNil())
+			dash0OtlpExporter := dash0Exporter.(map[string]any)
+			Expect(dash0OtlpExporter["endpoint"]).To(Equal(EndpointDash0Test))
+
+			// Verify gRPC exporter (index 1)
+			grpcExporter := exporters["otlp_grpc/default_1"]
+			Expect(grpcExporter).ToNot(BeNil())
+			grpcOtlpExporter := grpcExporter.(map[string]any)
+			Expect(grpcOtlpExporter["endpoint"]).To(Equal(EndpointGrpcTest))
+
+			// Verify HTTP exporter (index 2)
+			httpExporter := exporters["otlp_http/default_2/proto"]
+			Expect(httpExporter).ToNot(BeNil())
+			httpOtlpExporter := httpExporter.(map[string]any)
+			Expect(httpOtlpExporter["endpoint"]).To(Equal(EndpointHttpTest))
+			Expect(httpOtlpExporter["encoding"]).To(Equal("proto"))
+		}, daemonSetAndDeployment)
+
+		It("should list all default exporters in the default export pipeline [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsDefaultMixed(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			// All three exporters should be in the traces/export/default pipeline
+			tracesExportDefaultExporters := readPipelineExporters(pipelines, "traces/export/default")
+			Expect(tracesExportDefaultExporters).To(ContainElement("otlp_grpc/dash0/default_0"))
+			Expect(tracesExportDefaultExporters).To(ContainElement("otlp_grpc/default_1"))
+			Expect(tracesExportDefaultExporters).To(ContainElement("otlp_http/default_2/proto"))
+
+			// All three exporters should be in the metrics/export/default pipeline
+			metricsExportDefaultExporters := readPipelineExporters(pipelines, "metrics/export/default")
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_grpc/dash0/default_0"))
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_grpc/default_1"))
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_http/default_2/proto"))
+
+			// All three exporters should be in the logs/export/default pipeline
+			logsExportDefaultExporters := readPipelineExporters(pipelines, "logs/export/default")
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_grpc/dash0/default_0"))
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_grpc/default_1"))
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_http/default_2/proto"))
+		})
+
+		It("should list all default exporters in the default export pipeline [Deployment]", func() {
+			configMap, err := assembleDeploymentCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsDefaultMixed(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, defaultNamespacesWithEventCollection, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			// All three exporters should be in the metrics/export/default pipeline
+			metricsExportDefaultExporters := readPipelineExporters(pipelines, "metrics/export/default")
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_grpc/dash0/default_0"))
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_grpc/default_1"))
+			Expect(metricsExportDefaultExporters).To(ContainElement("otlp_http/default_2/proto"))
+
+			// All three exporters should be in the logs/export/default pipeline
+			logsExportDefaultExporters := readPipelineExporters(pipelines, "logs/export/default")
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_grpc/dash0/default_0"))
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_grpc/default_1"))
+			Expect(logsExportDefaultExporters).To(ContainElement("otlp_http/default_2/proto"))
+		})
+
+		DescribeTable("should render namespaced exporters with multiple Exports entries per namespace", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsWithNamespacedMultiExporters(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			exportersRaw := collectorConfig["exporters"]
+			Expect(exportersRaw).ToNot(BeNil())
+			exporters := exportersRaw.(map[string]any)
+			// 1 default + 2 for namespace1 + 2 for namespace2 = 5
+			Expect(exporters).To(HaveLen(5))
+
+			// Verify default exporter
+			defaultExporter := exporters["otlp_grpc/dash0/default_0"]
+			Expect(defaultExporter).ToNot(BeNil())
+
+			// Verify namespace-1 exporters (Dash0 + gRPC)
+			dash0ExporterNs1 := exporters["otlp_grpc/dash0/ns/"+namespace1+"_0"]
+			Expect(dash0ExporterNs1).ToNot(BeNil())
+			dash0OtlpExporterNs1 := dash0ExporterNs1.(map[string]any)
+			Expect(dash0OtlpExporterNs1["endpoint"]).To(Equal(EndpointDash0Test))
+
+			grpcExporterNs1 := exporters["otlp_grpc/ns/"+namespace1+"_1"]
+			Expect(grpcExporterNs1).ToNot(BeNil())
+			grpcOtlpExporterNs1 := grpcExporterNs1.(map[string]any)
+			Expect(grpcOtlpExporterNs1["endpoint"]).To(Equal(EndpointGrpcTest))
+
+			// Verify namespace-2 exporters (HTTP + Dash0)
+			httpExporterNs2 := exporters["otlp_http/ns/"+namespace2+"_0/proto"]
+			Expect(httpExporterNs2).ToNot(BeNil())
+			httpOtlpExporterNs2 := httpExporterNs2.(map[string]any)
+			Expect(httpOtlpExporterNs2["endpoint"]).To(Equal(EndpointHttpTest))
+
+			dash0ExporterNs2 := exporters["otlp_grpc/dash0/ns/"+namespace2+"_1"]
+			Expect(dash0ExporterNs2).ToNot(BeNil())
+			dash0OtlpExporterNs2 := dash0ExporterNs2.(map[string]any)
+			Expect(dash0OtlpExporterNs2["endpoint"]).To(Equal(EndpointDash0TestAlternative))
+		}, daemonSetAndDeployment)
+
+		It("should list all namespaced exporters in namespace-specific export pipelines [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsWithNamespacedMultiExporters(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			// namespace-1 pipelines should include both Dash0 and gRPC exporters
+			tracesExportNs1Exporters := readPipelineExporters(pipelines, "traces/export/ns/"+namespace1)
+			Expect(tracesExportNs1Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace1 + "_0"))
+			Expect(tracesExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1 + "_1"))
+
+			metricsExportNs1Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace1)
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace1 + "_0"))
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1 + "_1"))
+
+			logsExportNs1Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace1)
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace1 + "_0"))
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1 + "_1"))
+
+			// namespace-2 pipelines should include both HTTP and Dash0 exporters
+			tracesExportNs2Exporters := readPipelineExporters(pipelines, "traces/export/ns/"+namespace2)
+			Expect(tracesExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "_0/proto"))
+			Expect(tracesExportNs2Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace2 + "_1"))
+
+			metricsExportNs2Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace2)
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "_0/proto"))
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace2 + "_1"))
+
+			logsExportNs2Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace2)
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "_0/proto"))
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace2 + "_1"))
+		})
+
+		It("should list all namespaced exporters in namespace-specific export pipelines [Deployment]", func() {
+			configMap, err := assembleDeploymentCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestMultipleExportsWithNamespacedMultiExporters(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, defaultNamespacesWithEventCollection, nil, nil, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			// namespace-1 pipelines should include both Dash0 and gRPC exporters
+			metricsExportNs1Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace1)
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace1 + "_0"))
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1 + "_1"))
+
+			logsExportNs1Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace1)
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace1 + "_0"))
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1 + "_1"))
+
+			// namespace-2 pipelines should include both HTTP and Dash0 exporters
+			metricsExportNs2Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace2)
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "_0/proto"))
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace2 + "_1"))
+
+			logsExportNs2Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace2)
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "_0/proto"))
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_grpc/dash0/ns/" + namespace2 + "_1"))
+		})
 
 		It("should render routing connectors when namespaced exporters are configured [DaemonSet])", func() {
 			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
@@ -641,30 +1376,30 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			// Verify routing connectors are created
 			connectorsRaw := collectorConfig["connectors"]
 			Expect(connectorsRaw).ToNot(BeNil())
-			connectors := connectorsRaw.(map[string]interface{})
+			connectors := connectorsRaw.(map[string]any)
 
 			// Verify routing connector for traces
 			routingTracesRaw := connectors["routing/traces"]
 			Expect(routingTracesRaw).ToNot(BeNil())
-			routingTraces := routingTracesRaw.(map[string]interface{})
+			routingTraces := routingTracesRaw.(map[string]any)
 			Expect(routingTraces["error_mode"]).To(Equal("ignore"))
-			defaultPipelinesTraces := routingTraces["default_pipelines"].([]interface{})
+			defaultPipelinesTraces := routingTraces["default_pipelines"].([]any)
 			Expect(defaultPipelinesTraces).To(ContainElement("traces/export/default"))
 
 			// Verify routing connector for metrics
 			routingMetricsRaw := connectors["routing/metrics"]
 			Expect(routingMetricsRaw).ToNot(BeNil())
-			routingMetrics := routingMetricsRaw.(map[string]interface{})
+			routingMetrics := routingMetricsRaw.(map[string]any)
 			Expect(routingMetrics["error_mode"]).To(Equal("ignore"))
-			defaultPipelinesMetrics := routingMetrics["default_pipelines"].([]interface{})
+			defaultPipelinesMetrics := routingMetrics["default_pipelines"].([]any)
 			Expect(defaultPipelinesMetrics).To(ContainElement("metrics/export/default"))
 
 			// Verify routing connector for logs
 			routingLogsRaw := connectors["routing/logs"]
 			Expect(routingLogsRaw).ToNot(BeNil())
-			routingLogs := routingLogsRaw.(map[string]interface{})
+			routingLogs := routingLogsRaw.(map[string]any)
 			Expect(routingLogs["error_mode"]).To(Equal("ignore"))
-			defaultPipelinesLogs := routingLogs["default_pipelines"].([]interface{})
+			defaultPipelinesLogs := routingLogs["default_pipelines"].([]any)
 			Expect(defaultPipelinesLogs).To(ContainElement("logs/export/default"))
 		})
 
@@ -682,23 +1417,194 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			// Verify routing connectors are created
 			connectorsRaw := collectorConfig["connectors"]
 			Expect(connectorsRaw).ToNot(BeNil())
-			connectors := connectorsRaw.(map[string]interface{})
+			connectors := connectorsRaw.(map[string]any)
 
 			// Verify routing connector for metrics
 			routingMetricsRaw := connectors["routing/metrics"]
 			Expect(routingMetricsRaw).ToNot(BeNil())
-			routingMetrics := routingMetricsRaw.(map[string]interface{})
+			routingMetrics := routingMetricsRaw.(map[string]any)
 			Expect(routingMetrics["error_mode"]).To(Equal("ignore"))
-			defaultPipelinesMetrics := routingMetrics["default_pipelines"].([]interface{})
+			defaultPipelinesMetrics := routingMetrics["default_pipelines"].([]any)
 			Expect(defaultPipelinesMetrics).To(ContainElement("metrics/export/default"))
 
 			// Verify routing connector for logs
 			routingLogsRaw := connectors["routing/logs"]
 			Expect(routingLogsRaw).ToNot(BeNil())
-			routingLogs := routingLogsRaw.(map[string]interface{})
+			routingLogs := routingLogsRaw.(map[string]any)
 			Expect(routingLogs["error_mode"]).To(Equal("ignore"))
-			defaultPipelinesLogs := routingLogs["default_pipelines"].([]interface{})
+			defaultPipelinesLogs := routingLogs["default_pipelines"].([]any)
 			Expect(defaultPipelinesLogs).To(ContainElement("logs/export/default"))
+		})
+
+		It("should not render profiling pipelines or connectors when profiling is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  false,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]any)
+			Expect(connectors).ToNot(HaveKey("forward/profiles-processors"))
+			Expect(connectors).ToNot(HaveKey("forward/profiles-default-exporter"))
+
+			pipelines := readPipelines(collectorConfig)
+			for pipelineName := range pipelines {
+				Expect(pipelineName).ToNot(HavePrefix("profiles"))
+			}
+		})
+
+		It("should render profiling pipelines and connectors when profiling is enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]any)
+			Expect(connectors).To(HaveKey("forward/profiles-processors"))
+			Expect(connectors).To(HaveKey("forward/profiles-default-exporter"))
+
+			pipelines := readPipelines(collectorConfig)
+
+			// Verify the profiles intake pipeline
+			profilesReceivers := readPipelineReceivers(pipelines, "profiles")
+			Expect(profilesReceivers).To(ContainElement("otlp"))
+			profilesExporters := readPipelineExporters(pipelines, "profiles")
+			Expect(profilesExporters).To(ContainElement("forward/profiles-processors"))
+
+			// Verify the profiles/common-processors pipeline
+			commonProcessors := readPipelineProcessors(pipelines, "profiles/common-processors")
+			Expect(commonProcessors).To(ContainElement("memory_limiter"))
+			Expect(commonProcessors).To(ContainElement("resourcedetection"))
+			Expect(commonProcessors).To(ContainElement("k8s_attributes/profiles"))
+			Expect(commonProcessors).ToNot(ContainElement("k8s_attributes"))
+			Expect(commonProcessors).To(ContainElement("transform/resources"))
+			commonExporters := readPipelineExporters(pipelines, "profiles/common-processors")
+			Expect(commonExporters).To(ContainElement("forward/profiles-default-exporter"))
+
+			// Verify the profiles/export/default pipeline
+			defaultExporters := readPipelineExporters(pipelines, "profiles/export/default")
+			Expect(defaultExporters).To(ContainElement("otlp_grpc/dash0/default"))
+		})
+
+		It("should render k8s_attributes/profiles without connection pod association and with container.id [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			// Verify k8s_attributes/profiles processor exists
+			k8sAttrProfilesRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes/profiles"})
+			Expect(k8sAttrProfilesRaw).ToNot(BeNil())
+			k8sAttrProfiles := k8sAttrProfilesRaw.(map[string]any)
+
+			// Verify pod_association has container.id first, then k8s.pod.ip and k8s.pod.uid, and no connection
+			podAssociation := k8sAttrProfiles["pod_association"].([]any)
+			podAssocSources := make([]string, 0)
+			for _, assoc := range podAssociation {
+				sources := assoc.(map[string]any)["sources"].([]any)
+				for _, src := range sources {
+					srcMap := src.(map[string]any)
+					from := srcMap["from"].(string)
+					if from == "connection" {
+						podAssocSources = append(podAssocSources, "connection")
+					} else if name, ok := srcMap["name"]; ok {
+						podAssocSources = append(podAssocSources, name.(string))
+					}
+				}
+			}
+			Expect(podAssocSources).To(Equal([]string{"container.id", "k8s.pod.ip", "k8s.pod.uid"}))
+
+			// Verify the base k8s_attributes processor has connection but no container.id
+			k8sAttrRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
+			Expect(k8sAttrRaw).ToNot(BeNil())
+			k8sAttr := k8sAttrRaw.(map[string]any)
+			basePodAssociation := k8sAttr["pod_association"].([]any)
+			basePodAssocSources := make([]string, 0)
+			for _, assoc := range basePodAssociation {
+				sources := assoc.(map[string]any)["sources"].([]any)
+				for _, src := range sources {
+					srcMap := src.(map[string]any)
+					from := srcMap["from"].(string)
+					if from == "connection" {
+						basePodAssocSources = append(basePodAssocSources, "connection")
+					} else if name, ok := srcMap["name"]; ok {
+						basePodAssocSources = append(basePodAssocSources, name.(string))
+					}
+				}
+			}
+			Expect(basePodAssocSources).To(ContainElement("connection"))
+			Expect(basePodAssocSources).ToNot(ContainElement("container.id"))
+		})
+
+		It("should not render k8s_attributes/profiles when profiling is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  false,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			processors := collectorConfig["processors"].(map[string]any)
+			Expect(processors).ToNot(HaveKey("k8s_attributes/profiles"))
+			Expect(processors).To(HaveKey("k8s_attributes"))
+		})
+
+		It("should render profiling routing connector with namespaced exporters [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedOtlpExporters(),
+				ProfilingEnabled:  true,
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]any)
+			routingProfilesRaw := connectors["routing/profiles"]
+			Expect(routingProfilesRaw).ToNot(BeNil())
+			routingProfiles := routingProfilesRaw.(map[string]any)
+			Expect(routingProfiles["error_mode"]).To(Equal("ignore"))
+			defaultPipelines := routingProfiles["default_pipelines"].([]any)
+			Expect(defaultPipelines).To(ContainElement("profiles/export/default"))
+
+			// Verify namespaced export pipeline has the expected exporters
+			pipelines := readPipelines(collectorConfig)
+			profilesExportNs1Exporters := readPipelineExporters(pipelines, "profiles/export/ns/"+namespace1)
+			Expect(profilesExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
+		})
+
+		It("should not render profiling routing connector without namespaced exporters [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]any)
+			Expect(connectors).ToNot(HaveKey("routing/profiles"))
 		})
 
 		It("should render routing table entries with correct namespace conditions [DaemonSet])", func() {
@@ -714,25 +1620,25 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 
 			connectorsRaw := collectorConfig["connectors"]
 			Expect(connectorsRaw).ToNot(BeNil())
-			connectors := connectorsRaw.(map[string]interface{})
+			connectors := connectorsRaw.(map[string]any)
 
 			// Verify routing table entries for traces
-			routingTraces := connectors["routing/traces"].(map[string]interface{})
-			tracesTable := routingTraces["table"].([]interface{})
+			routingTraces := connectors["routing/traces"].(map[string]any)
+			tracesTable := routingTraces["table"].([]any)
 			Expect(tracesTable).To(HaveLen(2)) // namespace1 and namespace2
 			verifyRoutingTableEntry(tracesTable, namespace1, "traces/export/ns/"+namespace1)
 			verifyRoutingTableEntry(tracesTable, namespace2, "traces/export/ns/"+namespace2)
 
 			// Verify routing table entries for metrics
-			routingMetrics := connectors["routing/metrics"].(map[string]interface{})
-			metricsTable := routingMetrics["table"].([]interface{})
+			routingMetrics := connectors["routing/metrics"].(map[string]any)
+			metricsTable := routingMetrics["table"].([]any)
 			Expect(metricsTable).To(HaveLen(2))
 			verifyRoutingTableEntry(metricsTable, namespace1, "metrics/export/ns/"+namespace1)
 			verifyRoutingTableEntry(metricsTable, namespace2, "metrics/export/ns/"+namespace2)
 
 			// Verify routing table entries for logs
-			routingLogs := connectors["routing/logs"].(map[string]interface{})
-			logsTable := routingLogs["table"].([]interface{})
+			routingLogs := connectors["routing/logs"].(map[string]any)
+			logsTable := routingLogs["table"].([]any)
 			Expect(logsTable).To(HaveLen(2))
 			verifyRoutingTableEntry(logsTable, namespace1, "logs/export/ns/"+namespace1)
 			verifyRoutingTableEntry(logsTable, namespace2, "logs/export/ns/"+namespace2)
@@ -751,18 +1657,18 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 
 			connectorsRaw := collectorConfig["connectors"]
 			Expect(connectorsRaw).ToNot(BeNil())
-			connectors := connectorsRaw.(map[string]interface{})
+			connectors := connectorsRaw.(map[string]any)
 
 			// Verify routing table entries for metrics
-			routingMetrics := connectors["routing/metrics"].(map[string]interface{})
-			metricsTable := routingMetrics["table"].([]interface{})
+			routingMetrics := connectors["routing/metrics"].(map[string]any)
+			metricsTable := routingMetrics["table"].([]any)
 			Expect(metricsTable).To(HaveLen(2))
 			verifyRoutingTableEntry(metricsTable, namespace1, "metrics/export/ns/"+namespace1)
 			verifyRoutingTableEntry(metricsTable, namespace2, "metrics/export/ns/"+namespace2)
 
 			// Verify routing table entries for logs
-			routingLogs := connectors["routing/logs"].(map[string]interface{})
-			logsTable := routingLogs["table"].([]interface{})
+			routingLogs := connectors["routing/logs"].(map[string]any)
+			logsTable := routingLogs["table"].([]any)
 			Expect(logsTable).To(HaveLen(2))
 			verifyRoutingTableEntry(logsTable, namespace1, "logs/export/ns/"+namespace1)
 			verifyRoutingTableEntry(logsTable, namespace2, "logs/export/ns/"+namespace2)
@@ -784,34 +1690,34 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			tracesExportNs1Receivers := readPipelineReceivers(pipelines, "traces/export/ns/"+namespace1)
 			Expect(tracesExportNs1Receivers).To(ContainElement("routing/traces"))
 			tracesExportNs1Exporters := readPipelineExporters(pipelines, "traces/export/ns/"+namespace1)
-			Expect(tracesExportNs1Exporters).To(ContainElement("otlp/grpc/ns/" + namespace1))
+			Expect(tracesExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
 
 			tracesExportNs2Receivers := readPipelineReceivers(pipelines, "traces/export/ns/"+namespace2)
 			Expect(tracesExportNs2Receivers).To(ContainElement("routing/traces"))
 			tracesExportNs2Exporters := readPipelineExporters(pipelines, "traces/export/ns/"+namespace2)
-			Expect(tracesExportNs2Exporters).To(ContainElement("otlphttp/ns/" + namespace2 + "/proto"))
+			Expect(tracesExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "/proto"))
 
 			// Verify namespace-specific metrics export pipelines
 			metricsExportNs1Receivers := readPipelineReceivers(pipelines, "metrics/export/ns/"+namespace1)
 			Expect(metricsExportNs1Receivers).To(ContainElement("routing/metrics"))
 			metricsExportNs1Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace1)
-			Expect(metricsExportNs1Exporters).To(ContainElement("otlp/grpc/ns/" + namespace1))
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
 
 			metricsExportNs2Receivers := readPipelineReceivers(pipelines, "metrics/export/ns/"+namespace2)
 			Expect(metricsExportNs2Receivers).To(ContainElement("routing/metrics"))
 			metricsExportNs2Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace2)
-			Expect(metricsExportNs2Exporters).To(ContainElement("otlphttp/ns/" + namespace2 + "/proto"))
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "/proto"))
 
 			// Verify namespace-specific logs export pipelines
 			logsExportNs1Receivers := readPipelineReceivers(pipelines, "logs/export/ns/"+namespace1)
 			Expect(logsExportNs1Receivers).To(ContainElement("routing/logs"))
 			logsExportNs1Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace1)
-			Expect(logsExportNs1Exporters).To(ContainElement("otlp/grpc/ns/" + namespace1))
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
 
 			logsExportNs2Receivers := readPipelineReceivers(pipelines, "logs/export/ns/"+namespace2)
 			Expect(logsExportNs2Receivers).To(ContainElement("routing/logs"))
 			logsExportNs2Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace2)
-			Expect(logsExportNs2Exporters).To(ContainElement("otlphttp/ns/" + namespace2 + "/proto"))
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "/proto"))
 		})
 
 		It("should render namespace-specific export pipelines [Deployment])", func() {
@@ -830,23 +1736,23 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			metricsExportNs1Receivers := readPipelineReceivers(pipelines, "metrics/export/ns/"+namespace1)
 			Expect(metricsExportNs1Receivers).To(ContainElement("routing/metrics"))
 			metricsExportNs1Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace1)
-			Expect(metricsExportNs1Exporters).To(ContainElement("otlp/grpc/ns/" + namespace1))
+			Expect(metricsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
 
 			metricsExportNs2Receivers := readPipelineReceivers(pipelines, "metrics/export/ns/"+namespace2)
 			Expect(metricsExportNs2Receivers).To(ContainElement("routing/metrics"))
 			metricsExportNs2Exporters := readPipelineExporters(pipelines, "metrics/export/ns/"+namespace2)
-			Expect(metricsExportNs2Exporters).To(ContainElement("otlphttp/ns/" + namespace2 + "/proto"))
+			Expect(metricsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "/proto"))
 
 			// Verify namespace-specific logs export pipelines
 			logsExportNs1Receivers := readPipelineReceivers(pipelines, "logs/export/ns/"+namespace1)
 			Expect(logsExportNs1Receivers).To(ContainElement("routing/logs"))
 			logsExportNs1Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace1)
-			Expect(logsExportNs1Exporters).To(ContainElement("otlp/grpc/ns/" + namespace1))
+			Expect(logsExportNs1Exporters).To(ContainElement("otlp_grpc/ns/" + namespace1))
 
 			logsExportNs2Receivers := readPipelineReceivers(pipelines, "logs/export/ns/"+namespace2)
 			Expect(logsExportNs2Receivers).To(ContainElement("routing/logs"))
 			logsExportNs2Exporters := readPipelineExporters(pipelines, "logs/export/ns/"+namespace2)
-			Expect(logsExportNs2Exporters).To(ContainElement("otlphttp/ns/" + namespace2 + "/proto"))
+			Expect(logsExportNs2Exporters).To(ContainElement("otlp_http/ns/" + namespace2 + "/proto"))
 		})
 
 		It("should wire common-processors pipelines to routing connectors when namespaced exporters exist [DaemonSet]", func() {
@@ -965,7 +1871,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			// Verify routing connectors are NOT created
 			connectorsRaw := collectorConfig["connectors"]
 			Expect(connectorsRaw).ToNot(BeNil())
-			connectors := connectorsRaw.(map[string]interface{})
+			connectors := connectorsRaw.(map[string]any)
 			Expect(connectors["routing/traces"]).To(BeNil())
 			Expect(connectors["routing/metrics"]).To(BeNil())
 			Expect(connectors["routing/logs"]).To(BeNil())
@@ -1043,14 +1949,813 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			Expect(logsExportDefaultReceivers).To(ContainElement("forward/logs-default-exporter"))
 			Expect(logsExportDefaultReceivers).ToNot(ContainElement("routing/logs"))
 		})
+
+		It("should route namespaced traces before sampling when intelligent edge is enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedOtlpExporters(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			pipelines := readPipelines(collectorConfig)
+
+			// routing/traces default_pipelines should point to ie-pre-sampling
+			routingTraces := connectors["routing/traces"].(map[string]interface{})
+			defaultPipelines := routingTraces["default_pipelines"].([]interface{})
+			Expect(defaultPipelines).To(ContainElement("traces/ie-pre-sampling"))
+			Expect(defaultPipelines).ToNot(ContainElement("traces/export/default"))
+
+			// traces/common-processors should export to routing/traces (not directly to sampling)
+			tracesCommonExporters := readPipelineExporters(pipelines, "traces/common-processors")
+			Expect(tracesCommonExporters).To(ContainElement("routing/traces"))
+			Expect(tracesCommonExporters).ToNot(ContainElement("forward/traces-to-sampling"))
+			Expect(tracesCommonExporters).ToNot(ContainElement("dash0redmetrics"))
+
+			// traces/ie-pre-sampling should exist and forward to sampling + RED metrics
+			iePreSamplingReceivers := readPipelineReceivers(pipelines, "traces/ie-pre-sampling")
+			Expect(iePreSamplingReceivers).To(ContainElement("routing/traces"))
+			iePreSamplingExporters := readPipelineExporters(pipelines, "traces/ie-pre-sampling")
+			Expect(iePreSamplingExporters).To(ContainElement("forward/traces-to-sampling"))
+			Expect(iePreSamplingExporters).To(ContainElement("dash0redmetrics"))
+
+			// traces/sampled should export to forward/traces-default-exporter (not routing)
+			sampledExporters := readPipelineExporters(pipelines, "traces/sampled")
+			Expect(sampledExporters).To(ContainElement("forward/traces-default-exporter"))
+			Expect(sampledExporters).ToNot(ContainElement("routing/traces"))
+
+			// traces/export/default should receive from forward/traces-default-exporter
+			tracesExportDefaultReceivers := readPipelineReceivers(pipelines, "traces/export/default")
+			Expect(tracesExportDefaultReceivers).To(ContainElement("forward/traces-default-exporter"))
+			Expect(tracesExportDefaultReceivers).ToNot(ContainElement("routing/traces"))
+
+			// namespace-specific export pipelines still receive from routing/traces
+			tracesExportNs1Receivers := readPipelineReceivers(pipelines, "traces/export/ns/"+namespace1)
+			Expect(tracesExportNs1Receivers).To(ContainElement("routing/traces"))
+			tracesExportNs2Receivers := readPipelineReceivers(pipelines, "traces/export/ns/"+namespace2)
+			Expect(tracesExportNs2Receivers).To(ContainElement("routing/traces"))
+
+			// dash0settingsonedgeextension extension should be configured and listed in service extensions
+			extensions := collectorConfig["extensions"].(map[string]interface{})
+			Expect(extensions).To(HaveKey("dash0settingsonedgeextension"))
+			settingsOnEdge := extensions["dash0settingsonedgeextension"].(map[string]interface{})
+			Expect(settingsOnEdge["endpoint"]).To(Equal("https://control-plane-api.dash0.com"))
+
+			serviceConfig := collectorConfig["service"].(map[string]interface{})
+			serviceExtensions := serviceConfig["extensions"].([]interface{})
+			Expect(serviceExtensions).To(ContainElement("dash0settingsonedgeextension"))
+		})
+
+		It("should collect barker logs via file_log/selfmonitoring when IE + barker + self-monitoring enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   true,
+					BarkerName:      namePrefix + "-barker",
+				},
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			// file_log/selfmonitoring should include barker pod log path
+			receivers := collectorConfig["receivers"].(map[string]interface{})
+			Expect(receivers).To(HaveKey("file_log/selfmonitoring"))
+			filelogConfig := receivers["file_log/selfmonitoring"].(map[string]interface{})
+			includePaths := filelogConfig["include"].([]interface{})
+			barkerPathFound := false
+			for _, p := range includePaths {
+				if path, ok := p.(string); ok {
+					if strings.Contains(path, namePrefix+"-barker") {
+						barkerPathFound = true
+					}
+				}
+			}
+			Expect(barkerPathFound).To(BeTrue(), "barker pod log path not found in file_log/selfmonitoring include list")
+
+			// logs/selfmonitoring-filelog-to-forwarder pipeline should exist
+			pipelines := readPipelines(collectorConfig)
+			Expect(pipelines).To(HaveKey("logs/selfmonitoring-filelog-to-forwarder"))
+		})
+
+		It("should not include barker logs in file_log/selfmonitoring when barker is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   false,
+				},
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			configContent := configMap.Data["config.yaml"]
+			Expect(configContent).ToNot(ContainSubstring(namePrefix + "-barker"))
+		})
+
+		It("should not collect barker logs when self-monitoring is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   true,
+					BarkerName:      namePrefix + "-barker",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			configContent := configMap.Data["config.yaml"]
+			Expect(configContent).ToNot(ContainSubstring(namePrefix + "-barker"))
+			Expect(configContent).ToNot(ContainSubstring("file_log/selfmonitoring"))
+		})
+
+		It("should drop barker-originated OTLP logs when IE + barker + self-monitoring are enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   true,
+					BarkerName:      namePrefix + "-barker",
+				},
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).To(HaveKey("filter/logs/drop_barker_otlp_selfmonitoring"))
+
+			logRecordConditions := ReadFromMap(processors, []string{
+				"filter/logs/drop_barker_otlp_selfmonitoring", "logs", "log_record",
+			}).([]interface{})
+			Expect(logRecordConditions).To(HaveLen(1))
+			Expect(logRecordConditions[0]).To(Equal(
+				`resource.attributes["service.name"] == "barker" and ` +
+					`resource.attributes["service.namespace"] == "dash0-operator" and ` +
+					`resource.attributes["telemetry.sdk.language"] != nil`,
+			))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineProcessors(pipelines, "logs/otlp-to-forwarder")).
+				To(ContainElement("filter/logs/drop_barker_otlp_selfmonitoring"))
+		})
+
+		It("should not drop barker OTLP logs when self-monitoring is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   true,
+					BarkerName:      namePrefix + "-barker",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).ToNot(HaveKey("filter/logs/drop_barker_otlp_selfmonitoring"))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineProcessors(pipelines, "logs/otlp-to-forwarder")).
+				ToNot(ContainElement("filter/logs/drop_barker_otlp_selfmonitoring"))
+		})
+
+		It("should not add barker OTLP drop filter when barker is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+					BarkerEnabled:   false,
+				},
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).ToNot(HaveKey("filter/logs/drop_barker_otlp_selfmonitoring"))
+		})
+
+		It("should wire the dash0signaltometrics connector when IE + signalToMetrics are enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                true,
+					SamplingEnabled:        true,
+					SignalToMetricsEnabled: true,
+					Endpoint:               "decision-maker.example.com:443",
+					ApiEndpoint:            "https://control-plane-api.dash0.com",
+					Dataset:                "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			// Connector is defined with empty body (no tunables set)
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			Expect(connectors).To(HaveKey("dash0signaltometrics"))
+			s2m := connectors["dash0signaltometrics"].(map[string]interface{})
+			Expect(s2m).To(BeEmpty(), "dash0signaltometrics should render as `{}` when no tunables set")
+
+			// Spans flow into the connector pre-sampling, alongside dash0redmetrics
+			pipelines := readPipelines(collectorConfig)
+			tracesCommonExporters := readPipelineExporters(pipelines, "traces/common-processors")
+			Expect(tracesCommonExporters).To(ContainElement("dash0redmetrics"))
+			Expect(tracesCommonExporters).To(ContainElement("dash0signaltometrics"))
+
+			// Logs fan out to the connector alongside the default forward
+			logsCommonExporters := readPipelineExporters(pipelines, "logs/common-processors")
+			Expect(logsCommonExporters).To(ContainElement("forward/logs-default-exporter"))
+			Expect(logsCommonExporters).To(ContainElement("dash0signaltometrics"))
+
+			// Emitted metrics enter the standard metrics path via metrics/otlp-to-forwarder
+			metricsForwarderReceivers := readPipelineReceivers(pipelines, "metrics/otlp-to-forwarder")
+			Expect(metricsForwarderReceivers).To(ContainElement("dash0redmetrics"))
+			Expect(metricsForwarderReceivers).To(ContainElement("dash0signaltometrics"))
+		})
+
+		It("should also wire the dash0signaltometrics connector in traces/ie-pre-sampling when namespaced exporters are configured [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedOtlpExporters(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                true,
+					SamplingEnabled:        true,
+					SignalToMetricsEnabled: true,
+					Endpoint:               "decision-maker.example.com:443",
+					ApiEndpoint:            "https://control-plane-api.dash0.com",
+					Dataset:                "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			iePreSamplingExporters := readPipelineExporters(pipelines, "traces/ie-pre-sampling")
+			Expect(iePreSamplingExporters).To(ContainElement("dash0redmetrics"))
+			Expect(iePreSamplingExporters).To(ContainElement("dash0signaltometrics"))
+		})
+
+		It("should render dash0signaltometrics tunables when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                      true,
+					SamplingEnabled:              true,
+					SignalToMetricsEnabled:       true,
+					SignalToMetricsMaxTimeSeries: ptr.To(int32(50000)),
+					SignalToMetricsFlushInterval: "30s",
+					Endpoint:                     "decision-maker.example.com:443",
+					ApiEndpoint:                  "https://control-plane-api.dash0.com",
+					Dataset:                      "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			Expect(connectors).To(HaveKey("dash0signaltometrics"))
+			s2m := connectors["dash0signaltometrics"].(map[string]interface{})
+			Expect(s2m["max_time_series"]).To(Equal(50000))
+			Expect(s2m["metrics_flush_interval"]).To(Equal("30s"))
+		})
+
+		It("should wire dash0signaltometrics into logs/common-processors even with namespaced exporters [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedOtlpExporters(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                true,
+					SamplingEnabled:        true,
+					SignalToMetricsEnabled: true,
+					Endpoint:               "decision-maker.example.com:443",
+					ApiEndpoint:            "https://control-plane-api.dash0.com",
+					Dataset:                "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			logsCommonExporters := readPipelineExporters(pipelines, "logs/common-processors")
+			Expect(logsCommonExporters).To(ContainElement("routing/logs"))
+			Expect(logsCommonExporters).To(ContainElement("dash0signaltometrics"))
+		})
+
+		It("should still wire dash0signaltometrics when sampling is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                true,
+					SamplingEnabled:        false,
+					SignalToMetricsEnabled: true,
+					Endpoint:               "decision-maker.example.com:443",
+					ApiEndpoint:            "https://control-plane-api.dash0.com",
+					Dataset:                "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			Expect(connectors).To(HaveKey("dash0signaltometrics"))
+			Expect(connectors).ToNot(HaveKey("dash0sampling"), "sampling processor is in processors map, not connectors")
+
+			pipelines := readPipelines(collectorConfig)
+			tracesCommonExporters := readPipelineExporters(pipelines, "traces/common-processors")
+			Expect(tracesCommonExporters).To(ContainElement("dash0signaltometrics"))
+			Expect(tracesCommonExporters).To(ContainElement("dash0redmetrics"))
+			Expect(tracesCommonExporters).To(ContainElement("forward/traces-default-exporter"))
+			Expect(tracesCommonExporters).ToNot(ContainElement("forward/traces-to-sampling"))
+		})
+
+		It("should not wire the dash0signaltometrics connector when signalToMetrics is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                true,
+					SamplingEnabled:        true,
+					SignalToMetricsEnabled: false,
+					Endpoint:               "decision-maker.example.com:443",
+					ApiEndpoint:            "https://control-plane-api.dash0.com",
+					Dataset:                "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			Expect(connectors).ToNot(HaveKey("dash0signaltometrics"))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineExporters(pipelines, "traces/common-processors")).
+				ToNot(ContainElement("dash0signaltometrics"))
+			Expect(readPipelineExporters(pipelines, "logs/common-processors")).
+				ToNot(ContainElement("dash0signaltometrics"))
+			Expect(readPipelineReceivers(pipelines, "metrics/otlp-to-forwarder")).
+				ToNot(ContainElement("dash0signaltometrics"))
+		})
+
+		It("should wire the dash0filter processor when IE + spamFilter are enabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:           true,
+					SamplingEnabled:   true,
+					SpamFilterEnabled: true,
+					Endpoint:          "decision-maker.example.com:443",
+					ApiEndpoint:       "https://control-plane-api.dash0.com",
+					Dataset:           "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).To(HaveKey("dash0filter"))
+			webFilter := processors["dash0filter"].(map[string]interface{})
+			Expect(webFilter).To(BeEmpty(), "dash0filter should render as `{}` when no tunables set")
+
+			pipelines := readPipelines(collectorConfig)
+			tracesCommonProcessors := readPipelineProcessors(pipelines, "traces/common-processors")
+			Expect(tracesCommonProcessors).To(ContainElement("dash0filter"))
+			Expect(tracesCommonProcessors).To(ContainElements("dash0resource", "dash0operation", "dash0filter"),
+				"dash0filter must run after dash0resource and dash0operation set IE attributes")
+			logsCommonProcessors := readPipelineProcessors(pipelines, "logs/common-processors")
+			Expect(logsCommonProcessors).To(ContainElement("dash0filter"))
+			Expect(logsCommonProcessors).To(ContainElements("resource/ie_attributes", "dash0resource", "dash0filter"),
+				"dash0filter must run after resource/ie_attributes, and dash0resource must run so dash0signaltometrics gets the resource hash")
+		})
+
+		It("should render dash0filter tunables when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                      true,
+					SamplingEnabled:              true,
+					SpamFilterEnabled:            true,
+					SpamFilterCacheExpiration:    "30s",
+					SpamFilterAllowNoSettingsExt: true,
+					Endpoint:                     "decision-maker.example.com:443",
+					ApiEndpoint:                  "https://control-plane-api.dash0.com",
+					Dataset:                      "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).To(HaveKey("dash0filter"))
+			webFilter := processors["dash0filter"].(map[string]interface{})
+			Expect(webFilter["cache_expiration"]).To(Equal("30s"))
+			Expect(webFilter["allow_no_settings_ext"]).To(BeTrue())
+		})
+
+		It("should wire dash0filter into common-processors even with namespaced exporters [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestNamespacedOtlpExporters(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:           true,
+					SamplingEnabled:   true,
+					SpamFilterEnabled: true,
+					Endpoint:          "decision-maker.example.com:443",
+					ApiEndpoint:       "https://control-plane-api.dash0.com",
+					Dataset:           "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			pipelines := readPipelines(collectorConfig)
+
+			Expect(readPipelineProcessors(pipelines, "traces/common-processors")).To(ContainElement("dash0filter"))
+			Expect(readPipelineProcessors(pipelines, "logs/common-processors")).To(ContainElement("dash0filter"))
+		})
+
+		It("should still wire dash0filter when sampling is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:           true,
+					SamplingEnabled:   false,
+					SpamFilterEnabled: true,
+					Endpoint:          "decision-maker.example.com:443",
+					ApiEndpoint:       "https://control-plane-api.dash0.com",
+					Dataset:           "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).To(HaveKey("dash0filter"))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineProcessors(pipelines, "traces/common-processors")).To(ContainElement("dash0filter"))
+			Expect(readPipelineProcessors(pipelines, "logs/common-processors")).To(ContainElement("dash0filter"))
+		})
+
+		It("should not wire the dash0filter processor when spamFilter is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:           true,
+					SamplingEnabled:   true,
+					SpamFilterEnabled: false,
+					Endpoint:          "decision-maker.example.com:443",
+					ApiEndpoint:       "https://control-plane-api.dash0.com",
+					Dataset:           "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).ToNot(HaveKey("dash0filter"))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineProcessors(pipelines, "traces/common-processors")).
+				ToNot(ContainElement("dash0filter"))
+			Expect(readPipelineProcessors(pipelines, "logs/common-processors")).
+				ToNot(ContainElement("dash0filter"))
+		})
+
+		It("should render dash0operation as an empty object when no operation processor tunables are set [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:     true,
+					Endpoint:    "decision-maker.example.com:443",
+					ApiEndpoint: "https://control-plane-api.dash0.com",
+					Dataset:     "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			Expect(processors).To(HaveKey("dash0operation"))
+			Expect(processors["dash0operation"].(map[string]interface{})).
+				To(BeEmpty(), "dash0operation should render as `{}` when no tunables set")
+		})
+
+		It("should render prefer_span_name when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                 true,
+					OperationPreferSpanName: true,
+					Endpoint:                "decision-maker.example.com:443",
+					ApiEndpoint:             "https://control-plane-api.dash0.com",
+					Dataset:                 "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			operation := processors["dash0operation"].(map[string]interface{})
+			Expect(operation["prefer_span_name"]).To(BeTrue())
+			Expect(operation).ToNot(HaveKey("cardinality_rules"))
+		})
+
+		It("should render cardinality_rules with nested operation_matchers when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled: true,
+					OperationCardinalityRules: []IntelligentEdgeCardinalityRule{
+						{
+							Id:              "warehouse-sites",
+							SourceAttribute: "url.path",
+							QuickFilter:     "/sites/",
+							OperationMatchers: []IntelligentEdgeOperationMatcher{
+								{
+									Regex:        "/sites/([a-z0-9-]+)/",
+									Replacements: []string{"site"},
+									QuickFilter:  "/sites/",
+									Literal:      true,
+								},
+								{
+									Regex:        "/zones/([a-z0-9-]+)/",
+									Replacements: []string{"zone"},
+								},
+							},
+						},
+					},
+					Endpoint:    "decision-maker.example.com:443",
+					ApiEndpoint: "https://control-plane-api.dash0.com",
+					Dataset:     "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			operation := processors["dash0operation"].(map[string]interface{})
+			Expect(operation).ToNot(HaveKey("prefer_span_name"))
+
+			rules := operation["cardinality_rules"].([]interface{})
+			Expect(rules).To(HaveLen(1))
+			rule := rules[0].(map[string]interface{})
+			Expect(rule["id"]).To(Equal("warehouse-sites"))
+			Expect(rule["source_attribute"]).To(Equal("url.path"))
+			Expect(rule["quick_filter"]).To(Equal("/sites/"))
+
+			matchers := rule["operation_matchers"].([]interface{})
+			Expect(matchers).To(HaveLen(2))
+			first := matchers[0].(map[string]interface{})
+			Expect(first["regex"]).To(Equal("/sites/([a-z0-9-]+)/"))
+			Expect(first["replacements"]).To(Equal([]interface{}{"site"}))
+			Expect(first["quick_filter"]).To(Equal("/sites/"))
+			Expect(first["literal"]).To(BeTrue())
+
+			second := matchers[1].(map[string]interface{})
+			Expect(second["regex"]).To(Equal("/zones/([a-z0-9-]+)/"))
+			Expect(second["replacements"]).To(Equal([]interface{}{"zone"}))
+			Expect(second).ToNot(HaveKey("quick_filter"), "an unset quick_filter must be omitted")
+			Expect(second).ToNot(HaveKey("literal"), "a false literal must be omitted")
+		})
+
+		It("should render sampling fallback ratio and debug when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                     true,
+					SamplingEnabled:             true,
+					SamplingFallbackSampleRatio: "0.5",
+					SamplingDebug:               true,
+					Endpoint:                    "decision-maker.example.com:443",
+					ApiEndpoint:                 "https://control-plane-api.dash0.com",
+					Dataset:                     "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			sampling := processors["dash0sampling"].(map[string]interface{})
+			Expect(sampling["fallback_sample_ratio"]).To(Equal(0.5))
+			Expect(sampling["debug"]).To(BeTrue())
+		})
+
+		It("should omit sampling fallback ratio and debug when unset [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:         true,
+					SamplingEnabled: true,
+					Endpoint:        "decision-maker.example.com:443",
+					ApiEndpoint:     "https://control-plane-api.dash0.com",
+					Dataset:         "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			sampling := processors["dash0sampling"].(map[string]interface{})
+			Expect(sampling).ToNot(HaveKey("fallback_sample_ratio"))
+			Expect(sampling).ToNot(HaveKey("debug"))
+		})
+
+		It("should render the trace reservoir max_disk_bytes and metric_level [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                       true,
+					SamplingEnabled:               true,
+					SamplingReservoirMaxDiskBytes: 2 * 1024 * 1024 * 1024,
+					SamplingReservoirMetricLevel:  "detailed",
+					Endpoint:                      "decision-maker.example.com:443",
+					ApiEndpoint:                   "https://control-plane-api.dash0.com",
+					Dataset:                       "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			processors := collectorConfig["processors"].(map[string]interface{})
+			sampling := processors["dash0sampling"].(map[string]interface{})
+			reservoir := sampling["reservoir"].(map[string]interface{})
+			Expect(reservoir["type"]).To(Equal("disk"))
+			Expect(reservoir["data_dir"]).To(Equal("/var/lib/dash0/trace-reservoir"))
+			Expect(reservoir["max_disk_bytes"]).To(BeNumerically("==", int64(2*1024*1024*1024)))
+			Expect(reservoir["metric_level"]).To(Equal("detailed"))
+		})
+
+		It("should render dash0redmetrics as an empty object when no tunables are set [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:     true,
+					Endpoint:    "decision-maker.example.com:443",
+					ApiEndpoint: "https://control-plane-api.dash0.com",
+					Dataset:     "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			Expect(connectors).To(HaveKey("dash0redmetrics"))
+			Expect(connectors["dash0redmetrics"].(map[string]interface{})).
+				To(BeEmpty(), "dash0redmetrics should render as `{}` when no tunables set")
+		})
+
+		It("should render dash0redmetrics tunables when set on the IE config [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				IntelligentEdge: IntelligentEdgeConfig{
+					Enabled:                            true,
+					RedMetricsMaxTimeSeries:            ptr.To(int32(12000)),
+					RedMetricsAdditionalSpanAttributes: []string{"http.route", "http.request.method"},
+					Endpoint:                           "decision-maker.example.com:443",
+					ApiEndpoint:                        "https://control-plane-api.dash0.com",
+					Dataset:                            "default",
+				},
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			connectors := collectorConfig["connectors"].(map[string]interface{})
+			redMetrics := connectors["dash0redmetrics"].(map[string]interface{})
+			Expect(redMetrics["max_time_series"]).To(Equal(12000))
+			Expect(redMetrics["additional_span_attributes"]).
+				To(Equal([]interface{}{"http.route", "http.request.method"}))
+		})
 	})
 
-	DescribeTable("should render batch processor with defaults if SendBatchMaxSize is not requested", func(cmTypeDef configMapTypeDefinition) {
+	DescribeTable("should render batch processor with defaults if no batch size settings are provided", func(cmTypeDef configMapTypeDefinition) {
 		configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
 			OperatorNamespace: OperatorNamespace,
 			NamePrefix:        namePrefix,
 			Exporters:         cmTestSingleDefaultOtlpExporter(),
 			KubernetesInfrastructureMetricsCollectionEnabled: true,
+			SendBatchSize:    nil,
 			SendBatchMaxSize: nil,
 		}, monitoredNamespaces, nil, nil, false)
 
@@ -1058,11 +2763,11 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		collectorConfig := parseConfigMapContent(configMap)
 		batchProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "batch"})
 		Expect(batchProcessorRaw).ToNot(BeNil())
-		batchProcessor := batchProcessorRaw.(map[string]interface{})
+		batchProcessor := batchProcessorRaw.(map[string]any)
 		Expect(batchProcessor).To(HaveLen(0))
 	}, daemonSetAndDeployment)
 
-	DescribeTable("should not set send_batch_max_size on batch processor if requested", func(cmTypeDef configMapTypeDefinition) {
+	DescribeTable("should set send_batch_max_size on batch processor if requested", func(cmTypeDef configMapTypeDefinition) {
 		configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
 			OperatorNamespace: OperatorNamespace,
 			NamePrefix:        namePrefix,
@@ -1075,8 +2780,49 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		collectorConfig := parseConfigMapContent(configMap)
 		batchProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "batch"})
 		Expect(batchProcessorRaw).ToNot(BeNil())
-		batchProcessor := batchProcessorRaw.(map[string]interface{})
+		batchProcessor := batchProcessorRaw.(map[string]any)
 		Expect(batchProcessor).To(HaveLen(1))
+		sendBatchMaxSize := ReadFromMap(batchProcessor, []string{"send_batch_max_size"})
+		Expect(sendBatchMaxSize).To(Equal(16384))
+	}, daemonSetAndDeployment)
+
+	DescribeTable("should set send_batch_size on batch processor if requested", func(cmTypeDef configMapTypeDefinition) {
+		configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+			OperatorNamespace: OperatorNamespace,
+			NamePrefix:        namePrefix,
+			Exporters:         cmTestSingleDefaultOtlpExporter(),
+			KubernetesInfrastructureMetricsCollectionEnabled: true,
+			SendBatchSize: ptr.To(uint32(4096)),
+		}, monitoredNamespaces, nil, nil, false)
+
+		Expect(err).ToNot(HaveOccurred())
+		collectorConfig := parseConfigMapContent(configMap)
+		batchProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "batch"})
+		Expect(batchProcessorRaw).ToNot(BeNil())
+		batchProcessor := batchProcessorRaw.(map[string]any)
+		Expect(batchProcessor).To(HaveLen(1))
+		sendBatchSize := ReadFromMap(batchProcessor, []string{"send_batch_size"})
+		Expect(sendBatchSize).To(Equal(4096))
+	}, daemonSetAndDeployment)
+
+	DescribeTable("should set both send_batch_size and send_batch_max_size on batch processor if requested", func(cmTypeDef configMapTypeDefinition) {
+		configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+			OperatorNamespace: OperatorNamespace,
+			NamePrefix:        namePrefix,
+			Exporters:         cmTestSingleDefaultOtlpExporter(),
+			KubernetesInfrastructureMetricsCollectionEnabled: true,
+			SendBatchSize:    ptr.To(uint32(4096)),
+			SendBatchMaxSize: ptr.To(uint32(16384)),
+		}, monitoredNamespaces, nil, nil, false)
+
+		Expect(err).ToNot(HaveOccurred())
+		collectorConfig := parseConfigMapContent(configMap)
+		batchProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "batch"})
+		Expect(batchProcessorRaw).ToNot(BeNil())
+		batchProcessor := batchProcessorRaw.(map[string]any)
+		Expect(batchProcessor).To(HaveLen(2))
+		sendBatchSize := ReadFromMap(batchProcessor, []string{"send_batch_size"})
+		Expect(sendBatchSize).To(Equal(4096))
 		sendBatchMaxSize := ReadFromMap(batchProcessor, []string{"send_batch_max_size"})
 		Expect(sendBatchMaxSize).To(Equal(16384))
 	}, daemonSetAndDeployment)
@@ -1111,10 +2857,10 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		Expect(resourceProcessor).ToNot(BeNil())
 		attributes := ReadFromMap(resourceProcessor, []string{"attributes"})
 		Expect(attributes).To(HaveLen(1))
-		attrs := attributes.([]interface{})
-		Expect(attrs[0].(map[string]interface{})["key"]).To(Equal("k8s.cluster.name"))
-		Expect(attrs[0].(map[string]interface{})["value"]).To(Equal("cluster-name"))
-		Expect(attrs[0].(map[string]interface{})["action"]).To(Equal("insert"))
+		attrs := attributes.([]any)
+		Expect(attrs[0].(map[string]any)["key"]).To(Equal("k8s.cluster.name"))
+		Expect(attrs[0].(map[string]any)["value"]).To(Equal("cluster-name"))
+		Expect(attrs[0].(map[string]any)["action"]).To(Equal("insert"))
 		pipelines := readPipelines(collectorConfig)
 		metricsProcessors := readPipelineProcessors(pipelines, "metrics/common-processors")
 		Expect(metricsProcessors).ToNot(BeNil())
@@ -1173,7 +2919,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				collectorConfig := parseConfigMapContent(configMap)
 				kubeletstatsReceiverRaw := ReadFromMap(collectorConfig, []string{"receivers", "kubeletstats"})
 				Expect(kubeletstatsReceiverRaw).ToNot(BeNil())
-				kubeletstatsReceiver := kubeletstatsReceiverRaw.(map[string]interface{})
+				kubeletstatsReceiver := kubeletstatsReceiverRaw.(map[string]any)
 				endpoint := kubeletstatsReceiver["endpoint"]
 				Expect(endpoint).To(Equal(testConfig.wanted.endpoint))
 				authType := kubeletstatsReceiver["auth_type"]
@@ -1249,98 +2995,218 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 	})
 
 	Describe("should enable/disable the replicaset informer", func() {
-		DescribeTable("should configure the k8sattributes processor to not start the replicaset informer if disabled", func(cmTypeDef configMapTypeDefinition) {
+		DescribeTable("should configure the k8s_attributes processor to not start the replicaset informer if disabled", func(cmTypeDef configMapTypeDefinition) {
 			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
-				OperatorNamespace:         OperatorNamespace,
-				NamePrefix:                namePrefix,
-				Exporters:                 cmTestSingleDefaultOtlpExporter(),
-				DisableReplicasetInformer: true,
+				OperatorNamespace:                      OperatorNamespace,
+				NamePrefix:                             namePrefix,
+				Exporters:                              cmTestSingleDefaultOtlpExporter(),
+				K8sAttributesDisableReplicasetInformer: true,
 			}, monitoredNamespaces, nil, nil, false)
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8sattributes"})
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
 			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
-			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]interface{})
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
 			deploymentNameFromReplicasetRaw := ReadFromMap(k8sAttributesProcessor, []string{"extract", "deployment_name_from_replicaset"})
 			Expect(deploymentNameFromReplicasetRaw).ToNot(BeNil())
 			deploymentNameFromReplicaset := deploymentNameFromReplicasetRaw.(bool)
 			Expect(deploymentNameFromReplicaset).To(BeTrue())
 			metadataListRaw := ReadFromMap(k8sAttributesProcessor, []string{"extract", "metadata"})
 			Expect(metadataListRaw).ToNot(BeNil())
-			metadataList := metadataListRaw.([]interface{})
+			metadataList := metadataListRaw.([]any)
 			Expect(metadataList).ToNot(ContainElement("k8s.deployment.uid"))
 		}, daemonSetAndDeployment)
 
-		DescribeTable("should configure the k8sattributes processor to use the replicaset informer by default", func(cmTypeDef configMapTypeDefinition) {
+		DescribeTable("should configure the k8s_attributes processor to use the replicaset informer by default", func(cmTypeDef configMapTypeDefinition) {
 			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
-				OperatorNamespace:         OperatorNamespace,
-				NamePrefix:                namePrefix,
-				Exporters:                 cmTestSingleDefaultOtlpExporter(),
-				DisableReplicasetInformer: false,
+				OperatorNamespace:                      OperatorNamespace,
+				NamePrefix:                             namePrefix,
+				Exporters:                              cmTestSingleDefaultOtlpExporter(),
+				K8sAttributesDisableReplicasetInformer: false,
 			}, monitoredNamespaces, nil, nil, false)
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8sattributes"})
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
 			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
-			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]interface{})
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
 			deploymentNameFromReplicasetRaw := ReadFromMap(k8sAttributesProcessor, []string{"extract", "deployment_name_from_replicaset"})
 			Expect(deploymentNameFromReplicasetRaw).To(BeNil())
 			metadataListRaw := ReadFromMap(k8sAttributesProcessor, []string{"extract", "metadata"})
 			Expect(metadataListRaw).ToNot(BeNil())
-			metadataList := metadataListRaw.([]interface{})
+			metadataList := metadataListRaw.([]any)
 			Expect(metadataList).To(ContainElement("k8s.deployment.uid"))
 		}, daemonSetAndDeployment)
 	})
 
+	Describe("should enable/disable wait_for_metadata", func() {
+		DescribeTable("should configure the k8s_attributes processor to wait for metadata if enabled", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace:                   OperatorNamespace,
+				NamePrefix:                          namePrefix,
+				Exporters:                           cmTestSingleDefaultOtlpExporter(),
+				K8sAttributesWaitForMetadata:        true,
+				K8sAttributesWaitForMetadataTimeout: "30s",
+			}, monitoredNamespaces, nil, nil, false)
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
+			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
+			waitForMetadataRaw := ReadFromMap(k8sAttributesProcessor, []string{"wait_for_metadata"})
+			Expect(waitForMetadataRaw).ToNot(BeNil())
+			Expect(waitForMetadataRaw.(bool)).To(BeTrue())
+			waitForMetadataTimeoutRaw := ReadFromMap(k8sAttributesProcessor, []string{"wait_for_metadata_timeout"})
+			Expect(waitForMetadataTimeoutRaw).ToNot(BeNil())
+			Expect(waitForMetadataTimeoutRaw.(string)).To(Equal("30s"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should not render wait_for_metadata in the k8s_attributes processor by default", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+			}, monitoredNamespaces, nil, nil, false)
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
+			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
+			Expect(ReadFromMap(k8sAttributesProcessor, []string{"wait_for_metadata"})).To(BeNil())
+			Expect(ReadFromMap(k8sAttributesProcessor, []string{"wait_for_metadata_timeout"})).To(BeNil())
+		}, daemonSetAndDeployment)
+	})
+
 	Describe("should enable/disable collecting labels and annotations", func() {
-		DescribeTable("should not render the label/annotation collection snippet if disabled", func(cmTypeDef configMapTypeDefinition) {
+		DescribeTable("should not render the label/annotation collection snippet if disabled for namespaces and pods", func(cmTypeDef configMapTypeDefinition) {
 			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
 				OperatorNamespace: OperatorNamespace,
 				NamePrefix:        namePrefix,
 				Exporters:         cmTestSingleDefaultOtlpExporter(),
 				KubernetesInfrastructureMetricsCollectionEnabled: true,
 				CollectPodLabelsAndAnnotationsEnabled:            false,
+				CollectNamespaceLabelsAndAnnotationsEnabled:      false,
 			}, monitoredNamespaces, nil, nil, false)
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8sattributes"})
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
 			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
-			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]interface{})
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
 			labelsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "labels"})
 			Expect(labelsSnippet).To(BeNil())
 			annotationsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "annotations"})
 			Expect(annotationsSnippet).To(BeNil())
 		}, daemonSetAndDeployment)
 
-		DescribeTable("should collect labels and annotation if enabled", func(cmTypeDef configMapTypeDefinition) {
+		DescribeTable("should collect labels and annotation from namespaces and pods if both are enabled", func(cmTypeDef configMapTypeDefinition) {
 			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
 				OperatorNamespace: OperatorNamespace,
 				NamePrefix:        namePrefix,
 				Exporters:         cmTestSingleDefaultOtlpExporter(),
 				KubernetesInfrastructureMetricsCollectionEnabled: true,
 				CollectPodLabelsAndAnnotationsEnabled:            true,
+				CollectNamespaceLabelsAndAnnotationsEnabled:      true,
 			}, monitoredNamespaces, nil, nil, false)
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8sattributes"})
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
 			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
-			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]interface{})
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
 			labelsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "labels"})
 			Expect(labelsSnippet).ToNot(BeNil())
+			Expect(labelsSnippet).To(HaveLen(2))
 			annotationsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "annotations"})
 			Expect(annotationsSnippet).ToNot(BeNil())
+			Expect(annotationsSnippet).To(HaveLen(2))
+			namespaceLabelTag := ReadFromMap(labelsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceLabelTag).To(Equal("k8s.namespace.label.$$1"))
+			podLabelTag := ReadFromMap(labelsSnippet, []string{"1", "tag_name"})
+			Expect(podLabelTag).To(Equal("k8s.pod.label.$$1"))
+			namespaceAnnotationTag := ReadFromMap(annotationsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceAnnotationTag).To(Equal("k8s.namespace.annotation.$$1"))
+			podAnnotationTag := ReadFromMap(annotationsSnippet, []string{"1", "tag_name"})
+			Expect(podAnnotationTag).To(Equal("k8s.pod.annotation.$$1"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should collect only namespace labels/annotations when only namespace collection is enabled", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+				CollectPodLabelsAndAnnotationsEnabled:            false,
+				CollectNamespaceLabelsAndAnnotationsEnabled:      true,
+			}, monitoredNamespaces, nil, nil, false)
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
+			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
+			labelsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "labels"})
+			Expect(labelsSnippet).ToNot(BeNil())
+			Expect(labelsSnippet).To(HaveLen(1))
+			annotationsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "annotations"})
+			Expect(annotationsSnippet).ToNot(BeNil())
+			Expect(annotationsSnippet).To(HaveLen(1))
+			namespaceLabelTag := ReadFromMap(labelsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceLabelTag).To(Equal("k8s.namespace.label.$$1"))
+			namespaceAnnotationTag := ReadFromMap(annotationsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceAnnotationTag).To(Equal("k8s.namespace.annotation.$$1"))
+		}, daemonSetAndDeployment)
+
+		DescribeTable("should collect only pod labels/annotations when only pod collection is enabled", func(cmTypeDef configMapTypeDefinition) {
+			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				KubernetesInfrastructureMetricsCollectionEnabled: true,
+				CollectPodLabelsAndAnnotationsEnabled:            true,
+				CollectNamespaceLabelsAndAnnotationsEnabled:      false,
+			}, monitoredNamespaces, nil, nil, false)
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			k8sAttributesProcessorRaw := ReadFromMap(collectorConfig, []string{"processors", "k8s_attributes"})
+			Expect(k8sAttributesProcessorRaw).ToNot(BeNil())
+			k8sAttributesProcessor := k8sAttributesProcessorRaw.(map[string]any)
+			labelsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "labels"})
+			Expect(labelsSnippet).ToNot(BeNil())
+			Expect(labelsSnippet).To(HaveLen(1))
+			annotationsSnippet := ReadFromMap(k8sAttributesProcessor, []string{"extract", "annotations"})
+			Expect(annotationsSnippet).ToNot(BeNil())
+			Expect(annotationsSnippet).To(HaveLen(1))
+			namespaceLabelTag := ReadFromMap(labelsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceLabelTag).To(Equal("k8s.pod.label.$$1"))
+			namespaceAnnotationTag := ReadFromMap(annotationsSnippet, []string{"0", "tag_name"})
+			Expect(namespaceAnnotationTag).To(Equal("k8s.pod.annotation.$$1"))
 		}, daemonSetAndDeployment)
 	})
 
 	Describe("discard metrics from unmonitored namespaces", func() {
 
 		type ottlFilterExpressionTestConfig struct {
-			monitoredNamespaces []string
-			expectedExpression  string
+			monitoredNamespaces           []string
+			selfMonitoringEnabled         bool
+			prometheusCrdSupportEnabled   bool
+			operatorManagerDeploymentName string
+			intelligentEdge               IntelligentEdgeConfig
+			expectedExpression            string
 		}
 
-		DescribeTable("should render the namespace filter ottl expression", func(testConfig ottlFilterExpressionTestConfig) {
-			expression := renderOttlNamespaceFilter(testConfig.monitoredNamespaces)
+		DescribeTable("should render the namespace filter ottl expression correctly", func(testConfig ottlFilterExpressionTestConfig) {
+			colConfig := &oTelColConfig{
+				OperatorNamespace:             OperatorNamespace,
+				NamePrefix:                    namePrefix,
+				OperatorManagerDeploymentName: testConfig.operatorManagerDeploymentName,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: testConfig.selfMonitoringEnabled,
+				},
+				PrometheusCrdSupportEnabled: testConfig.prometheusCrdSupportEnabled,
+				TargetAllocatorNamePrefix:   TargetAllocatorPrefixTest,
+				IntelligentEdge:             testConfig.intelligentEdge,
+			}
+			expression := renderOttlNamespaceFilter(
+				testConfig.monitoredNamespaces,
+				colConfig,
+			)
 			Expect(expression).To(Equal(testConfig.expectedExpression))
 		},
 			Entry("with nil", ottlFilterExpressionTestConfig{
@@ -1369,6 +3235,422 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-2\"\n" +
 					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-3\"\n",
 			}),
+			Entry("with no namespaces, self-monitoring enabled, Prometheus CRD support disabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           nil,
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n",
+			}),
+			Entry("with one namespace, self-monitoring enabled, Prometheus CRD support disabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           []string{namespace1},
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-1\"\n",
+			}),
+			Entry("with two namespaces, self-monitoring enabled, Prometheus CRD support disabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           []string{namespace1, namespace2},
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-1\"\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-2\"\n",
+			}),
+			Entry("with no namespaces, self-monitoring enabled, Prometheus CRD support enabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           nil,
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   true,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedTargetAllocatorDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n",
+			}),
+			Entry("with one namespace, self-monitoring enabled, Prometheus CRD support enabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           []string{namespace1},
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   true,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedTargetAllocatorDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-1\"\n",
+			}),
+			Entry("with two namespaces, self-monitoring enabled, Prometheus CRD support enabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           []string{namespace1, namespace2},
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   true,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedTargetAllocatorDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-1\"\n" +
+					"          and resource.attributes[\"k8s.namespace.name\"] != \"namespace-2\"\n",
+			}),
+			Entry("with no namespaces, self-monitoring enabled, intelligent edge with barker enabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           nil,
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				intelligentEdge: IntelligentEdgeConfig{
+					Enabled:       true,
+					BarkerEnabled: true,
+					BarkerName:    namePrefix + "-barker",
+				},
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + namePrefix + "-barker\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n",
+			}),
+			Entry("intelligent edge enabled but barker disabled - no barker exclusion", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           nil,
+				selfMonitoringEnabled:         true,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				intelligentEdge: IntelligentEdgeConfig{
+					Enabled:       true,
+					BarkerEnabled: false,
+					BarkerName:    namePrefix + "-barker",
+				},
+				expectedExpression: "(resource.attributes[\"k8s.deployment.name\"] != \"" + OperatorManagerDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.daemonset.name\"] != \"" + ExpectedDaemonSetName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          (resource.attributes[\"k8s.deployment.name\"] != \"" + ExpectedDeploymentName + "\" or " +
+					"resource.attributes[\"k8s.namespace.name\"] != \"" + OperatorNamespace + "\") and\n" +
+					"          resource.attributes[\"k8s.namespace.name\"] != nil\n",
+			}),
+			Entry("self-monitoring disabled - barker exclusion not added even if barker enabled", ottlFilterExpressionTestConfig{
+				monitoredNamespaces:           nil,
+				selfMonitoringEnabled:         false,
+				prometheusCrdSupportEnabled:   false,
+				operatorManagerDeploymentName: OperatorManagerDeploymentName,
+				intelligentEdge: IntelligentEdgeConfig{
+					Enabled:       true,
+					BarkerEnabled: true,
+					BarkerName:    namePrefix + "-barker",
+				},
+				expectedExpression: "resource.attributes[\"k8s.namespace.name\"] != nil\n",
+			}),
+		)
+
+		type ottlFilterEvaluationTestConfig struct {
+			monitoredNamespaces           []string
+			selfMonitoringEnabled         bool
+			prometheusCrdSupportEnabled   bool
+			operatorManagerDeploymentName string
+			intelligentEdge               IntelligentEdgeConfig
+			resourceAttributes            map[string]string
+			expectedToBeDropped           bool
+		}
+
+		DescribeTable("should let self-monitoring metrics pass through the OTTL namespace filter", func(testConfig ottlFilterEvaluationTestConfig) {
+			colConfig := &oTelColConfig{
+				OperatorNamespace:             OperatorNamespace,
+				NamePrefix:                    namePrefix,
+				OperatorManagerDeploymentName: testConfig.operatorManagerDeploymentName,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: testConfig.selfMonitoringEnabled,
+				},
+				PrometheusCrdSupportEnabled: testConfig.prometheusCrdSupportEnabled,
+				TargetAllocatorNamePrefix:   TargetAllocatorPrefixTest,
+				IntelligentEdge:             testConfig.intelligentEdge,
+			}
+			expression := renderOttlNamespaceFilter(testConfig.monitoredNamespaces, colConfig)
+
+			settings := component.TelemetrySettings{Logger: zap.NewNop()}
+			parser, err := ottlmetric.NewParser(nil, settings)
+			Expect(err).NotTo(HaveOccurred())
+			conditions, err := parser.ParseConditions([]string{expression})
+			Expect(err).NotTo(HaveOccurred())
+			condSeq := ottlmetric.NewConditionSequence(conditions, settings)
+
+			resourceMetrics := pmetric.NewResourceMetrics()
+			for k, v := range testConfig.resourceAttributes {
+				resourceMetrics.Resource().Attributes().PutStr(k, v)
+			}
+			scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
+			metric := scopeMetrics.Metrics().AppendEmpty()
+			tCtx := ottlmetric.NewTransformContextPtr(resourceMetrics, scopeMetrics, metric)
+			defer tCtx.Close()
+
+			result, err := condSeq.Eval(context.Background(), tCtx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(testConfig.expectedToBeDropped))
+		},
+			Entry("operator manager metrics are not dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": OperatorManagerDeploymentName,
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("daemonset collector metrics are not dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.daemonset.name": ExpectedDaemonSetName,
+						"k8s.namespace.name": OperatorNamespace,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("deployment collector metrics are not dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": ExpectedDeploymentName,
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("target allocator metrics are not dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   true,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": ExpectedTargetAllocatorDeploymentName,
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("metrics from a random deployment in a monitored namespace are not dropped (self-monitoring enabled)",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": "some-deployment",
+						"k8s.namespace.name":  namespace1,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("metrics from a random deployment in a monitored namespace are not dropped (self-monitoring disabled)",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         false,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": "some-deployment",
+						"k8s.namespace.name":  namespace1,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("metrics from a random workload in a monitored namespace are not dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         false,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.namespace.name": namespace2,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("metrics from a random deployment in an unmonitored namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": "some-deployment",
+						"k8s.namespace.name":  "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a random daemonset in an unmonitored namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.daemonset.name": "some-daemonset",
+						"k8s.namespace.name": "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a random deployment in the operator namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   true,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": "some-deployment",
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a random daemonset in the operator namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   true,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.daemonset.name": "some-daemonset",
+						"k8s.namespace.name": OperatorNamespace,
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a deployment with the same name as the operator manager in a different namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": OperatorManagerDeploymentName,
+						"k8s.namespace.name":  "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a daemonset with the same name as the collector in a different namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.daemonset.name": ExpectedDaemonSetName,
+						"k8s.namespace.name": "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a deployment with the same name as the collector in a different namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": ExpectedDeploymentName,
+						"k8s.namespace.name":  "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("metrics from a deployment with the same name as the target allocator in a different namespace are dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": ExpectedTargetAllocatorDeploymentName,
+						"k8s.namespace.name":  "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("barker metrics are not dropped when self-monitoring and intelligent edge are enabled",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					intelligentEdge: IntelligentEdgeConfig{
+						Enabled:       true,
+						BarkerEnabled: true,
+						BarkerName:    namePrefix + "-barker",
+					},
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": namePrefix + "-barker",
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: false,
+				}),
+			Entry("barker metrics in a different namespace are still dropped",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					intelligentEdge: IntelligentEdgeConfig{
+						Enabled:       true,
+						BarkerEnabled: true,
+						BarkerName:    namePrefix + "-barker",
+					},
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": namePrefix + "-barker",
+						"k8s.namespace.name":  "some-namespace",
+					},
+					expectedToBeDropped: true,
+				}),
+			Entry("barker metrics are dropped when barker is disabled in intelligent edge config",
+				ottlFilterEvaluationTestConfig{
+					monitoredNamespaces:           []string{namespace1, namespace2},
+					selfMonitoringEnabled:         true,
+					prometheusCrdSupportEnabled:   false,
+					operatorManagerDeploymentName: OperatorManagerDeploymentName,
+					intelligentEdge: IntelligentEdgeConfig{
+						Enabled:       true,
+						BarkerEnabled: false,
+						BarkerName:    namePrefix + "-barker",
+					},
+					resourceAttributes: map[string]string{
+						"k8s.deployment.name": namePrefix + "-barker",
+						"k8s.namespace.name":  OperatorNamespace,
+					},
+					expectedToBeDropped: true,
+				}),
 		)
 
 		DescribeTable("should render the namespace filter and add it to the metrics pipeline", func(cmTypeDef configMapTypeDefinition) {
@@ -1381,17 +3663,62 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			filterProcessor := ReadFromMap(collectorConfig, []string{"processors", "filter/metrics/only_monitored_namespaces"})
+			filterProcessor := ReadFromMap(collectorConfig, []string{
+				"processors",
+				"filter/metrics/only_monitored_namespaces",
+			})
 			Expect(filterProcessor).ToNot(BeNil())
 			filters := ReadFromMap(filterProcessor, []string{"metrics", "metric"})
 			Expect(filters).To(HaveLen(1))
-			filterString := filters.([]interface{})[0].(string)
+			filterString := filters.([]any)[0].(string)
 			Expect(filterString).To(Equal(`resource.attributes["k8s.namespace.name"] != nil and resource.attributes["k8s.namespace.name"] != "namespace-1" and resource.attributes["k8s.namespace.name"] != "namespace-2"`))
 			pipelines := readPipelines(collectorConfig)
 			metricsProcessors := readPipelineProcessors(pipelines, "metrics/common-processors")
 			Expect(metricsProcessors).ToNot(BeNil())
 			Expect(metricsProcessors).To(ContainElement("filter/metrics/only_monitored_namespaces"))
 		}, daemonSetAndDeployment)
+
+		It("should render the namespace filter and add it to the profiles pipeline [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  true,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			filterProcessor := ReadFromMap(collectorConfig, []string{
+				"processors",
+				"filter/profiles/only_monitored_namespaces",
+			})
+			Expect(filterProcessor).ToNot(BeNil())
+			filters := ReadFromMap(filterProcessor, []string{"profiles", "profile"})
+			Expect(filters).To(HaveLen(1))
+			filterString := filters.([]any)[0].(string)
+			Expect(filterString).To(Equal(`resource.attributes["k8s.namespace.name"] != nil and resource.attributes["k8s.namespace.name"] != "namespace-1" and resource.attributes["k8s.namespace.name"] != "namespace-2"`))
+			pipelines := readPipelines(collectorConfig)
+			profilesProcessors := readPipelineProcessors(pipelines, "profiles/common-processors")
+			Expect(profilesProcessors).ToNot(BeNil())
+			Expect(profilesProcessors).To(ContainElement("filter/profiles/only_monitored_namespaces"))
+		})
+
+		It("should not render the profiles namespace filter when profiling is disabled [DaemonSet]", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(&oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				ProfilingEnabled:  false,
+			}, monitoredNamespaces, nil, nil, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			filterProcessor := ReadFromMap(collectorConfig, []string{
+				"processors",
+				"filter/profiles/only_monitored_namespaces",
+			})
+			Expect(filterProcessor).To(BeNil())
+		})
 	})
 
 	Describe("prometheus scraping config", func() {
@@ -1444,6 +3771,192 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			Expect(prometheusMetricsExporters).ToNot(BeNil())
 			Expect(prometheusMetricsExporters).To(ContainElement("forward/metrics-processors"))
 		})
+
+		It("should render the target-allocator self-monitoring scrape job when self-monitoring and Prometheus CRD support are enabled", func() {
+			taConfig := &oTelColConfig{
+				OperatorNamespace:           OperatorNamespace,
+				NamePrefix:                  namePrefix,
+				Exporters:                   cmTestSingleDefaultOtlpExporter(),
+				PrometheusCrdSupportEnabled: true,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(taConfig, []string{}, []string{}, []string{}, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "prometheus"})).ToNot(BeNil())
+
+			// verify the ta scrape job exists with correct label selector and namespace targeting
+			taJobNamespaceNames := ReadFromMap(collectorConfig, []string{
+				"receivers", "prometheus", "config", "scrape_configs",
+				"job_name=dash0-target-allocator-selfmonitoring",
+				"kubernetes_sd_configs", "role=pod", "namespaces", "names",
+			})
+			Expect(taJobNamespaceNames).ToNot(BeNil())
+			Expect(taJobNamespaceNames.([]interface{})).To(ContainElement(OperatorNamespace))
+
+			taJobLabelSelector := ReadFromMap(collectorConfig, []string{
+				"receivers", "prometheus", "config", "scrape_configs",
+				"job_name=dash0-target-allocator-selfmonitoring",
+				"kubernetes_sd_configs", "role=pod", "selectors", "0", "label",
+			})
+			Expect(taJobLabelSelector).To(Equal(
+				"app.kubernetes.io/instance=dash0-operator,app.kubernetes.io/name=opentelemetry-target-allocator",
+			))
+
+			// verify the transform processor is defined
+			Expect(ReadFromMap(collectorConfig, []string{
+				"processors",
+				"transform/metrics/prometheus_service_attributes",
+			})).ToNot(BeNil())
+
+			pipelines := readPipelines(collectorConfig)
+			prometheusMetricsReceivers := readPipelineReceivers(pipelines, "metrics/prometheus-to-forwarder")
+			Expect(prometheusMetricsReceivers).ToNot(BeNil())
+			Expect(prometheusMetricsReceivers).To(ContainElement("prometheus"))
+			prometheusMetricsProcessors := readPipelineProcessors(pipelines, "metrics/prometheus-to-forwarder")
+			Expect(prometheusMetricsProcessors).ToNot(BeNil())
+			Expect(prometheusMetricsProcessors).To(ContainElement("transform/metrics/prometheus_service_attributes"))
+		})
+
+		It("should render the target-allocator self-monitoring scrape job alongside namespace scrape jobs", func() {
+			taConfig := &oTelColConfig{
+				OperatorNamespace:           OperatorNamespace,
+				NamePrefix:                  namePrefix,
+				Exporters:                   cmTestSingleDefaultOtlpExporter(),
+				PrometheusCrdSupportEnabled: true,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(
+				taConfig,
+				[]string{namespace1, namespace2},
+				nil,
+				[]string{namespace1, namespace2},
+				nil,
+				nil,
+				emptyTargetAllocatorMtlsConfig,
+				false,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			scrapeConfigs := ReadFromMap(collectorConfig, []string{"receivers", "prometheus", "config", "scrape_configs"})
+			Expect(scrapeConfigs).ToNot(BeNil())
+
+			// verify the ta self-monitoring job is present
+			taJob := ReadFromMap(scrapeConfigs, []string{"job_name=dash0-target-allocator-selfmonitoring"})
+			Expect(taJob).ToNot(BeNil())
+
+			// verify the regular namespace scrape jobs are also present
+			for _, jobName := range []string{
+				"dash0-kubernetes-pods-scrape-config",
+				"dash0-kubernetes-pods-scrape-config-slow",
+			} {
+				verifyScrapeJobHasNamespaces(collectorConfig, jobName)
+			}
+		})
+
+		It("should not render the target-allocator self-monitoring scrape job when self-monitoring is disabled", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(
+				config,
+				[]string{namespace1},
+				nil,
+				[]string{namespace1},
+				nil,
+				nil,
+				emptyTargetAllocatorMtlsConfig,
+				false,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			scrapeConfigs := ReadFromMap(collectorConfig, []string{"receivers", "prometheus", "config", "scrape_configs"})
+			Expect(scrapeConfigs).ToNot(BeNil())
+			taJob := ReadFromMap(scrapeConfigs, []string{"job_name=dash0-target-allocator-selfmonitoring"})
+			Expect(taJob).To(BeNil())
+		})
+
+		It("should not render the target-allocator self-monitoring scrape job when Prometheus CRD support is disabled", func() {
+			taConfig := &oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(
+				taConfig,
+				[]string{namespace1},
+				nil,
+				[]string{namespace1},
+				nil,
+				nil,
+				emptyTargetAllocatorMtlsConfig,
+				false,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			scrapeConfigs := ReadFromMap(collectorConfig, []string{"receivers", "prometheus", "config", "scrape_configs"})
+			Expect(scrapeConfigs).ToNot(BeNil())
+			taJob := ReadFromMap(scrapeConfigs, []string{"job_name=dash0-target-allocator-selfmonitoring"})
+			Expect(taJob).To(BeNil())
+		})
+
+		It("should render the prometheus api_server config when development mode is enabled", func() {
+			devConfig := &oTelColConfig{
+				OperatorNamespace: OperatorNamespace,
+				NamePrefix:        namePrefix,
+				Exporters:         cmTestSingleDefaultOtlpExporter(),
+				DevelopmentMode:   true,
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(
+				devConfig,
+				[]string{namespace1, namespace2},
+				nil,
+				[]string{namespace1},
+				nil,
+				nil,
+				emptyTargetAllocatorMtlsConfig,
+				false,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "prometheus"})).ToNot(BeNil())
+			apiServer := ReadFromMap(collectorConfig, []string{"receivers", "prometheus", "api_server"})
+			Expect(apiServer).ToNot(BeNil())
+			apiServerMap := apiServer.(map[string]any)
+			Expect(apiServerMap["enabled"]).To(Equal(true))
+			serverConfig := apiServerMap["server_config"]
+			Expect(serverConfig).ToNot(BeNil())
+			serverConfigMap := serverConfig.(map[string]any)
+			Expect(serverConfigMap["endpoint"]).To(Equal("localhost:9191"))
+		})
+
+		It("should not render the prometheus api_server config when development mode is disabled", func() {
+			configMap, err := assembleDaemonSetCollectorConfigMap(
+				config,
+				[]string{namespace1, namespace2},
+				nil,
+				[]string{namespace1},
+				nil,
+				nil,
+				emptyTargetAllocatorMtlsConfig,
+				false,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "prometheus"})).ToNot(BeNil())
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "prometheus", "api_server"})).To(BeNil())
+		})
 	})
 
 	Describe("log collection", func() {
@@ -1453,25 +3966,25 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			Exporters:         cmTestSingleDefaultOtlpExporter(),
 		}
 
-		It("should not render the filelog receiver if no namespace has log collection enabled", func() {
+		It("should not render the file_log receiver if no namespace has log collection enabled", func() {
 			configMap, err := assembleDaemonSetCollectorConfigMap(config, []string{}, []string{}, []string{}, nil, nil, emptyTargetAllocatorMtlsConfig, false)
 
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			Expect(ReadFromMap(collectorConfig, []string{"receivers", "filelog"})).To(BeNil())
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "file_log"})).To(BeNil())
 
 			filelogServiceAttributeProcessor :=
 				ReadFromMap(collectorConfig, []string{"processors", "transform/logs/filelog_service_attributes"})
 			Expect(filelogServiceAttributeProcessor).To(BeNil())
 
 			pipelines := readPipelines(collectorConfig)
-			Expect(pipelines["logs/filelog"]).To(BeNil())
+			Expect(pipelines["logs/file_log"]).To(BeNil())
 			logsCommonProcessorsPipelineProcessors := readPipelineProcessors(pipelines, "logs/common-processors")
 			Expect(logsCommonProcessorsPipelineProcessors).ToNot(BeNil())
 			Expect(logsCommonProcessorsPipelineProcessors).ToNot(ContainElement("transform/logs/filelog_service_attributes"))
 		})
 
-		It("should render the filelog config with all namespaces for which log collection is enabled", func() {
+		It("should render the file_log config with all namespaces for which log collection is enabled", func() {
 			configMap, err := assembleDaemonSetCollectorConfigMap(
 				config,
 				[]string{"namespace-1", "namespace-2", "namespace-3"},
@@ -1484,10 +3997,10 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			)
 			Expect(err).ToNot(HaveOccurred())
 			collectorConfig := parseConfigMapContent(configMap)
-			fileLogReceiverRaw := ReadFromMap(collectorConfig, []string{"receivers", "filelog"})
+			fileLogReceiverRaw := ReadFromMap(collectorConfig, []string{"receivers", "file_log"})
 			Expect(fileLogReceiverRaw).ToNot(BeNil())
-			fileLogReceiver := fileLogReceiverRaw.(map[string]interface{})
-			filePatterns := fileLogReceiver["include"].([]interface{})
+			fileLogReceiver := fileLogReceiverRaw.(map[string]any)
+			filePatterns := fileLogReceiver["include"].([]any)
 			Expect(filePatterns).To(HaveLen(2))
 			Expect(filePatterns).To(ContainElement("/var/log/pods/namespace-1_*/*/*.log"))
 			Expect(filePatterns).To(ContainElement("/var/log/pods/namespace-2_*/*/*.log"))
@@ -1499,7 +4012,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			pipelines := readPipelines(collectorConfig)
 			logsFilelogReceivers := readPipelineReceivers(pipelines, "logs/filelog-to-forwarder")
 			Expect(logsFilelogReceivers).ToNot(BeNil())
-			Expect(logsFilelogReceivers).To(ContainElement("filelog"))
+			Expect(logsFilelogReceivers).To(ContainElement("file_log"))
 			logsFilelogProcessors := readPipelineProcessors(pipelines, "logs/filelog-to-forwarder")
 			Expect(logsFilelogProcessors).ToNot(BeNil())
 			logsFilelogExporters := readPipelineExporters(pipelines, "logs/filelog-to-forwarder")
@@ -1630,8 +4143,8 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				collectorConfig := parseConfigMapContent(configMap)
 				k8sEventsReceiverRaw := ReadFromMap(collectorConfig, []string{"receivers", "k8s_events"})
 				Expect(k8sEventsReceiverRaw).ToNot(BeNil())
-				k8sEventsReceiver := k8sEventsReceiverRaw.(map[string]interface{})
-				namespaces := k8sEventsReceiver["namespaces"].([]interface{})
+				k8sEventsReceiver := k8sEventsReceiverRaw.(map[string]any)
+				namespaces := k8sEventsReceiver["namespaces"].([]any)
 				Expect(namespaces).To(HaveLen(2))
 				Expect(namespaces).To(ContainElement("namespace-1"))
 				Expect(namespaces).To(ContainElement("namespace-2"))
@@ -1758,6 +4271,20 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						},
 					)),
 
+				Entry(fmt.Sprintf("[config map type: %s]: should filter profiles/profiles", cmTypeDef.cmType),
+					createFilterTestForSingleObjectType(cmTypeDef,
+						signalTypeProfiles,
+						objectTypeProfile,
+						[]string{
+							`an ottl profile condition`,
+							`another ottl profile condition`,
+						},
+						[]string{
+							`a third ottl profile condition`,
+							`a fourth ottl profile condition`,
+						},
+					)),
+
 				Entry(fmt.Sprintf("[config map type: %s]: should apply trace filter to only one namespace", cmTypeDef.cmType),
 					filterTestConfig{
 						configMapTypeDefinition: cmTypeDef,
@@ -1780,7 +4307,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: filterTestConfigExpectations{
 							daemonset: filterExpectations{
 								signalsWithFilters:    []signalType{signalTypeTraces},
-								signalsWithoutFilters: []signalType{signalTypeMetrics, signalTypeLogs},
+								signalsWithoutFilters: []signalType{signalTypeMetrics, signalTypeLogs, signalTypeProfiles},
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeTraces: {
 										objectTypeSpan: []string{
@@ -1820,7 +4347,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: filterTestConfigExpectations{
 							daemonset: filterExpectations{
 								signalsWithFilters:    []signalType{signalTypeMetrics},
-								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeMetrics: {
 										objectTypeMetric: []string{
@@ -1836,7 +4363,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 							},
 							deployment: filterExpectations{
 								signalsWithFilters:    []signalType{signalTypeMetrics},
-								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeMetrics: {
 										objectTypeMetric: []string{
@@ -1874,7 +4401,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: filterTestConfigExpectations{
 							daemonset: filterExpectations{
 								signalsWithFilters:    []signalType{signalTypeLogs},
-								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeMetrics},
+								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeMetrics, signalTypeProfiles},
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeLogs: {
 										objectTypeLogRecord: []string{
@@ -1891,6 +4418,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				Entry(fmt.Sprintf("[config map type: %s]: should apply filters for all signals to only one namespace", cmTypeDef.cmType),
 					filterTestConfig{
 						configMapTypeDefinition: cmTypeDef,
+						profilingEnabled:        true,
 						filters: []NamespacedFilter{
 							{
 								Namespace: namespace1,
@@ -1907,6 +4435,9 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 									Logs: &dash0common.LogFilter{
 										LogRecordFilter: []string{"log record condition 1", "log record condition 2"},
 									},
+									Profiles: &dash0common.ProfileFilter{
+										ProfileFilter: []string{"profile condition 1", "profile condition 2"},
+									},
 								},
 							},
 							{
@@ -1916,7 +4447,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						},
 						expectations: filterTestConfigExpectations{
 							daemonset: filterExpectations{
-								signalsWithFilters:    []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs},
+								signalsWithFilters:    []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs, signalTypeProfiles},
 								signalsWithoutFilters: nil,
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeTraces: {
@@ -1945,11 +4476,17 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 											`resource.attributes["k8s.namespace.name"] == "namespace-1" and (log record condition 2)`,
 										},
 									},
+									signalTypeProfiles: {
+										objectTypeProfile: []string{
+											`resource.attributes["k8s.namespace.name"] == "namespace-1" and (profile condition 1)`,
+											`resource.attributes["k8s.namespace.name"] == "namespace-1" and (profile condition 2)`,
+										},
+									},
 								},
 							},
 							deployment: filterExpectations{
 								signalsWithFilters:    []signalType{signalTypeMetrics},
-								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutFilters: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								conditions: conditionExpectationsPerObjectType{
 									signalTypeMetrics: {
 										objectTypeMetric: []string{
@@ -1977,6 +4514,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					NamePrefix:        namePrefix,
 					Exporters:         cmTestSingleDefaultOtlpExporter(),
 					KubernetesInfrastructureMetricsCollectionEnabled: true,
+					ProfilingEnabled: testConfig.profilingEnabled,
 				},
 				monitoredNamespaces,
 				testConfig.filters,
@@ -2003,7 +4541,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				)
 				Expect(filterProcessorRaw).ToNot(BeNil(),
 					fmt.Sprintf("expected filter processor %s to exist, but it didn't", filterProcessorName))
-				filterProcessor := filterProcessorRaw.(map[string]interface{})
+				filterProcessor := filterProcessorRaw.(map[string]any)
 				Expect(filterProcessor["error_mode"]).To(Equal("ignore"))
 
 				for objectType, expectedConditionsForObjectType := range expectations.conditions[signal] {
@@ -2015,7 +4553,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					Expect(filterConditionsRaw).ToNot(BeNil(),
 						"expected %d filter conditions but there were none for signal \"%s\" and object type \"%s\"",
 						len(expectedConditionsForObjectType), signal, objectType)
-					actualFilterConditions := filterConditionsRaw.([]interface{})
+					actualFilterConditions := filterConditionsRaw.([]any)
 					Expect(actualFilterConditions).To(HaveLen(len(expectedConditionsForObjectType)))
 					for i, expectedCondition := range expectedConditionsForObjectType {
 						Expect(actualFilterConditions[i]).To(Equal(expectedCondition))
@@ -2058,7 +4596,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		}
 
 		DescribeTable("filter processor should use the most severe error mode", func(testConfig filterErrorModeTestConfig) {
-			var filters []NamespacedFilter
+			filters := make([]NamespacedFilter, 0, len(testConfig.errorModes))
 			for _, errorMode := range testConfig.errorModes {
 				filters = append(filters, NamespacedFilter{
 					Namespace: namespace1,
@@ -2160,6 +4698,13 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						[]string{"statement 3", "statement 4"},
 					)),
 
+				Entry(fmt.Sprintf("[config map type: %s]: should transform profiles", cmTypeDef.cmType),
+					createTransformTestForSingleObjectType(cmTypeDef,
+						signalTypeProfiles,
+						[]string{"statement 1", "statement 2"},
+						[]string{"statement 3", "statement 4"},
+					)),
+
 				Entry(fmt.Sprintf("[config map type: %s]: should apply trace transform to only one namespace", cmTypeDef.cmType),
 					transformTestConfig{
 						configMapTypeDefinition: cmTypeDef,
@@ -2182,7 +4727,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: transformTestConfigExpectations{
 							daemonset: transformExpectations{
 								signalsWithTransforms:    []signalType{signalTypeTraces},
-								signalsWithoutTransforms: []signalType{signalTypeMetrics, signalTypeLogs},
+								signalsWithoutTransforms: []signalType{signalTypeMetrics, signalTypeLogs, signalTypeProfiles},
 								groups: groupExpectationsPerSignalType{
 									signalTypeTraces: []groupExpectations{
 										{
@@ -2226,7 +4771,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: transformTestConfigExpectations{
 							daemonset: transformExpectations{
 								signalsWithTransforms:    []signalType{signalTypeMetrics},
-								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								groups: groupExpectationsPerSignalType{
 									signalTypeMetrics: {
 										{
@@ -2246,7 +4791,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 							},
 							deployment: transformExpectations{
 								signalsWithTransforms:    []signalType{signalTypeMetrics},
-								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								groups: groupExpectationsPerSignalType{
 									signalTypeMetrics: []groupExpectations{
 										{
@@ -2289,7 +4834,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						expectations: transformTestConfigExpectations{
 							daemonset: transformExpectations{
 								signalsWithTransforms:    []signalType{signalTypeLogs},
-								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeMetrics, signalTypeProfiles},
 								groups: groupExpectationsPerSignalType{
 									signalTypeLogs: []groupExpectations{
 										{
@@ -2314,6 +4859,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				Entry(fmt.Sprintf("[config map type: %s]: should apply transforms for all signals to only one namespace", cmTypeDef.cmType),
 					transformTestConfig{
 						configMapTypeDefinition: cmTypeDef,
+						profilingEnabled:        true,
 						transforms: []NamespacedTransform{
 							{
 								Namespace: namespace1,
@@ -2331,6 +4877,10 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 										{Statements: []string{"log statement 1"}},
 										{Statements: []string{"log statement 2"}},
 									},
+									Profiles: []dash0common.NormalizedTransformGroup{
+										{Statements: []string{"profile statement 1"}},
+										{Statements: []string{"profile statement 2"}},
+									},
 								},
 							},
 							{
@@ -2340,7 +4890,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						},
 						expectations: transformTestConfigExpectations{
 							daemonset: transformExpectations{
-								signalsWithTransforms:    []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs},
+								signalsWithTransforms:    []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs, signalTypeProfiles},
 								signalsWithoutTransforms: nil,
 								groups: groupExpectationsPerSignalType{
 									signalTypeTraces: []groupExpectations{
@@ -2385,11 +4935,25 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 											},
 										},
 									},
+									signalTypeProfiles: []groupExpectations{
+										{
+											statements: []string{"profile statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1"`,
+											},
+										},
+										{
+											statements: []string{"profile statement 2"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1"`,
+											},
+										},
+									},
 								},
 							},
 							deployment: transformExpectations{
 								signalsWithTransforms:    []signalType{signalTypeMetrics},
-								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
 								groups: groupExpectationsPerSignalType{
 									signalTypeMetrics: {
 										{
@@ -2410,6 +4974,246 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 						},
 					}),
 
+				Entry(fmt.Sprintf("[config map type: %s]: should AND-prepend the namespace condition to a single existing condition per signal", cmTypeDef.cmType),
+					transformTestConfig{
+						configMapTypeDefinition: cmTypeDef,
+						profilingEnabled:        true,
+						transforms: []NamespacedTransform{
+							{
+								Namespace: namespace1,
+								Transform: dash0common.NormalizedTransformSpec{
+									ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+									Traces: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{`attributes["http.status_code"] >= 500`},
+											Statements: []string{"trace statement 1"},
+										},
+									},
+									Metrics: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{`name == "system.cpu.usage"`},
+											Statements: []string{"metric statement 1"},
+										},
+									},
+									Logs: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{`severity_number >= SEVERITY_NUMBER_WARN`},
+											Statements: []string{"log statement 1"},
+										},
+									},
+									Profiles: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{`attributes["profile.kind"] == "cpu"`},
+											Statements: []string{"profile statement 1"},
+										},
+									},
+								},
+							},
+						},
+						expectations: transformTestConfigExpectations{
+							daemonset: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs, signalTypeProfiles},
+								signalsWithoutTransforms: nil,
+								groups: groupExpectationsPerSignalType{
+									signalTypeTraces: []groupExpectations{
+										{
+											statements: []string{"trace statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (attributes["http.status_code"] >= 500)`,
+											},
+										},
+									},
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+											},
+										},
+									},
+									signalTypeLogs: []groupExpectations{
+										{
+											statements: []string{"log statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (severity_number >= SEVERITY_NUMBER_WARN)`,
+											},
+										},
+									},
+									signalTypeProfiles: []groupExpectations{
+										{
+											statements: []string{"profile statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (attributes["profile.kind"] == "cpu")`,
+											},
+										},
+									},
+								},
+							},
+							deployment: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
+								groups: groupExpectationsPerSignalType{
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+											},
+										},
+									},
+								},
+							},
+						},
+					}),
+
+				Entry(fmt.Sprintf("[config map type: %s]: should AND-prepend the namespace condition to each of multiple existing conditions", cmTypeDef.cmType),
+					transformTestConfig{
+						configMapTypeDefinition: cmTypeDef,
+						transforms: []NamespacedTransform{
+							{
+								Namespace: namespace1,
+								Transform: dash0common.NormalizedTransformSpec{
+									ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+									Metrics: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{
+												`name == "system.cpu.usage"`,
+												`name == "system.memory.usage"`,
+											},
+											Statements: []string{"metric statement 1"},
+										},
+									},
+								},
+							},
+						},
+						expectations: transformTestConfigExpectations{
+							daemonset: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
+								groups: groupExpectationsPerSignalType{
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.memory.usage")`,
+											},
+										},
+									},
+								},
+							},
+							deployment: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
+								groups: groupExpectationsPerSignalType{
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.memory.usage")`,
+											},
+										},
+									},
+								},
+							},
+						},
+					}),
+
+				Entry(fmt.Sprintf("[config map type: %s]: should mix groups with and without existing conditions across namespaces", cmTypeDef.cmType),
+					transformTestConfig{
+						configMapTypeDefinition: cmTypeDef,
+						transforms: []NamespacedTransform{
+							{
+								Namespace: namespace1,
+								Transform: dash0common.NormalizedTransformSpec{
+									ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+									Metrics: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{`name == "system.cpu.usage"`},
+											Statements: []string{"metric statement 1"},
+										},
+										{
+											// no user-defined conditions on this group
+											Statements: []string{"metric statement 2"},
+										},
+									},
+								},
+							},
+							{
+								Namespace: namespace2,
+								Transform: dash0common.NormalizedTransformSpec{
+									ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+									Metrics: []dash0common.NormalizedTransformGroup{
+										{
+											Conditions: []string{
+												`name == "http.server.duration"`,
+												`name == "http.client.duration"`,
+											},
+											Statements: []string{"metric statement 3"},
+										},
+									},
+								},
+							},
+						},
+						expectations: transformTestConfigExpectations{
+							daemonset: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
+								groups: groupExpectationsPerSignalType{
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+											},
+										},
+										{
+											statements: []string{"metric statement 2"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1"`,
+											},
+										},
+										{
+											statements: []string{"metric statement 3"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-2" and (name == "http.server.duration")`,
+												`resource.attributes["k8s.namespace.name"] == "namespace-2" and (name == "http.client.duration")`,
+											},
+										},
+									},
+								},
+							},
+							deployment: transformExpectations{
+								signalsWithTransforms:    []signalType{signalTypeMetrics},
+								signalsWithoutTransforms: []signalType{signalTypeTraces, signalTypeLogs, signalTypeProfiles},
+								groups: groupExpectationsPerSignalType{
+									signalTypeMetrics: []groupExpectations{
+										{
+											statements: []string{"metric statement 1"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1" and (name == "system.cpu.usage")`,
+											},
+										},
+										{
+											statements: []string{"metric statement 2"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-1"`,
+											},
+										},
+										{
+											statements: []string{"metric statement 3"},
+											conditions: []string{
+												`resource.attributes["k8s.namespace.name"] == "namespace-2" and (name == "http.server.duration")`,
+												`resource.attributes["k8s.namespace.name"] == "namespace-2" and (name == "http.client.duration")`,
+											},
+										},
+									},
+								},
+							},
+						},
+					}),
+
 				//
 			})
 		}
@@ -2421,6 +5225,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					NamePrefix:        namePrefix,
 					Exporters:         cmTestSingleDefaultOtlpExporter(),
 					KubernetesInfrastructureMetricsCollectionEnabled: true,
+					ProfilingEnabled: testConfig.profilingEnabled,
 				},
 				monitoredNamespaces,
 				nil,
@@ -2447,7 +5252,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				)
 				Expect(transformProcessorRaw).ToNot(BeNil(),
 					fmt.Sprintf("expected transform processor %s to exist, but it didn't", transformProcessorName))
-				transformProcessor := transformProcessorRaw.(map[string]interface{})
+				transformProcessor := transformProcessorRaw.(map[string]any)
 				Expect(transformProcessor["error_mode"]).To(Equal("ignore"))
 
 				signalGroupsLabel := ""
@@ -2458,6 +5263,8 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					signalGroupsLabel = "metric_statements"
 				case signalTypeLogs:
 					signalGroupsLabel = "log_statements"
+				case signalTypeProfiles:
+					signalGroupsLabel = "profile_statements"
 				default:
 					Fail(fmt.Sprintf("unknown signal type: %s", signal))
 				}
@@ -2467,7 +5274,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				Expect(groupsRaw).ToNot(BeNil(),
 					"expected %d transform group(s) but there were none for signal \"%s\"",
 					len(expectedGroups), signal)
-				groups := groupsRaw.([]interface{})
+				groups := groupsRaw.([]any)
 				Expect(groups).To(HaveLen(len(expectedGroups)))
 
 				for i, expectedGroup := range expectedGroups {
@@ -2476,7 +5283,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					Expect(actualStatementsRaw).ToNot(BeNil(),
 						"expected %d transform statement(s) but there were none for signal \"%s\"",
 						len(expectedStatements), signal)
-					actualTransformStatements := actualStatementsRaw.([]interface{})
+					actualTransformStatements := actualStatementsRaw.([]any)
 					Expect(actualTransformStatements).To(HaveLen(len(expectedStatements)))
 					for i, expectedStatement := range expectedStatements {
 						Expect(actualTransformStatements[i]).To(Equal(expectedStatement))
@@ -2487,7 +5294,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 					Expect(actualConditionsRaw).ToNot(BeNil(),
 						"expected %d transform condition(s) but there were none for signal \"%s\"",
 						len(expectedConditions), signal)
-					actualTransformConditions := actualConditionsRaw.([]interface{})
+					actualTransformConditions := actualConditionsRaw.([]any)
 					Expect(actualTransformConditions).To(HaveLen(len(expectedConditions)))
 					for i, expectedCondition := range expectedConditions {
 						Expect(actualTransformConditions[i]).To(Equal(expectedCondition))
@@ -2520,12 +5327,12 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		}
 
 		DescribeTable("transform processor should use the most severe error mode", func(testConfig transformErrorModeTestConfig) {
-			var transforms []NamespacedTransform
+			transforms := make([]NamespacedTransform, 0, len(testConfig.errorModes))
 			for _, errorMode := range testConfig.errorModes {
 				transforms = append(transforms, NamespacedTransform{
 					Namespace: namespace1,
 					Transform: dash0common.NormalizedTransformSpec{
-						ErrorMode: ptr.To(errorMode),
+						ErrorMode: new(errorMode),
 						Traces: []dash0common.NormalizedTransformGroup{
 							{Statements: []string{"statement"}},
 						},
@@ -2631,7 +5438,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 		}, daemonSetAndDeployment)
 
 		DescribeTable("should render metrics & logs pipelines for a Dash0 export", func(cmTypeDef configMapTypeDefinition) {
-			export := *Dash0ExportWithEndpointAndToken()
+			export := Dash0ExportWithEndpointAndToken()
 			configMap, err := cmTypeDef.assembleConfigMapFunction(&oTelColConfig{
 				OperatorNamespace: OperatorNamespace,
 				NamePrefix:        namePrefix,
@@ -2639,7 +5446,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 				KubernetesInfrastructureMetricsCollectionEnabled: true,
 				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
 					SelfMonitoringEnabled: true,
-					Export:                export,
+					Export:                *export,
 				},
 			}, monitoredNamespaces, nil, nil, false)
 			Expect(err).ToNot(HaveOccurred())
@@ -2647,31 +5454,37 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 
 			selfMonitoringLogsPipelineRaw := readSelfMonitoringLogsPipeline(collectorConfig)
 			Expect(selfMonitoringLogsPipelineRaw).ToNot(BeNil())
-			selfMonitoringLogsPipeline, ok := selfMonitoringLogsPipelineRaw.(map[string]interface{})
+			selfMonitoringLogsPipeline, ok := selfMonitoringLogsPipelineRaw.(map[string]any)
 			Expect(ok).To(BeTrue())
 			otlpExporter := readOtlpExporterFromSelfMonitoringLogsPipeline(selfMonitoringLogsPipeline)
 			Expect(otlpExporter["protocol"]).To(Equal(common.ProtocolGrpc))
 			Expect(otlpExporter["endpoint"]).To(Equal(EndpointDash0WithProtocolTest))
 			headersRaw := otlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers, ok := headersRaw.(map[string]interface{})
+			headers, ok := headersRaw.([]any)
 			Expect(ok).To(BeTrue())
 			Expect(headers).To(HaveLen(1))
-			Expect(headers[util.AuthorizationHeaderName]).To(Equal("Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"))
+			header0, ok := headers[0].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(header0["name"]).To(Equal(util.AuthorizationHeaderName))
+			Expect(header0["value"]).To(Equal("Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"))
 
 			selfMonitoringMetricsPipelineRaw := readSelfMonitoringMetricsPipeline(collectorConfig)
 			Expect(selfMonitoringMetricsPipelineRaw).ToNot(BeNil())
-			selfMonitoringMetricsPipeline, ok := selfMonitoringMetricsPipelineRaw.(map[string]interface{})
+			selfMonitoringMetricsPipeline, ok := selfMonitoringMetricsPipelineRaw.(map[string]any)
 			Expect(ok).To(BeTrue())
 			otlpExporter = readOtlpExporterFromSelfMonitoringMetricsPipeline(selfMonitoringMetricsPipeline)
 			Expect(otlpExporter["protocol"]).To(Equal(common.ProtocolGrpc))
 			Expect(otlpExporter["endpoint"]).To(Equal(EndpointDash0WithProtocolTest))
 			headersRaw = otlpExporter["headers"]
 			Expect(headersRaw).ToNot(BeNil())
-			headers, ok = headersRaw.(map[string]interface{})
+			headers, ok = headersRaw.([]any)
 			Expect(ok).To(BeTrue())
 			Expect(headers).To(HaveLen(1))
-			Expect(headers[util.AuthorizationHeaderName]).To(Equal("Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"))
+			header0, ok = headers[0].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(header0["name"]).To(Equal(util.AuthorizationHeaderName))
+			Expect(header0["value"]).To(Equal("Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"))
 		}, daemonSetAndDeployment)
 	})
 
@@ -2718,7 +5531,7 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 			Expect(ok).To(BeTrue())
 			Expect(endpoint).To(HavePrefix("https://"))
 
-			tlsConfig, ok := ReadFromMap(taConfig, []string{"tls"}).(map[string]interface{})
+			tlsConfig, ok := ReadFromMap(taConfig, []string{"tls"}).(map[string]any)
 			Expect(ok).To(BeTrue())
 			Expect(tlsConfig["ca_file"]).To(Equal(fmt.Sprintf("%s/ca.crt", targetAllocatorCertsVolumeDir)))
 			Expect(tlsConfig["cert_file"]).To(Equal(fmt.Sprintf("%s/tls.crt", targetAllocatorCertsVolumeDir)))
@@ -2746,6 +5559,89 @@ var _ = Describe("The OpenTelemetry Collector ConfigMaps", func() {
 
 			tlsConfig := ReadFromMap(taConfig, []string{"tls"})
 			Expect(tlsConfig).To(BeNil())
+		})
+	})
+
+	Describe("target-allocator self-monitoring", func() {
+		It("should render the file_log/selfmonitoring receiver and pipeline when both SelfMonitoringEnabled and PrometheusCrdSupportEnabled are true", func() {
+			config := &oTelColConfig{
+				OperatorNamespace:           OperatorNamespace,
+				NamePrefix:                  namePrefix,
+				Exporters:                   cmTestSingleDefaultOtlpExporter(),
+				PrometheusCrdSupportEnabled: true,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(config, []string{}, []string{}, []string{}, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			filelogReceiverRaw := ReadFromMap(collectorConfig, []string{"receivers", "file_log/selfmonitoring"})
+			Expect(filelogReceiverRaw).ToNot(BeNil())
+			filelogReceiver, ok := filelogReceiverRaw.(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			includeRaw := filelogReceiver["include"]
+			Expect(includeRaw).ToNot(BeNil())
+			include, ok := includeRaw.([]interface{})
+			Expect(ok).To(BeTrue())
+			Expect(include).To(HaveLen(1))
+			Expect(include[0].(string)).To(ContainSubstring(
+				fmt.Sprintf("%s_%s-opentelemetry-target-allocator", OperatorNamespace, namePrefix),
+			))
+			Expect(filelogReceiver["start_at"]).To(Equal("beginning"))
+
+			pipelines := readPipelines(collectorConfig)
+			Expect(readPipelineReceivers(pipelines, "logs/selfmonitoring-filelog-to-forwarder")).To(ConsistOf("file_log/selfmonitoring"))
+			Expect(readPipelineProcessors(pipelines, "logs/selfmonitoring-filelog-to-forwarder")).To(ConsistOf("memory_limiter"))
+			Expect(readPipelineExporters(pipelines, "logs/selfmonitoring-filelog-to-forwarder")).To(ConsistOf("forward/logs-processors"))
+		})
+
+		It("should not render the file_log/selfmonitoring receiver and pipeline when SelfMonitoringEnabled is false", func() {
+			config := &oTelColConfig{
+				OperatorNamespace:           OperatorNamespace,
+				NamePrefix:                  namePrefix,
+				Exporters:                   cmTestSingleDefaultOtlpExporter(),
+				PrometheusCrdSupportEnabled: true,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: false,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(config, []string{}, []string{}, []string{}, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "file_log/selfmonitoring"})).To(BeNil())
+			Expect(ReadFromMap(collectorConfig, []string{
+				"service",
+				"pipelines",
+				"logs/selfmonitoring-filelog-to-forwarder",
+			})).To(BeNil())
+		})
+
+		It("should not render the file_log/selfmonitoring receiver and pipeline when PrometheusCrdSupportEnabled is false", func() {
+			config := &oTelColConfig{
+				OperatorNamespace:           OperatorNamespace,
+				NamePrefix:                  namePrefix,
+				Exporters:                   cmTestSingleDefaultOtlpExporter(),
+				PrometheusCrdSupportEnabled: false,
+				SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{
+					SelfMonitoringEnabled: true,
+				},
+			}
+			configMap, err := assembleDaemonSetCollectorConfigMap(config, []string{}, []string{}, []string{}, nil, nil, emptyTargetAllocatorMtlsConfig, false)
+
+			Expect(err).ToNot(HaveOccurred())
+			collectorConfig := parseConfigMapContent(configMap)
+
+			Expect(ReadFromMap(collectorConfig, []string{"receivers", "file_log/selfmonitoring"})).To(BeNil())
+			Expect(ReadFromMap(collectorConfig, []string{
+				"service",
+				"pipelines",
+				"logs/selfmonitoring-filelog-to-forwarder",
+			})).To(BeNil())
 		})
 	})
 })
@@ -2786,12 +5682,12 @@ func assembleDeploymentCollectorConfigMapForTest(
 	)
 }
 
-func parseConfigMapContent(configMap *corev1.ConfigMap) map[string]interface{} {
+func parseConfigMapContent(configMap *corev1.ConfigMap) map[string]any {
 	return ParseConfigMapContent(configMap, "config.yaml")
 }
 
 func verifyProcessorDoesNotAppearInAnyPipeline(
-	collectorConfig map[string]interface{},
+	collectorConfig map[string]any,
 	processorName string,
 ) {
 	pipelines := readPipelines(collectorConfig)
@@ -2803,18 +5699,19 @@ func verifyProcessorDoesNotAppearInAnyPipeline(
 	}
 }
 
-func verifyScrapeJobHasNamespaces(collectorConfig map[string]interface{}, jobName string) {
+func verifyScrapeJobHasNamespaces(collectorConfig map[string]any, jobName string) {
 	namespacesKubernetesPodsRaw :=
 		ReadFromMap(
 			collectorConfig,
 			pathToScrapeJob(jobName),
 		)
-	namespacesKubernetesPods := namespacesKubernetesPodsRaw.([]interface{})
+	namespacesKubernetesPods := namespacesKubernetesPodsRaw.([]any)
 	Expect(namespacesKubernetesPods).To(ContainElements("namespace-1", "namespace-2"))
 }
 
 func pathToScrapeJob(jobName string) []string {
-	return []string{"receivers",
+	return []string{
+		"receivers",
 		"prometheus",
 		"config",
 		"scrape_configs",
@@ -2826,34 +5723,34 @@ func pathToScrapeJob(jobName string) []string {
 	}
 }
 
-func readPipelines(collectorConfig map[string]interface{}) map[string]interface{} {
-	return ((collectorConfig["service"]).(map[string]interface{})["pipelines"]).(map[string]interface{})
+func readPipelines(collectorConfig map[string]any) map[string]any {
+	return ((collectorConfig["service"]).(map[string]any)["pipelines"]).(map[string]any)
 }
 
-func readPipelineReceivers(pipelines map[string]interface{}, pipelineName string) []interface{} {
+func readPipelineReceivers(pipelines map[string]any, pipelineName string) []any {
 	return readPipelineList(pipelines, pipelineName, "receivers")
 }
 
-func readPipelineProcessors(pipelines map[string]interface{}, pipelineName string) []interface{} {
+func readPipelineProcessors(pipelines map[string]any, pipelineName string) []any {
 	return readPipelineList(pipelines, pipelineName, "processors")
 }
 
-func readPipelineExporters(pipelines map[string]interface{}, pipelineName string) []interface{} {
+func readPipelineExporters(pipelines map[string]any, pipelineName string) []any {
 	return readPipelineList(pipelines, pipelineName, "exporters")
 }
 
-func readPipelineList(pipelines map[string]interface{}, pipelineName string, listName string) []interface{} {
+func readPipelineList(pipelines map[string]any, pipelineName string, listName string) []any {
 	pipelineRaw := pipelines[pipelineName]
 	Expect(pipelineRaw).ToNot(BeNil(), fmt.Sprintf("pipeline %s was nil", pipelineName))
-	pipeline := pipelineRaw.(map[string]interface{})
+	pipeline := pipelineRaw.(map[string]any)
 	listRaw := pipeline[listName]
 	if listRaw == nil {
 		return nil
 	}
-	return listRaw.([]interface{})
+	return listRaw.([]any)
 }
 
-func readSelfMonitoringTelemetry(collectorConfig map[string]interface{}) interface{} {
+func readSelfMonitoringTelemetry(collectorConfig map[string]any) any {
 	return ReadFromMap(
 		collectorConfig,
 		[]string{
@@ -2862,7 +5759,7 @@ func readSelfMonitoringTelemetry(collectorConfig map[string]interface{}) interfa
 		})
 }
 
-func readSelfMonitoringMetricsPipeline(collectorConfig map[string]interface{}) interface{} {
+func readSelfMonitoringMetricsPipeline(collectorConfig map[string]any) any {
 	return ReadFromMap(
 		collectorConfig,
 		[]string{
@@ -2872,7 +5769,7 @@ func readSelfMonitoringMetricsPipeline(collectorConfig map[string]interface{}) i
 		})
 }
 
-func readOtlpExporterFromSelfMonitoringMetricsPipeline(selfMonitoringLogsPipeline map[string]interface{}) map[string]interface{} {
+func readOtlpExporterFromSelfMonitoringMetricsPipeline(selfMonitoringLogsPipeline map[string]any) map[string]any {
 	otlpExporterRaw := ReadFromMap(
 		selfMonitoringLogsPipeline,
 		[]string{
@@ -2884,12 +5781,12 @@ func readOtlpExporterFromSelfMonitoringMetricsPipeline(selfMonitoringLogsPipelin
 		},
 	)
 	Expect(otlpExporterRaw).ToNot(BeNil())
-	otlpExporter, ok := otlpExporterRaw.(map[string]interface{})
+	otlpExporter, ok := otlpExporterRaw.(map[string]any)
 	Expect(ok).To(BeTrue())
 	return otlpExporter
 }
 
-func readSelfMonitoringLogsPipeline(collectorConfig map[string]interface{}) interface{} {
+func readSelfMonitoringLogsPipeline(collectorConfig map[string]any) any {
 	return ReadFromMap(
 		collectorConfig,
 		[]string{
@@ -2899,7 +5796,7 @@ func readSelfMonitoringLogsPipeline(collectorConfig map[string]interface{}) inte
 		})
 }
 
-func readOtlpExporterFromSelfMonitoringLogsPipeline(selfMonitoringLogsPipeline map[string]interface{}) map[string]interface{} {
+func readOtlpExporterFromSelfMonitoringLogsPipeline(selfMonitoringLogsPipeline map[string]any) map[string]any {
 	otlpExporterRaw := ReadFromMap(
 		selfMonitoringLogsPipeline,
 		[]string{
@@ -2911,7 +5808,7 @@ func readOtlpExporterFromSelfMonitoringLogsPipeline(selfMonitoringLogsPipeline m
 		},
 	)
 	Expect(otlpExporterRaw).ToNot(BeNil())
-	otlpExporter, ok := otlpExporterRaw.(map[string]interface{})
+	otlpExporter, ok := otlpExporterRaw.(map[string]any)
 	Expect(ok).To(BeTrue())
 	return otlpExporter
 }
@@ -3019,6 +5916,25 @@ func createFilterTestForSingleObjectType(
 		default:
 			Fail(fmt.Sprintf("unsupported object type %s for signal type %s", objectT, signalT))
 		}
+
+	case signalTypeProfiles:
+		switch objectT {
+		case objectTypeProfile:
+			filter1 = dash0common.Filter{
+				ErrorMode: dash0common.FilterTransformErrorModeIgnore,
+				Profiles: &dash0common.ProfileFilter{
+					ProfileFilter: conditionsNamespace1,
+				},
+			}
+			filter2 = dash0common.Filter{
+				ErrorMode: dash0common.FilterTransformErrorModeIgnore,
+				Profiles: &dash0common.ProfileFilter{
+					ProfileFilter: conditionsNamespace2,
+				},
+			}
+		default:
+			Fail(fmt.Sprintf("unsupported object type %s for signal type %s", objectT, signalT))
+		}
 	}
 
 	daemonSetExpectations := filterExpectations{
@@ -3055,6 +5971,7 @@ func createFilterTestForSingleObjectType(
 
 	return filterTestConfig{
 		configMapTypeDefinition: cmTypeDef,
+		profilingEnabled:        signalT == signalTypeProfiles,
 		filters: []NamespacedFilter{
 			{
 				Namespace: namespace1,
@@ -3079,7 +5996,7 @@ func emptyFilterExpectations() filterExpectations {
 }
 
 func allSignals() []signalType {
-	return []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs}
+	return []signalType{signalTypeTraces, signalTypeMetrics, signalTypeLogs, signalTypeProfiles}
 }
 
 func prependNamespaceCheckToAllOttlCondition(namespace string, conditions []string) []string {
@@ -3087,7 +6004,7 @@ func prependNamespaceCheckToAllOttlCondition(namespace string, conditions []stri
 	for _, condition := range conditions {
 		processedConditions = append(
 			processedConditions,
-			prependNamespaceCheckToOttlFilterCondition(namespace, condition),
+			prependNamespaceCheckToOttlCondition(namespace, condition),
 		)
 	}
 	return processedConditions
@@ -3154,6 +6071,20 @@ func createTransformTestForSingleObjectType(
 				{Statements: statementsNamespace2},
 			},
 		}
+
+	case signalTypeProfiles:
+		transform1 = dash0common.NormalizedTransformSpec{
+			ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+			Profiles: []dash0common.NormalizedTransformGroup{
+				{Statements: statementsNamespace1},
+			},
+		}
+		transform2 = dash0common.NormalizedTransformSpec{
+			ErrorMode: ptr.To(dash0common.FilterTransformErrorModeIgnore),
+			Profiles: []dash0common.NormalizedTransformGroup{
+				{Statements: statementsNamespace2},
+			},
+		}
 	}
 
 	daemonSetExpectations := transformExpectations{
@@ -3165,7 +6096,8 @@ func createTransformTestForSingleObjectType(
 						fmt.Sprintf(
 							`resource.attributes["k8s.namespace.name"] == "%s"`,
 							namespace1,
-						)},
+						),
+					},
 					statements: statementsNamespace1,
 				},
 				{
@@ -3173,7 +6105,8 @@ func createTransformTestForSingleObjectType(
 						fmt.Sprintf(
 							`resource.attributes["k8s.namespace.name"] == "%s"`,
 							namespace2,
-						)},
+						),
+					},
 					statements: statementsNamespace2,
 				},
 			},
@@ -3191,7 +6124,8 @@ func createTransformTestForSingleObjectType(
 							fmt.Sprintf(
 								`resource.attributes["k8s.namespace.name"] == "%s"`,
 								namespace1,
-							)},
+							),
+						},
 						statements: statementsNamespace1,
 					},
 					{
@@ -3199,7 +6133,8 @@ func createTransformTestForSingleObjectType(
 							fmt.Sprintf(
 								`resource.attributes["k8s.namespace.name"] == "%s"`,
 								namespace2,
-							)},
+							),
+						},
 						statements: statementsNamespace2,
 					},
 				},
@@ -3214,6 +6149,7 @@ func createTransformTestForSingleObjectType(
 
 	return transformTestConfig{
 		configMapTypeDefinition: cmTypeDef,
+		profilingEnabled:        signalT == signalTypeProfiles,
 		transforms: []NamespacedTransform{
 			{
 				Namespace: namespace1,
@@ -3237,16 +6173,16 @@ func emptyTransformExpectations() transformExpectations {
 	}
 }
 
-func verifyRoutingTableEntry(table []interface{}, namespace string, expectedPipeline string) {
+func verifyRoutingTableEntry(table []any, namespace string, expectedPipeline string) {
 	expectedCondition := fmt.Sprintf(`attributes["k8s.namespace.name"] == "%s"`, namespace)
 	found := false
 	for _, entryRaw := range table {
-		entry := entryRaw.(map[string]interface{})
+		entry := entryRaw.(map[string]any)
 		condition := entry["condition"].(string)
 		if condition == expectedCondition {
 			found = true
 			Expect(entry["context"]).To(Equal("resource"))
-			pipelines := entry["pipelines"].([]interface{})
+			pipelines := entry["pipelines"].([]any)
 			Expect(pipelines).To(ContainElement(expectedPipeline))
 			break
 		}

@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+# this scenario only works as expected when Prometheus CRD support is enabled
+export PROMETHEUS_CRD_SUPPORT_ENABLED="true"
+
 project_root="$(dirname "${BASH_SOURCE[0]}")"/../..
 scripts_lib="test-resources/bin/lib"
 
@@ -28,7 +31,7 @@ source "$scripts_lib/util"
 
 load_env_file
 verify_kubectx
-setup_test_environment
+setup_test_environment "$target_namespace"
 
 step_counter=1
 
@@ -55,8 +58,6 @@ finish_step
 
 deploy_additional_resources
 
-deploy_dash0_api_sync_resources
-
 echo "STEP $step_counter: rebuild images"
 build_all_images
 finish_step
@@ -68,6 +69,8 @@ finish_step
 echo "STEP $step_counter: deploy the Dash0 operator using helm"
 deploy_via_helm
 finish_step
+
+deploy_dash0_api_sync_resources
 
 echo "STEP $step_counter: deploy nodejs app with servicemonitor (or podmonitor)"
 deploy_application_under_monitoring "$runtime_under_test" "$nodejs_values_with_service_monitor"

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG instrumentation_image=dash0-instrumentation:latest
-ARG base_image_build=golang:1.25.5-alpine3.23
+ARG base_image_build=golang:1.26.3-alpine3.23
 ARG base_image_run=scratch
 
 FROM ${instrumentation_image} AS init
@@ -26,6 +26,6 @@ USER 65532:65532
 
 # The following lines emulate the behavior of running the instrumentation image as a Kubernetes init container and
 # setting the LD_PRELOAD environment variable via the operator.
-COPY --from=init /dash0-init-container /__otel_auto_instrumentation
+COPY --from=init /dash0-instrumentation /__otel_auto_instrumentation
 ENV LD_PRELOAD=/__otel_auto_instrumentation/injector/libotelinject.so
-ENV OTEL_INJECTOR_CONFIG_FILE=/__otel_auto_instrumentation/injector/otelinject.conf
+ENV OTEL_INJECTOR_CONFIG_FILE=/__otel_auto_instrumentation/injector/injector.conf

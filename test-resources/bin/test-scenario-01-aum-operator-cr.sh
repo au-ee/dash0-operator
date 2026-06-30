@@ -25,7 +25,7 @@ source "$scripts_lib/util"
 
 load_env_file
 verify_kubectx
-setup_test_environment
+setup_test_environment "$target_namespace"
 
 step_counter=1
 
@@ -55,8 +55,6 @@ install_third_party_crds
 finish_step
 
 deploy_additional_resources
-
-deploy_dash0_api_sync_resources
 
 echo "STEP $step_counter: rebuild images"
 build_all_images
@@ -92,5 +90,7 @@ else
   echo "not deploying a Dash0 monitoring resource"
   echo
 fi
+
+deploy_dash0_api_sync_resources
 
 finish_scenario

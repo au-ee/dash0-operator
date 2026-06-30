@@ -11,11 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,14 +23,16 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 type SyntheticCheckReconciler struct {
@@ -38,11 +40,12 @@ type SyntheticCheckReconciler struct {
 	pseudoClusterUid      types.UID
 	leaderElectionAware   util.LeaderElectionAware
 	httpClient            *http.Client
-	apiConfig             atomic.Pointer[ApiConfig]
-	authToken             atomic.Pointer[string]
+	defaultApiConfigs     selfmonitoringapiaccess.SynchronizedSlice[ApiConfig]
+	namespacedApiConfigs  selfmonitoringapiaccess.SynchronizedMapSlice[ApiConfig]
 	initialSyncMutex      sync.Mutex
+	initialSyncInProgress atomic.Bool
 	initialSyncHasHappend atomic.Bool
-	httpRetryDelay        time.Duration
+	namespacedSyncMutex   selfmonitoringapiaccess.NamespaceMutex
 }
 
 var (
@@ -56,11 +59,13 @@ func NewSyntheticCheckReconciler(
 	httpClient *http.Client,
 ) *SyntheticCheckReconciler {
 	return &SyntheticCheckReconciler{
-		Client:              k8sClient,
-		pseudoClusterUid:    pseudoClusterUid,
-		leaderElectionAware: leaderElectionAware,
-		httpClient:          httpClient,
-		httpRetryDelay:      1 * time.Second,
+		Client:               k8sClient,
+		pseudoClusterUid:     pseudoClusterUid,
+		leaderElectionAware:  leaderElectionAware,
+		httpClient:           httpClient,
+		defaultApiConfigs:    *selfmonitoringapiaccess.NewSynchronizedSlice[ApiConfig](),
+		namespacedApiConfigs: *selfmonitoringapiaccess.NewSynchronizedMapSlice[ApiConfig](),
+		namespacedSyncMutex:  *selfmonitoringapiaccess.NewNamespaceMutex(),
 	}
 }
 
@@ -75,7 +80,7 @@ func (r *SyntheticCheckReconciler) SetupWithManager(mgr manager.Manager) error {
 func (r *SyntheticCheckReconciler) InitializeSelfMonitoringMetrics(
 	meter otelmetric.Meter,
 	metricNamePrefix string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	reconcileRequestMetricName := fmt.Sprintf("%s%s", metricNamePrefix, "syntheticcheck.reconcile_requests")
 	var err error
@@ -96,16 +101,12 @@ func (r *SyntheticCheckReconciler) ShortName() string {
 	return "check"
 }
 
-func (r *SyntheticCheckReconciler) GetAuthToken() string {
-	token := r.authToken.Load()
-	if token == nil {
-		return ""
-	}
-	return *token
+func (r *SyntheticCheckReconciler) GetDefaultApiConfigs() []ApiConfig {
+	return r.defaultApiConfigs.Get()
 }
 
-func (r *SyntheticCheckReconciler) GetApiConfig() *atomic.Pointer[ApiConfig] {
-	return &r.apiConfig
+func (r *SyntheticCheckReconciler) GetNamespacedApiConfigs(namespace string) ([]ApiConfig, bool) {
+	return r.namespacedApiConfigs.Get(namespace)
 }
 
 func (r *SyntheticCheckReconciler) ControllerName() string {
@@ -120,86 +121,101 @@ func (r *SyntheticCheckReconciler) HttpClient() *http.Client {
 	return r.httpClient
 }
 
-func (r *SyntheticCheckReconciler) GetHttpRetryDelay() time.Duration {
-	return r.httpRetryDelay
-}
-
-//nolint:unused
-func (r *SyntheticCheckReconciler) overrideHttpRetryDelay(delay time.Duration) {
-	r.httpRetryDelay = delay
-}
-
-func (r *SyntheticCheckReconciler) SetApiEndpointAndDataset(
+func (r *SyntheticCheckReconciler) SetDefaultApiConfigs(
 	ctx context.Context,
-	apiConfig *ApiConfig,
-	logger *logr.Logger) {
-	r.apiConfig.Store(apiConfig)
+	apiConfigs []ApiConfig,
+	logger logd.Logger,
+) {
+	r.defaultApiConfigs.Set(apiConfigs)
 	r.maybeDoInitialSynchronizationOfAllResources(ctx, logger)
 }
 
-func (r *SyntheticCheckReconciler) RemoveApiEndpointAndDataset(_ context.Context, _ *logr.Logger) {
-	r.apiConfig.Store(nil)
+func (r *SyntheticCheckReconciler) RemoveDefaultApiConfigs(_ context.Context, _ logd.Logger) {
+	r.defaultApiConfigs.Clear()
 }
 
-func (r *SyntheticCheckReconciler) SetAuthToken(
+func (r *SyntheticCheckReconciler) SetNamespacedApiConfigs(
 	ctx context.Context,
-	authToken string,
-	logger *logr.Logger) {
-	r.authToken.Store(&authToken)
+	namespace string,
+	updatedApiConfigs []ApiConfig,
+	logger logd.Logger,
+) {
+	if updatedApiConfigs != nil {
+		previousApiConfigs, _ := r.namespacedApiConfigs.Get(namespace)
+
+		r.namespacedApiConfigs.Set(namespace, updatedApiConfigs)
+
+		if !slices.Equal(previousApiConfigs, updatedApiConfigs) {
+			r.synchronizeNamespacedResources(ctx, namespace, logger)
+		}
+	}
+}
+
+func (r *SyntheticCheckReconciler) RemoveNamespacedApiConfigs(
+	ctx context.Context,
+	namespace string,
+	logger logd.Logger,
+) {
+	if _, exists := r.namespacedApiConfigs.Get(namespace); exists {
+		r.namespacedApiConfigs.Delete(namespace)
+		r.synchronizeNamespacedResources(ctx, namespace, logger)
+	}
+}
+
+func (r *SyntheticCheckReconciler) SetSynchronizationEnabled(
+	_ context.Context,
+	_ string,
+	_ *dash0v1beta1.Dash0Monitoring,
+	_ logd.Logger,
+) {
+	// no-op: synthetic checks do not have a per-namespace sync toggle
+}
+
+func (r *SyntheticCheckReconciler) RemoveSynchronizationEnabled(_ string) {
+	// no-op: synthetic checks do not have a per-namespace sync toggle
+}
+
+func (r *SyntheticCheckReconciler) NotifyOperatorManagerJustBecameLeader(ctx context.Context, logger logd.Logger) {
 	r.maybeDoInitialSynchronizationOfAllResources(ctx, logger)
 }
 
-func (r *SyntheticCheckReconciler) RemoveAuthToken(_ context.Context, _ *logr.Logger) {
-	r.authToken.Store(nil)
-}
-
-func (r *SyntheticCheckReconciler) NotifiyOperatorManagerJustBecameLeader(ctx context.Context, logger *logr.Logger) {
-	r.maybeDoInitialSynchronizationOfAllResources(ctx, logger)
-}
-
-func (r *SyntheticCheckReconciler) maybeDoInitialSynchronizationOfAllResources(ctx context.Context, logger *logr.Logger) {
+func (r *SyntheticCheckReconciler) maybeDoInitialSynchronizationOfAllResources(
+	ctx context.Context,
+	logger logd.Logger,
+) {
 	r.initialSyncMutex.Lock()
 	defer r.initialSyncMutex.Unlock()
 
-	if r.initialSyncHasHappend.Load() {
+	if r.initialSyncHasHappend.Load() || r.initialSyncInProgress.Load() {
 		return
 	}
 
 	if !r.leaderElectionAware.IsLeader() {
 		logger.Info(
 			fmt.Sprintf(
-				"Waiting for the this operator manager replica to become leader before running initial " +
+				"Waiting for this operator manager replica to become leader before running initial " +
 					"synchronization of synthetic checks.",
-			))
+			),
+		)
 		return
 	}
-	if !isValidApiConfig(r.apiConfig.Load()) {
+	if len(filterValidApiConfigs(r.defaultApiConfigs.Get(), logger, "default operator configuration")) == 0 {
 		logger.Info(
-			"Waiting for the Dash0 API endpoint before running initial synchronization of synthetic checks. Either " +
-				"no Dash0 API endpoint has been provided via the operator configuration resource, or the operator " +
+			"Waiting for the Dash0 API config before running initial synchronization of synthetic checks. Either " +
+				"no Dash0 API config has been provided via the operator configuration resource, or the operator " +
 				"configuration resource has not been reconciled yet. If there is an operator configuration resource " +
 				"with an API endpoint and a Dash0 auth token or a secret ref present in the cluster, it will be " +
 				"reconciled in a few seconds and this message can be safely ignored.",
 		)
 		return
 	}
-	authToken := r.authToken.Load()
-	if authToken == nil || *authToken == "" {
-		logger.Info(
-			"Waiting for the Dash0 auth token before running initial synchronization of synthetic checks. Either " +
-				"the auth token has not been provided via the operator configuration resource, or the operator " +
-				"configuration resource has not been reconciled yet, or it has been provided as a secret reference " +
-				"which has not been resolved to a token yet. If there is an operator configuration resource with an " +
-				"API endpoint and a Dash0 auth token or a secret ref present in the cluster, it will be reconciled " +
-				"and the secret ref (if any) resolved to a token in a few seconds and this message can be safely " +
-				"ignored.",
-		)
-		return
-	}
 
 	logger.Info("Running initial synchronization of synthetic checks now.")
+	r.initialSyncInProgress.Store(true)
 
 	go func() {
+		defer r.initialSyncInProgress.Store(false)
+
 		allSyntheticCheckResourcesInCluster := dash0v1alpha1.Dash0SyntheticCheckList{}
 		if err := r.List(
 			ctx,
@@ -226,13 +242,65 @@ func (r *SyntheticCheckReconciler) maybeDoInitialSynchronizationOfAllResources(c
 	}()
 }
 
+func (r *SyntheticCheckReconciler) synchronizeNamespacedResources(
+	ctx context.Context,
+	namespace string,
+	logger logd.Logger,
+) {
+	if !r.leaderElectionAware.IsLeader() {
+		logger.Info(
+			fmt.Sprintf(
+				"Waiting for this operator manager replica to become leader before running " +
+					"synchronization of synthetic checks.",
+			),
+		)
+		return
+	}
+
+	// The namespacedSyncMutex is used so we don't trigger multiple syncs in parallel in a single namespace.
+	// That happens for example when the export from a monitoring resource is removed, since that updates both the API
+	// config and auth token at almost the same time, triggering two resyncs.
+	r.namespacedSyncMutex.Lock(namespace)
+
+	logger.Info(fmt.Sprintf("Running synchronization of synthetic checks in namespace %s now.", namespace))
+
+	go func() {
+		defer r.namespacedSyncMutex.Unlock(namespace)
+
+		allSyntheticCheckResourcesInNamespace := dash0v1alpha1.Dash0SyntheticCheckList{}
+		if err := r.List(
+			ctx,
+			&allSyntheticCheckResourcesInNamespace,
+			&client.ListOptions{
+				Namespace: namespace,
+			},
+		); err != nil {
+			logger.Error(err, fmt.Sprintf("Failed to list Dash0 synthetic check resources in namespace %s.", namespace))
+			return
+		}
+
+		for _, syntheticCheckResource := range allSyntheticCheckResourcesInNamespace.Items {
+			pseudoReconcileRequest := ctrl.Request{
+				NamespacedName: client.ObjectKey{
+					Namespace: syntheticCheckResource.Namespace,
+					Name:      syntheticCheckResource.Name,
+				},
+			}
+			_, _ = r.Reconcile(ctx, pseudoReconcileRequest)
+			// stagger API requests a bit
+			time.Sleep(50 * time.Millisecond)
+		}
+		logger.Info(fmt.Sprintf("Synchronization of synthetic checks in namespace %s has finished.", namespace))
+	}()
+}
+
 func (r *SyntheticCheckReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	if syntheticCheckReconcileRequestMetric != nil {
 		syntheticCheckReconcileRequestMetric.Add(ctx, 1)
 	}
 
 	qualifiedName := req.NamespacedName.String() //nolint:staticcheck
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("processing reconcile request for a synthetic check resource", "name", qualifiedName)
 
 	action := upsertAction
@@ -248,11 +316,13 @@ func (r *SyntheticCheckReconciler) Reconcile(ctx context.Context, req reconcile.
 				},
 			}
 		} else {
-			logger.Error(err,
+			logger.Error(
+				err,
 				fmt.Sprintf(
 					"Failed to get the synthetic check \"%s\", requeuing reconcile request.",
 					qualifiedName,
-				))
+				),
+			)
 			return ctrl.Result{}, err
 		}
 	}
@@ -265,11 +335,8 @@ func (r *SyntheticCheckReconciler) Reconcile(ctx context.Context, req reconcile.
 			r.WriteSynchronizationResultToSynchronizedResource(
 				ctx,
 				syntheticCheckResource,
-				dash0common.Dash0ApiResourceSynchronizationStatusFailed,
-				Dash0ApiObjectLabels{},
-				nil,
-				msg,
-				&logger,
+				synchronizationResults{},
+				logger,
 			)
 		}
 		return reconcile.Result{}, nil
@@ -281,7 +348,7 @@ func (r *SyntheticCheckReconciler) Reconcile(ctx context.Context, req reconcile.
 		unstructuredResource,
 		syntheticCheckResource,
 		action,
-		&logger,
+		logger,
 	)
 
 	return reconcile.Result{}, nil
@@ -289,11 +356,16 @@ func (r *SyntheticCheckReconciler) Reconcile(ctx context.Context, req reconcile.
 
 func (r *SyntheticCheckReconciler) MapResourceToHttpRequests(
 	preconditionChecksResult *preconditionValidationResult,
+	apiConfig ApiConfig,
 	action apiAction,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) *ResourceToRequestsResult {
 	itemName := preconditionChecksResult.k8sName
-	syntheticCheckUrl, syntheticCheckOrigin := r.renderSyntheticCheckUrl(preconditionChecksResult)
+	syntheticCheckUrl, syntheticCheckOrigin := r.renderSyntheticCheckUrl(
+		preconditionChecksResult,
+		apiConfig.Endpoint,
+		apiConfig.Dataset,
+	)
 
 	var req *http.Request
 	var method string
@@ -320,7 +392,7 @@ func (r *SyntheticCheckReconciler) MapResourceToHttpRequests(
 	default:
 		unknownActionErr := fmt.Errorf("unknown API action: %d", action)
 		logger.Error(unknownActionErr, "unknown API action")
-		return NewResourceToRequestsResultSingleItemError(itemName, unknownActionErr.Error())
+		return NewResourceToRequestsResultSingleItemError(apiConfig, itemName, unknownActionErr.Error())
 	}
 
 	if err != nil {
@@ -331,19 +403,28 @@ func (r *SyntheticCheckReconciler) MapResourceToHttpRequests(
 			err,
 		)
 		logger.Error(httpError, "error creating http request")
-		return NewResourceToRequestsResultSingleItemError(itemName, httpError.Error())
+		return NewResourceToRequestsResultSingleItemError(apiConfig, itemName, httpError.Error())
 	}
 
-	addAuthorizationHeader(req, preconditionChecksResult)
+	addAuthorizationHeader(req, apiConfig.Token)
 	if action == upsertAction {
 		req.Header.Set(util.ContentTypeHeaderName, util.ApplicationJsonMediaType)
 	}
 
-	return NewResourceToRequestsResultSingleItemSuccess(req, itemName, syntheticCheckOrigin, preconditionChecksResult.dataset)
+	return NewResourceToRequestsResultSingleItemSuccess(
+		apiConfig,
+		req,
+		itemName,
+		syntheticCheckOrigin,
+	)
 }
 
-func (r *SyntheticCheckReconciler) renderSyntheticCheckUrl(preconditionChecksResult *preconditionValidationResult) (string, string) {
-	datasetUrlEncoded := url.QueryEscape(preconditionChecksResult.dataset)
+func (r *SyntheticCheckReconciler) renderSyntheticCheckUrl(
+	preconditionChecksResult *preconditionValidationResult,
+	endpoint string,
+	dataset string,
+) (string, string) {
+	datasetUrlEncoded := url.QueryEscape(dataset)
 	syntheticCheckOrigin := fmt.Sprintf(
 		// we deliberately use _ as the separator, since that is an illegal character in Kubernetes names. This avoids
 		// any potential naming collisions (e.g. namespace="abc" & name="def-ghi" vs. namespace="abc-def" & name="ghi").
@@ -355,55 +436,99 @@ func (r *SyntheticCheckReconciler) renderSyntheticCheckUrl(preconditionChecksRes
 	)
 	return fmt.Sprintf(
 		"%sapi/synthetic-checks/%s?dataset=%s",
-		preconditionChecksResult.apiEndpoint,
+		endpoint,
 		syntheticCheckOrigin,
 		datasetUrlEncoded,
 	), syntheticCheckOrigin
 }
 
-func (r *SyntheticCheckReconciler) ExtractIdOriginAndDatasetFromResponseBody(
+func (r *SyntheticCheckReconciler) ExtractIdFromResponseBody(
 	responseBytes []byte,
-	logger *logr.Logger,
-) Dash0ApiObjectLabels {
+	logger logd.Logger,
+) (id string, err error) {
 	objectWithMetadata := Dash0ApiObjectWithMetadata{}
 	if err := json.Unmarshal(responseBytes, &objectWithMetadata); err != nil {
 		logger.Error(
 			err,
-			"cannot parse response, will not extract the synchronized object's ID or origin",
+			"cannot parse response, will not extract the synchronized object's ID",
 			"response",
 			string(responseBytes),
 		)
-		return Dash0ApiObjectLabels{}
+		return "", err
 	}
-	return objectWithMetadata.Metadata.Labels
+	return objectWithMetadata.Metadata.Labels.Id, nil
 }
 
 func (r *SyntheticCheckReconciler) WriteSynchronizationResultToSynchronizedResource(
 	ctx context.Context,
 	synchronizedResource client.Object,
-	status dash0common.Dash0ApiResourceSynchronizationStatus,
-	apiObjectLabels Dash0ApiObjectLabels,
-	validationIssues []string,
-	synchronizationError string,
-	logger *logr.Logger,
+	syncResults synchronizationResults,
+	logger logd.Logger,
 ) {
 	syntheticCheck := synchronizedResource.(*dash0v1alpha1.Dash0SyntheticCheck)
-	syntheticCheck.Status.SynchronizationStatus = status
+
+	// common result
+	syntheticCheck.Status.SynchronizationStatus = syncResults.resourceSyncStatus()
 	syntheticCheck.Status.SynchronizedAt = metav1.Time{Time: time.Now()}
-	if apiObjectLabels.Id != "" {
-		syntheticCheck.Status.Dash0Id = apiObjectLabels.Id
+	syntheticCheck.Status.ValidationIssues = nil // we do not validate anything for synthetic checks
+
+	// result(s) per apiConfig
+	syntheticCheckSyncResults := make([]dash0v1alpha1.Dash0SyntheticCheckSynchronizationResultPerEndpointAndDataset, 0,
+		len(syncResults.resultsPerApiConfig))
+	for _, res := range syncResults.resultsPerApiConfig {
+		synchronizationStatus := dash0common.Dash0ApiResourceSynchronizationStatusFailed
+		// for synthetic checks there can be only one sync error per endpoint/dataset
+		synchronizationError, httpStatusCode := firstSynchronizationErrorAndStatusCode(res.resourceToRequestsResult)
+		if synchronizationError == "" {
+			// no error: mark this endpoint/dataset as successful (this also clears errors from previous attempts)
+			synchronizationStatus = dash0common.Dash0ApiResourceSynchronizationStatusSuccessful
+		}
+		syncResultPerEndpointAndDataset := dash0v1alpha1.Dash0SyntheticCheckSynchronizationResultPerEndpointAndDataset{
+			SynchronizationStatus: synchronizationStatus,
+			Dash0ApiEndpoint:      res.apiConfig.Endpoint,
+			Dash0Dataset:          res.apiConfig.Dataset,
+			SynchronizationError:  synchronizationError,
+			HttpStatusCode:        httpStatusCode,
+		}
+		if len(res.successfullySynchronized) > 0 {
+			// for synthetic checks we only have at most one successful result per endpoint/dataset
+			synchronized := res.successfullySynchronized[0]
+			if synchronized.Labels.Id != "" {
+				syncResultPerEndpointAndDataset.Dash0Id = synchronized.Labels.Id
+			}
+			if synchronized.Labels.Origin != "" {
+				syncResultPerEndpointAndDataset.Dash0Origin = synchronized.Labels.Origin
+			}
+		}
+		syntheticCheckSyncResults = append(syntheticCheckSyncResults, syncResultPerEndpointAndDataset)
 	}
-	if apiObjectLabels.Origin != "" {
-		syntheticCheck.Status.Dash0Origin = apiObjectLabels.Origin
-	}
-	if apiObjectLabels.Dataset != "" {
-		syntheticCheck.Status.Dash0Dataset = apiObjectLabels.Dataset
-	}
-	syntheticCheck.Status.SynchronizationError = synchronizationError
-	syntheticCheck.Status.ValidationIssues = validationIssues
+	syntheticCheck.Status.SynchronizationResults = syntheticCheckSyncResults
+
 	if err := r.Status().Update(ctx, syntheticCheck); err != nil {
 		logger.Error(err, "Failed to update Dash0 synthetic check status.")
 	}
+}
+
+func (r *SyntheticCheckReconciler) CreateReconcileRequestsForRetryableSyncErrors(
+	ctx context.Context,
+) ([]reconcile.Request, error) {
+	allResources := &dash0v1alpha1.Dash0SyntheticCheckList{}
+	if err := r.List(ctx, allResources); err != nil {
+		return nil, err
+	}
+	var requests []reconcile.Request
+	for i := range allResources.Items {
+		resource := &allResources.Items[i]
+		for _, syncResult := range resource.Status.SynchronizationResults {
+			if isRetryableSynchronizationError(syncResult.SynchronizationError, syncResult.HttpStatusCode) {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: client.ObjectKey{Namespace: resource.Namespace, Name: resource.Name},
+				})
+				break
+			}
+		}
+	}
+	return requests, nil
 }
 
 // An event filter that ignores changes in the status subresource but reacts on changes to spec, label and annotations.
@@ -412,14 +537,6 @@ func (r *SyntheticCheckReconciler) WriteSynchronizationResultToSynchronizedResou
 // without the filter this would cause another no-op reconcile request.
 type syntheticCheckPredicate struct {
 	predicate.Funcs
-}
-
-func (p syntheticCheckPredicate) CreateFunc(_ event.CreateEvent) bool {
-	return true
-}
-
-func (p syntheticCheckPredicate) DeleteFunc(_ event.DeleteEvent) bool {
-	return true
 }
 
 func (p syntheticCheckPredicate) Update(e event.UpdateEvent) bool {
@@ -439,8 +556,4 @@ func (p syntheticCheckPredicate) Update(e event.UpdateEvent) bool {
 	annotationsChanged := !reflect.DeepEqual(oldObj.Annotations, newObj.Annotations)
 
 	return specChanged || labelsChanged || annotationsChanged
-}
-
-func (p syntheticCheckPredicate) GenericFunc(_ event.GenericEvent) bool {
-	return true
 }

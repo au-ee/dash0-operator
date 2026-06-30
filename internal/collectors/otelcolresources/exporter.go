@@ -5,21 +5,26 @@ package otelcolresources
 
 import (
 	"fmt"
+	"sort"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/util"
-	"github.com/go-logr/logr"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 type otlpExporter struct {
 	Name               string
 	Endpoint           string
+	Authorization      *dash0ExporterAuthorization
 	Headers            []dash0common.Header
 	Encoding           string
 	Insecure           bool
 	InsecureSkipVerify bool
+	Keepalive          *dash0common.KeepaliveClientConfig
+	BalancerName       string
 }
 
 type defaultOtlpExporters = []otlpExporter
@@ -31,37 +36,89 @@ type otlpExporters struct {
 	Namespaced namespacedOtlpExporters
 }
 
+func (e *otlpExporters) AllNamespaceKeys() []string {
+	keys := make([]string, 0, len(e.Namespaced))
+	for k := range e.Namespaced {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (e *otlpExporters) allNamespacedExporters() []otlpExporter {
+	all := make([]otlpExporter, 0, len(e.Namespaced))
+	for _, k := range e.AllNamespaceKeys() {
+		all = append(all, e.Namespaced[k]...)
+	}
+	return all
+}
+
+func (e *otlpExporters) allExporters() []otlpExporter {
+	nsExporters := e.allNamespacedExporters()
+	all := make([]otlpExporter, 0, len(e.Default)+len(nsExporters))
+	all = append(all, e.Default...)
+	all = append(all, nsExporters...)
+	return all
+}
+
 const (
-	dash0ExporterNamePrefix = "otlp/dash0"
-	grpcExporterNamePrefix  = "otlp/grpc"
-	httpExporterNamePrefix  = "otlphttp"
+	dash0ExporterNamePrefix = "otlp_grpc/dash0"
+	grpcExporterNamePrefix  = "otlp_grpc"
+	httpExporterNamePrefix  = "otlp_http"
 )
 
 func getDefaultOtlpExporters(dash0Config *dash0v1alpha1.Dash0OperatorConfiguration) ([]otlpExporter, error) {
-	return convertExportSettingsToExporterList(dash0Config.Spec.Export, true, nil)
+	if !dash0Config.HasExportsConfigured() {
+		return nil, nil
+	}
+
+	exporters := make([]otlpExporter, 0, dash0Config.ExportsCount())
+	for i, export := range dash0Config.EffectiveExports() {
+		exp, err := convertExportSettingsToExporterList(&export, i, true, nil)
+		if err != nil {
+			return nil, err
+		} else {
+			exporters = append(exporters, exp...)
+		}
+	}
+	return exporters, nil
 }
 
 // getNamespacedOtlpExporters will log and continue on errors. If a namespace has invalid exporter settings, the
 // remaining namespaces will still be handled correctly. For the invalid namespace, the default exporters will be used.
-func getNamespacedOtlpExporters(allMonitoringResources []dash0v1beta1.Dash0Monitoring, logger *logr.Logger) namespacedOtlpExporters {
+func getNamespacedOtlpExporters(
+	allMonitoringResources []dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) namespacedOtlpExporters {
 	nsExporters := make(map[string][]otlpExporter, len(allMonitoringResources))
 	for _, monitoringResource := range allMonitoringResources {
-		if monitoringResource.Spec.Export == nil {
+		if !monitoringResource.HasExportsConfigured() {
 			continue
 		}
 		ns := monitoringResource.Namespace
-		otlpExporters, err := convertExportSettingsToExporterList(monitoringResource.Spec.Export, false, &ns)
-		if err != nil {
-			logger.Error(err, fmt.Sprintf("Custom exporters for namespace %s could not be applied. "+
-				"Default exporters will be used for this namespace.", ns))
-		} else {
-			nsExporters[ns] = otlpExporters
+
+		exporters := make([]otlpExporter, 0, monitoringResource.ExportsCount())
+		for i, export := range monitoringResource.EffectiveExports() {
+			exp, err := convertExportSettingsToExporterList(&export, i, false, &ns)
+			if err != nil {
+				logger.ErrorTelemetryCollectionIssue(err, fmt.Sprintf("Custom exporters for namespace %s could not be applied. "+
+					"Default exporters will be used for this namespace.", ns))
+				break
+			} else {
+				exporters = append(exporters, exp...)
+			}
 		}
+		nsExporters[ns] = exporters
 	}
 	return nsExporters
 }
 
-func convertExportSettingsToExporterList(export *dash0common.Export, isDefault bool, namespace *string) ([]otlpExporter, error) {
+func convertExportSettingsToExporterList(
+	export *dash0common.Export,
+	index int,
+	isDefault bool,
+	namespace *string,
+) ([]otlpExporter, error) {
 	if export == nil {
 		return nil, nil
 	}
@@ -71,9 +128,9 @@ func convertExportSettingsToExporterList(export *dash0common.Export, isDefault b
 
 	var nameSuffix string
 	if isDefault {
-		nameSuffix = "default"
+		nameSuffix = nameSuffixDefault(index)
 	} else {
-		nameSuffix = namespaceToNameSuffix(*namespace)
+		nameSuffix = nameSuffixNs(index, *namespace)
 	}
 
 	var exporters []otlpExporter
@@ -83,13 +140,18 @@ func convertExportSettingsToExporterList(export *dash0common.Export, isDefault b
 	}
 
 	if export.Dash0 != nil {
-		var envVarName string
+		var auth *dash0ExporterAuthorization
+		var err error
 		if isDefault {
-			envVarName = authEnvVarNameDefault
+			auth, err = dash0ExporterAuthorizationForExport(*export, index, isDefault, nil)
 		} else {
-			envVarName = authEnvVarNameForNs(*namespace)
+			auth, err = dash0ExporterAuthorizationForExport(*export, index, isDefault, namespace)
 		}
-		dash0Exporter, err := convertDash0ExporterToOtlpExporter(export.Dash0, nameSuffix, envVarName)
+		if err != nil {
+			return nil, err
+		}
+
+		dash0Exporter, err := convertDash0ExporterToOtlpExporter(export.Dash0, nameSuffix, auth)
 		if err != nil {
 			return nil, err
 		}
@@ -115,14 +177,22 @@ func convertExportSettingsToExporterList(export *dash0common.Export, isDefault b
 	return exporters, nil
 }
 
-func convertDash0ExporterToOtlpExporter(d0 *dash0common.Dash0Configuration, nameSuffix string, authEnvVarName string) (*otlpExporter, error) {
+func convertDash0ExporterToOtlpExporter(
+	d0 *dash0common.Dash0Configuration,
+	nameSuffix string,
+	auth *dash0ExporterAuthorization,
+) (*otlpExporter, error) {
 	if d0.Endpoint == "" {
 		return nil, fmt.Errorf("no endpoint provided for the Dash0 exporter, unable to create the OpenTelemetry collector")
+	} else if auth == nil {
+		return nil, fmt.Errorf("no authorization provided for the Dash0 exporter, unable to create the OpenTelemetry collector")
 	}
-	headers := []dash0common.Header{{
-		Name:  util.AuthorizationHeaderName,
-		Value: authHeaderValue(authEnvVarName),
-	}}
+	headers := []dash0common.Header{
+		{
+			Name:  util.AuthorizationHeaderName,
+			Value: authHeaderValue(auth.EnvVarName),
+		},
+	}
 	if d0.Dataset != "" && d0.Dataset != util.DatasetDefault {
 		headers = append(headers, dash0common.Header{
 			Name:  util.Dash0DatasetHeaderName,
@@ -130,9 +200,16 @@ func convertDash0ExporterToOtlpExporter(d0 *dash0common.Dash0Configuration, name
 		})
 	}
 	dash0Exporter := otlpExporter{
-		Name:     fmt.Sprintf("%s/%s", dash0ExporterNamePrefix, nameSuffix),
-		Endpoint: d0.Endpoint,
-		Headers:  headers,
+		Name:          fmt.Sprintf("%s/%s", dash0ExporterNamePrefix, nameSuffix),
+		Endpoint:      d0.Endpoint,
+		Headers:       headers,
+		Authorization: auth,
+		Keepalive:     d0.Keepalive,
+		// For the dash0 exporter we always use pick_first, since client-side load balancing is
+		// not needed and it avoids the issue of the exporter trying both the IPv4 and IPv6
+		// addresses continuously, which leads to excessive warning logs since one will fail.
+		// (Which one will fail, depends on whether the cluster has IPv4 or IPv6 networking.)
+		BalancerName: string(dash0common.PickFirst),
 	}
 	setGrpcTlsFromPrefix(d0.Endpoint, &dash0Exporter)
 	return &dash0Exporter, nil
@@ -143,9 +220,11 @@ func convertGrpcExporterToOtlpExporter(grpc *dash0common.GrpcConfiguration, name
 		return nil, fmt.Errorf("no endpoint provided for the gRPC exporter, unable to create the OpenTelemetry collector")
 	}
 	grpcExporter := otlpExporter{
-		Name:     fmt.Sprintf("%s/%s", grpcExporterNamePrefix, nameSuffix),
-		Endpoint: grpc.Endpoint,
-		Headers:  grpc.Headers,
+		Name:         fmt.Sprintf("%s/%s", grpcExporterNamePrefix, nameSuffix),
+		Endpoint:     grpc.Endpoint,
+		Headers:      grpc.Headers,
+		Keepalive:    grpc.Keepalive,
+		BalancerName: string(grpc.BalancerName),
 	}
 	if grpc.Insecure != nil {
 		grpcExporter.Insecure = *grpc.Insecure
@@ -180,15 +259,19 @@ func convertHttpExporterToOtlpExporter(http *dash0common.HttpConfiguration, name
 }
 
 func setInsecureSkipVerify(endpoint string, insecureSkipVerify *bool, exporter *otlpExporter) {
-	if !hasNonTlsPrefix(endpoint) && util.ReadBoolPointerWithDefault(insecureSkipVerify, false) {
+	if !hasNonTlsPrefix(endpoint) && pointers.ReadBoolPointerWithDefault(insecureSkipVerify, false) {
 		exporter.InsecureSkipVerify = true
 	}
 }
 
-func namespaceToNameSuffix(namespace string) string {
-	return fmt.Sprintf("ns/%s", namespace)
-}
-
 func authHeaderValue(envVarName string) string {
 	return fmt.Sprintf("Bearer ${env:%s}", envVarName)
+}
+
+func nameSuffixDefault(index int) string {
+	return fmt.Sprintf("default_%d", index)
+}
+
+func nameSuffixNs(index int, namespace string) string {
+	return fmt.Sprintf("ns/%s_%d", namespace, index)
 }

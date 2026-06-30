@@ -56,6 +56,21 @@ TARGET_ALLOCATOR_IMAGE_TAG ?= $(IMAGE_TAG)
 TARGET_ALLOCATOR_IMAGE ?= $(TARGET_ALLOCATOR_IMAGE_REPOSITORY):$(TARGET_ALLOCATOR_IMAGE_TAG)
 TARGET_ALLOCATOR_IMAGE_PULL_POLICY ?= $(PULL_POLICY)
 
+INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY ?= $(IMAGE_REPOSITORY_PREFIX)intelligent-edge-collector
+INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG ?= $(IMAGE_TAG)
+INTELLIGENT_EDGE_COLLECTOR_IMAGE ?= $(INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY):$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG)
+INTELLIGENT_EDGE_COLLECTOR_IMAGE_PULL_POLICY ?= $(PULL_POLICY)
+
+BARKER_IMAGE_REPOSITORY ?= $(IMAGE_REPOSITORY_PREFIX)barker
+BARKER_IMAGE_TAG ?= $(IMAGE_TAG)
+BARKER_IMAGE ?= $(BARKER_IMAGE_REPOSITORY):$(BARKER_IMAGE_TAG)
+BARKER_IMAGE_PULL_POLICY ?= $(PULL_POLICY)
+
+AGENT0_CONNECTOR_IMAGE_REPOSITORY ?= $(IMAGE_REPOSITORY_PREFIX)agent0-connector
+AGENT0_CONNECTOR_IMAGE_TAG ?= $(IMAGE_TAG)
+AGENT0_CONNECTOR_IMAGE ?= $(AGENT0_CONNECTOR_IMAGE_REPOSITORY):$(AGENT0_CONNECTOR_IMAGE_TAG)
+AGENT0_CONNECTOR_IMAGE_PULL_POLICY ?= $(PULL_POLICY)
+
 # Variables for test application container images:
 
 TEST_IMAGE_REPOSITORY_PREFIX ?= $(IMAGE_REPOSITORY_PREFIX)
@@ -78,6 +93,15 @@ TEST_APP_PYTHON_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
 
 DASH0_API_MOCK_IMAGE_REPOSITORY ?= $(TEST_IMAGE_REPOSITORY_PREFIX)dash0-api-mock
 DASH0_API_MOCK_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
+
+DECISION_MAKER_MOCK_IMAGE_REPOSITORY ?= $(TEST_IMAGE_REPOSITORY_PREFIX)decision-maker-mock
+DECISION_MAKER_MOCK_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
+
+CONTROL_PLANE_MOCK_IMAGE_REPOSITORY ?= $(TEST_IMAGE_REPOSITORY_PREFIX)control-plane-mock
+CONTROL_PLANE_MOCK_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
+
+OUTBOUND_CONNECTOR_MOCK_IMAGE_REPOSITORY ?= $(TEST_IMAGE_REPOSITORY_PREFIX)outbound-connector-mock
+OUTBOUND_CONNECTOR_MOCK_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
 
 TELEMETRY_MATCHER_IMAGE_REPOSITORY ?= $(TEST_IMAGE_REPOSITORY_PREFIX)telemetry-matcher
 TELEMETRY_MATCHER_IMAGE_TAG ?= $(TEST_IMAGE_TAG)
@@ -144,23 +168,39 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+.PHONY: go-fix
+go-fix: ## Run go fix against code.
+	go fix ./...
+
 .PHONY: test
 test: go-unit-tests helm-unit-tests ## Run all unit tests (Go, Helm chart unit tests).
 
 .PHONY: go-unit-tests
-go-unit-tests: common-package-unit-tests operator-manager-unit-tests ## Run the Go unit tests for all packages.
+go-unit-tests: common-package-unit-tests operator-manager-unit-tests agent0-connector-unit-tests ## Run the Go unit tests for all packages.
 
 .PHONY: operator-manager-unit-tests
 operator-manager-unit-tests: manifests generate fmt vet envtest ## Run the Go unit tests for the operator code.
+ifdef GINKGO_FOCUS
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v -e /e2e -e /vendored) -ginkgo.focus="$(GINKGO_FOCUS)" -coverprofile cover.out
+else
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v -e /e2e -e /vendored) -coverprofile cover.out
+endif
 
 .PHONY: common-package-unit-tests
 common-package-unit-tests: ## Run the Go unit tests for the common package (code shared between operator manager and other images, i.e. config-reloader, filelogoffsetsync).
 	go test github.com/dash0hq/dash0-operator/images/pkg/common
 
+.PHONY: agent0-connector-unit-tests
+agent0-connector-unit-tests: ## Run the Go unit tests for the agent0-connector image Go app.
+	cd images/agent0-connector/src && go test ./...
+
 .PHONY: helm-unit-tests
 helm-unit-tests: ## Run the Helm chart unit tests.
 	cd helm-chart/dash0-operator && helm unittest -f 'tests/**/*.yaml' .
+
+.PHONY: python-instrumentation-unit-tests
+python-instrumentation-unit-tests:
+	cd images/instrumentation/python && python -m unittest test_sitecustomize.py -v
 
 .PHONY: build-all-test-e2e
 build-all-test-e2e: all-images test-e2e ## Builds (but does not push) all container images, then runs the end-to-end tests.
@@ -173,7 +213,7 @@ build-all-push-all-test-e2e: all-images push-all-images test-e2e ## Builds and p
 # is, `go test ./test/e2e/ -v -ginkgo.v`, but that would require us to manage go test's timeout (via the -timeout
 # flag), and ginkgo's own timeout.
 .PHONY: test-e2e
-test-e2e: ## Run the end-to-end tests. When testing local code, container images should be built beforehand (or use target build-images-test-e2e).
+test-e2e: ## Run the end-to-end tests. When testing local code, container images should be built beforehand (or use target build-all-test-e2e).
 ifdef GINKGO_FOCUS
 	cd test/e2e && go run github.com/onsi/ginkgo/v2/ginkgo -v -focus="$(GINKGO_FOCUS)" .
 else
@@ -181,7 +221,7 @@ else
 endif
 
 GOLANGCI_LINT = $(shell pwd)/bin/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.7.2
+GOLANGCI_LINT_VERSION ?= v2.9.0
 golangci-lint-install:
 	@[ -f $(GOLANGCI_LINT) ] || { \
 	set -e ;\
@@ -191,16 +231,28 @@ golangci-lint-install:
 .PHONY: golangci-lint
 golangci-lint: golangci-lint-install ## Run static code analysis for Go code.
 	@echo "-------------------------------- (linting Go code)"
-	@find . -maxdepth 5 -type f -name go.mod -print0 | xargs -0 -I{} $(SHELL) -c 'set -eo pipefail; dir=$$(dirname {}); echo $$dir; pushd $$dir > /dev/null; $(GOLANGCI_LINT) run; popd > /dev/null'
+	@set -eo pipefail; \
+	while IFS= read -r -d '' f; do \
+		dir=$$(dirname "$$f"); echo $$dir; \
+		(cd "$$dir" && $(GOLANGCI_LINT) run); \
+	done < <(find . -maxdepth 5 -type f -name go.mod -print0)
 
 .PHONY: golangci-lint-fix
 golangci-lint-fix: golangci-lint-install ## Run static code analysis for Go code and fix issues automatically.
-	@find . -maxdepth 5 -type f -name go.mod -print0 | xargs -0 -I{} $(SHELL) -c 'set -eo pipefail; dir=$$(dirname {}); echo $$dir; pushd $$dir > /dev/null; $(GOLANGCI_LINT) run --fix; popd > /dev/null'
+	@set -eo pipefail; \
+	while IFS= read -r -d '' f; do \
+		dir=$$(dirname "$$f"); echo $$dir; \
+		(cd "$$dir" && $(GOLANGCI_LINT) run --fix); \
+	done < <(find . -maxdepth 5 -type f -name go.mod -print0)
 
 .PHONY: go-mod-tidy
 go-mod-tidy: ## Run go mod tidy for all modules
 	@echo "-------------------------------- (running go mod tidy for all modules)"
-	@find . -maxdepth 5 -type f -name go.mod -print0 | xargs -0 -I{} $(SHELL) -c 'set -eo pipefail; dir=$$(dirname {}); echo $$dir; pushd $$dir > /dev/null; GOBIN=$(LOCALBIN) go mod tidy; popd > /dev/null'
+	@set -eo pipefail; \
+	while IFS= read -r -d '' f; do \
+		dir=$$(dirname "$$f"); echo $$dir; \
+		(cd "$$dir" && GOBIN=$(LOCALBIN) go mod tidy); \
+	done < <(find . -maxdepth 5 -type f -name go.mod -print0)
 
 .PHONY: internal-config-map-lint
 internal-config-map-lint: ## Verify config map templates for resources managed by the collector.
@@ -227,10 +279,14 @@ helm-chart-lint: ## Run static code analysis for the Helm chart templates.
 	@echo "-------------------------------- (linting Helm charts)"
 	@$(call lint_helm_chart,helm-chart/dash0-operator)
 	@$(call lint_helm_chart,test-resources/dotnet/helm-chart)
+	@$(call lint_helm_chart,test-resources/ebpf-profiler/helm-chart)
 	@$(call lint_helm_chart,test-resources/jvm/spring-boot/helm-chart)
 	@$(call lint_helm_chart,test-resources/node.js/express/helm-chart)
 	@$(call lint_helm_chart,test-resources/python/flask/helm-chart)
 	@$(call lint_helm_chart,test/e2e/dash0-api-mock/helm-chart)
+	@$(call lint_helm_chart,test/e2e/control-plane-mock/helm-chart)
+	@$(call lint_helm_chart,test/e2e/decision-maker-mock/helm-chart)
+	@$(call lint_helm_chart,test/e2e/outbound-connector-mock/helm-chart)
 	@$(call lint_helm_chart,test/e2e/otlp-sink/helm-chart)
 
 .PHONY: shellcheck-check-installed
@@ -244,7 +300,10 @@ shellcheck-check-installed:
 .PHONY: shellcheck-lint
 shellcheck-lint: shellcheck-check-installed ## Run static code analysis for all shell scripts.
 	@echo "-------------------------------- (linting shell scripts)"
-	find . -name \*.sh | xargs shellcheck -x
+	find . -name \*.sh \
+	  -not -path ./images/collector/opentelemetry-collector/\* \
+	  -not -path ./images/collector/opentelemetry-collector-contrib/\* \
+	  | xargs shellcheck -x
 
 .PHONY: npm-installed
 npm-installed:
@@ -259,6 +318,31 @@ instrumentation-test-lint: npm-installed
 	@echo "-------------------------------- (linting the instrumentation tests)"
 	cd images/instrumentation/test && npm ci && npm run lint
 
+# Pairs of go.mod and Dockerfile whose Go versions must be in sync, encoded as "dockerfile:<go.mod>:<Dockerfile>".
+GO_VERSION_CHECK_GOMOD_DOCKERFILE_PAIRS := \
+  dockerfile:go.mod:Dockerfile \
+  dockerfile:images/configreloader/src/go.mod:images/configreloader/Dockerfile \
+  dockerfile:images/filelogoffsetsync/src/go.mod:images/filelogoffsetsync/Dockerfile \
+  dockerfile:test/e2e/control-plane-mock/go.mod:test/e2e/control-plane-mock/Dockerfile \
+  dockerfile:test/e2e/dash0-api-mock/go.mod:test/e2e/dash0-api-mock/Dockerfile \
+  dockerfile:test/e2e/decision-maker-mock/go.mod:test/e2e/decision-maker-mock/Dockerfile \
+  dockerfile:test/e2e/outbound-connector-mock/go.mod:test/e2e/outbound-connector-mock/Dockerfile \
+  dockerfile:test/e2e/otlp-sink/telemetrymatcher/go.mod:test/e2e/otlp-sink/telemetrymatcher/Dockerfile
+
+# Pairs of go.mod files whose Go versions must be in sync, encoded as "gomod:<go.mod>:<go.mod>".
+GO_VERSION_CHECK_GOMOD_GOMOD_PAIRS := \
+  gomod:go.mod:images/pkg/common/go.mod \
+  gomod:go.mod:test/e2e/go.mod \
+  gomod:test/e2e/go.mod:test/e2e/pkg/shared/go.mod \
+  gomod:test/e2e/pkg/shared/go.mod:test/e2e/otlp-sink/telemetrymatcher/go.mod
+
+.PHONY: go-version-check
+go-version-check: ## Check whether go.mod Go versions are in sync with the associated Dockerfile base images and go.mod files.
+	@echo "-------------------------------- (verifying the Go versions are in sync)"
+	./test-resources/bin/go-version-check.sh \
+	  $(GO_VERSION_CHECK_GOMOD_DOCKERFILE_PAIRS) \
+	  $(GO_VERSION_CHECK_GOMOD_GOMOD_PAIRS)
+
 .PHONY: prometheus-crd-version-check
 prometheus-crd-version-check: ## Check whether all references to the PrometheusRule CRD are in sync.
 	@echo "-------------------------------- (verifying the Prometheus CRD version is in sync)"
@@ -270,7 +354,7 @@ perses-crd-version-check: ## Check whether all references to the PersesDashboard
 	./test-resources/bin/perses-crd-version-check.sh
 
 .PHONY: lint
-lint: golangci-lint internal-config-map-lint helm-chart-lint shellcheck-lint instrumentation-test-lint perses-crd-version-check prometheus-crd-version-check ## Run all static code analysis checks (Go, Helm, shell scripts, etc.).
+lint: go-version-check golangci-lint internal-config-map-lint helm-chart-lint shellcheck-lint instrumentation-test-lint perses-crd-version-check prometheus-crd-version-check ## Run all static code analysis checks (Go, Helm, shell scripts, etc.).
 
 .PHONY: lint-fix
 lint-fix: golangci-lint-fix
@@ -286,7 +370,24 @@ PHONY: all-auxiliary-images
 all-auxiliary-images: \
   test-app-images \
   dash0-api-mock-image \
+  decision-maker-mock-image \
+  control-plane-mock-image \
+  outbound-connector-mock-image \
   telemetry-matcher-image ## Build all auxiliary images that are used in test scripts and/or e2e tests, that is, test applications, dash0-api-mock, telemetry-matcher etc. If IMAGE_PLATFORMS is set, it will be passed as --platform to the build.
+
+# This target is a helper for testing. The production images will be built in the source repo of the IE images.
+.PHONY: all-images-with-ie
+all-images-with-ie: ## Build all images including the intelligent edge collector and barker. Requires DASH0_REPO_ROOT.
+	@if [ -z "$$DASH0_REPO_ROOT" ]; then \
+		echo "Error: DASH0_REPO_ROOT must be set to the dash0 monorepo path, e.g. DASH0_REPO_ROOT=/path/to/dash0 make all-images-with-ie" >&2; \
+		exit 1; \
+	fi
+	@$(MAKE) all-images
+	@INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY) \
+	  INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG) \
+	  BARKER_IMAGE_REPOSITORY=$(BARKER_IMAGE_REPOSITORY) \
+	  BARKER_IMAGE_TAG=$(BARKER_IMAGE_TAG) \
+	  test-resources/intelligentedge/build-ie-and-barker.sh
 
 PHONY: test-app-images
 test-app-images: \
@@ -315,6 +416,18 @@ test-app-image-python: ## Build the Python test application.
 dash0-api-mock-image: ## Build the Dash0 API mock container image, which is used in end-to-end tests.
 	@$(call build_container_image,$(DASH0_API_MOCK_IMAGE_REPOSITORY),$(DASH0_API_MOCK_IMAGE_TAG),test/e2e/dash0-api-mock)
 
+.PHONY: decision-maker-mock-image
+decision-maker-mock-image: ## Build the Decision Maker mock container image, which is used in end-to-end tests for IE.
+	@$(call build_container_image,$(DECISION_MAKER_MOCK_IMAGE_REPOSITORY),$(DECISION_MAKER_MOCK_IMAGE_TAG),test/e2e/decision-maker-mock)
+
+.PHONY: control-plane-mock-image
+control-plane-mock-image: ## Build the Control Plane mock container image, which is used in end-to-end tests for IE.
+	@$(call build_container_image,$(CONTROL_PLANE_MOCK_IMAGE_REPOSITORY),$(CONTROL_PLANE_MOCK_IMAGE_TAG),test/e2e/control-plane-mock)
+
+.PHONY: outbound-connector-mock-image
+outbound-connector-mock-image: ## Build the outbound-connector mock container image, which is used in end-to-end tests for the agent0-connector.
+	@$(call build_container_image,$(OUTBOUND_CONNECTOR_MOCK_IMAGE_REPOSITORY),$(OUTBOUND_CONNECTOR_MOCK_IMAGE_TAG),test/e2e/outbound-connector-mock)
+
 .PHONY: telemetry-matcher-image
 telemetry-matcher-image: ## Build the telemetry-matcher container image, which is used in end-to-end tests.
 	@$(call build_container_image,$(TELEMETRY_MATCHER_IMAGE_REPOSITORY),$(TELEMETRY_MATCHER_IMAGE_TAG),test/e2e,test/e2e/otlp-sink/telemetrymatcher/Dockerfile)
@@ -328,7 +441,20 @@ PHONY: push-all-auxiliary-images
 push-all-auxiliary-images: \
   push-test-app-images \
   push-dash0-api-mock-image \
+  push-decision-maker-mock-image \
+  push-control-plane-mock-image \
+  push-outbound-connector-mock-image \
   push-telemetry-matcher-image ## Push all auxiliary images that are used in test scripts and/or e2e tests, that is, test applications, dash0-api-mock, telemetry-matcher etc.
+
+# This target is a helper for testing. The production images will be pushed in the source repo of the IE images.
+.PHONY: push-all-images-with-ie
+push-all-images-with-ie: ## Push all images including the intelligent edge collector and barker.
+	@$(MAKE) push-all-images
+	@INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY) \
+	  INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG) \
+	  BARKER_IMAGE_REPOSITORY=$(BARKER_IMAGE_REPOSITORY) \
+	  BARKER_IMAGE_TAG=$(BARKER_IMAGE_TAG) \
+	  test-resources/intelligentedge/build-ie-and-barker.sh --push-only
 
 PHONY: push-test-app-images
 push-test-app-images: \
@@ -357,6 +483,56 @@ push-test-app-image-python: ## Push the Python test app image.
 push-dash0-api-mock-image: ## Push the Dash0 API mock container image.
 	@$(call push_container_image,$(DASH0_API_MOCK_IMAGE_REPOSITORY),$(DASH0_API_MOCK_IMAGE_TAG))
 
+.PHONY: push-decision-maker-mock-image
+push-decision-maker-mock-image: ## Push the Decision Maker mock container image.
+	@$(call push_container_image,$(DECISION_MAKER_MOCK_IMAGE_REPOSITORY),$(DECISION_MAKER_MOCK_IMAGE_TAG))
+
+.PHONY: push-control-plane-mock-image
+push-control-plane-mock-image: ## Push the Control Plane mock container image.
+	@$(call push_container_image,$(CONTROL_PLANE_MOCK_IMAGE_REPOSITORY),$(CONTROL_PLANE_MOCK_IMAGE_TAG))
+
+.PHONY: push-outbound-connector-mock-image
+push-outbound-connector-mock-image: ## Push the outbound-connector mock container image.
+	@$(call push_container_image,$(OUTBOUND_CONNECTOR_MOCK_IMAGE_REPOSITORY),$(OUTBOUND_CONNECTOR_MOCK_IMAGE_TAG))
+
+# Regenerates the gRPC bindings for the Decision Maker mock from its vendored
+# proto file. Not part of `make build` — run manually after re-vendoring the
+# proto. Requires `protoc` on PATH; the protoc-gen-go and protoc-gen-go-grpc
+# plugins are installed (or refreshed) automatically into the local Go bin dir.
+.PHONY: proto-gen-decision-maker-mock
+proto-gen-decision-maker-mock:
+	@command -v protoc > /dev/null || { echo "error: protoc is not installed"; exit 1; }
+	@cd test/e2e/decision-maker-mock && \
+	  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 && \
+	  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 && \
+	  PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+	    --go_out=. --go_opt=paths=source_relative \
+	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	    proto/decisionmaker.proto
+
+# Regenerates the gRPC bindings for the agent0-connector outbound-connector
+# client from its vendored proto file. Not part of `make build` — run manually
+# after re-vendoring the proto. Requires `protoc` on PATH; the protoc-gen-go and
+# protoc-gen-go-grpc plugins are installed (or refreshed) automatically into the
+# local Go bin dir.
+.PHONY: proto-gen-agent0-connector
+proto-gen-agent0-connector:
+	@command -v protoc > /dev/null || { echo "error: protoc is not installed"; exit 1; }
+	@cd images/agent0-connector/src && \
+	  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 && \
+	  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 && \
+	  PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+	    --go_out=. --go_opt=paths=source_relative \
+	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	    proto/outboundconnector.proto
+	@cd test/e2e/outbound-connector-mock && \
+	  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 && \
+	  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 && \
+	  PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+	    --go_out=. --go_opt=paths=source_relative \
+	    --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+	    proto/outboundconnector.proto
+
 .PHONY: push-telemetry-matcher-image
 push-telemetry-matcher-image: ## Push the telemetry-matcher container image.
 	@$(call push_container_image,$(TELEMETRY_MATCHER_IMAGE_REPOSITORY),$(TELEMETRY_MATCHER_IMAGE_TAG))
@@ -375,7 +551,8 @@ images: \
   image-config-reloader \
   image-filelog-offset-sync \
   image-filelog-offset-volume-ownership \
-  image-target-allocator ## Build all container images used by the operator. If IMAGE_PLATFORMS is set, it will be passed as --platform to the build.
+  image-target-allocator \
+  image-agent0-connector ## Build all container images used by the operator. If IMAGE_PLATFORMS is set, it will be passed as --platform to the build.
 
 define build_container_image
 $(eval $@_IMAGE_REPOSITORY = $(1))
@@ -423,6 +600,10 @@ image-filelog-offset-volume-ownership: ## Build the filelog offset volume owners
 image-target-allocator: ## Build the OpenTelemetry target-allocator container image.
 	@$(call build_container_image,$(TARGET_ALLOCATOR_IMAGE_REPOSITORY),$(TARGET_ALLOCATOR_IMAGE_TAG),images/target-allocator)
 
+.PHONY: image-agent0-connector
+image-agent0-connector: ## Build the agent0-connector container image.
+	@$(call build_container_image,$(AGENT0_CONNECTOR_IMAGE_REPOSITORY),$(AGENT0_CONNECTOR_IMAGE_TAG),images,images/agent0-connector/Dockerfile)
+
 .PHONY: push-images
 push-images: \
 	push-image-controller \
@@ -431,7 +612,8 @@ push-images: \
 	push-image-config-reloader \
 	push-image-filelog-offset-sync \
 	push-image-filelog-offset-volume-ownership \
-	push-image-target-allocator ## Push all container images using the full image reference.
+	push-image-target-allocator \
+	push-image-agent0-connector ## Push all container images using the full image reference.
 
 define push_container_image
 $(eval $@_IMAGE_REPOSITORY = $(1))
@@ -470,6 +652,10 @@ push-image-filelog-offset-volume-ownership: ## Push the filelog offset volume ow
 push-image-target-allocator: ## Push the OpenTelemetry target-allocator container image.
 	@$(call push_container_image,$(TARGET_ALLOCATOR_IMAGE_REPOSITORY),$(TARGET_ALLOCATOR_IMAGE_TAG))
 
+.PHONY: push-image-agent0-connector
+push-image-agent0-connector: ## Push the agent0-connector container image.
+	@$(call push_container_image,$(AGENT0_CONNECTOR_IMAGE_REPOSITORY),$(AGENT0_CONNECTOR_IMAGE_TAG))
+
 .PHONY: deploy
 deploy: ## Deploy the controller via helm to the current kubectl context.
 	test-resources/bin/render-templates.sh
@@ -479,9 +665,9 @@ deploy: ## Deploy the controller via helm to the current kubectl context.
 		--set operator.image.repository=$(CONTROLLER_IMAGE_REPOSITORY) \
 		--set operator.image.tag=$(CONTROLLER_IMAGE_TAG) \
 		--set operator.image.pullPolicy=$(CONTROLLER_IMAGE_PULL_POLICY) \
-		--set operator.initContainerImage.repository=$(INSTRUMENTATION_IMAGE_REPOSITORY) \
-		--set operator.initContainerImage.tag=$(INSTRUMENTATION_IMAGE_TAG) \
-		--set operator.initContainerImage.pullPolicy=$(INSTRUMENTATION_IMAGE_PULL_POLICY) \
+		--set operator.instrumentationImage.repository=$(INSTRUMENTATION_IMAGE_REPOSITORY) \
+		--set operator.instrumentationImage.tag=$(INSTRUMENTATION_IMAGE_TAG) \
+		--set operator.instrumentationImage.pullPolicy=$(INSTRUMENTATION_IMAGE_PULL_POLICY) \
 		--set operator.collectorImage.repository=$(COLLECTOR_IMAGE_REPOSITORY) \
 		--set operator.collectorImage.tag=$(COLLECTOR_IMAGE_TAG) \
 		--set operator.collectorImage.pullPolicy=$(COLLECTOR_IMAGE_PULL_POLICY) \
@@ -497,6 +683,15 @@ deploy: ## Deploy the controller via helm to the current kubectl context.
 		--set operator.targetAllocatorImage.repository=$(TARGET_ALLOCATOR_IMAGE_REPOSITORY) \
 		--set operator.targetAllocatorImage.tag=$(TARGET_ALLOCATOR_IMAGE_TAG) \
 		--set operator.targetAllocatorImage.pullPolicy=$(TARGET_ALLOCATOR_IMAGE_PULL_POLICY) \
+		--set operator.intelligentEdgeCollectorImage.repository=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY) \
+		--set operator.intelligentEdgeCollectorImage.tag=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG) \
+		--set operator.intelligentEdgeCollectorImage.pullPolicy=$(INTELLIGENT_EDGE_COLLECTOR_IMAGE_PULL_POLICY) \
+		--set operator.barkerImage.repository=$(BARKER_IMAGE_REPOSITORY) \
+		--set operator.barkerImage.tag=$(BARKER_IMAGE_TAG) \
+		--set operator.barkerImage.pullPolicy=$(BARKER_IMAGE_PULL_POLICY) \
+		--set operator.agent0ConnectorImage.repository=$(AGENT0_CONNECTOR_IMAGE_REPOSITORY) \
+		--set operator.agent0ConnectorImage.tag=$(AGENT0_CONNECTOR_IMAGE_TAG) \
+		--set operator.agent0ConnectorImage.pullPolicy=$(AGENT0_CONNECTOR_IMAGE_PULL_POLICY) \
 		--set operator.developmentMode=true \
 		dash0-operator \
 		$(OPERATOR_HELM_CHART)

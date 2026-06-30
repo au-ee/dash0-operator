@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 
 	"github.com/cisco-open/k8s-objectmatcher/patch"
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,8 +25,11 @@ import (
 
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/agent0connector/a0cresources"
 	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 	"github.com/dash0hq/dash0-operator/internal/util/resources"
 )
 
@@ -39,6 +41,8 @@ type OTelColResourceManager struct {
 	obsoleteResourcesHaveBeenDeleted atomic.Bool
 	kubeletStatsReceiverConfig       atomic.Pointer[KubeletStatsReceiverConfig]
 }
+
+type endpointProbeFn func(util.CollectorConfig, logd.Logger) (KubeletStatsReceiverConfig, bool)
 
 const (
 	bogusDeploymentPatch = "{\"spec\":{\"strategy\":{\"$retainKeys\":[\"type\"],\"rollingUpdate\":null}}}"
@@ -65,9 +69,11 @@ var (
 	}
 
 	httpClient     = &http.Client{}
-	insecureClient = &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}}
+	insecureClient = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 )
 
 func NewOTelColResourceManager(
@@ -89,10 +95,14 @@ func (m *OTelColResourceManager) CreateOrUpdateOpenTelemetryCollectorResources(
 	extraConfig util.ExtraConfig,
 	operatorConfigurationResource *dash0v1alpha1.Dash0OperatorConfiguration,
 	allMonitoringResources []dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	intelligentEdgeResource *dash0v1alpha1.Dash0IntelligentEdge,
+	logger logd.Logger,
 ) (bool, bool, error) {
 	selfMonitoringConfiguration, err :=
 		selfmonitoringapiaccess.ConvertOperatorConfigurationResourceToSelfMonitoringConfiguration(
+			ctx,
+			m.Client,
+			m.collectorConfig.OperatorNamespace,
 			operatorConfigurationResource,
 			logger,
 		)
@@ -106,25 +116,37 @@ func (m *OTelColResourceManager) CreateOrUpdateOpenTelemetryCollectorResources(
 	clusterName := ""
 
 	kubernetesInfrastructureMetricsCollectionEnabled :=
-		util.IsOptOutFlagWithDeprecatedVariantEnabled(
+		pointers.IsOptOutFlagWithDeprecatedVariantEnabled(
 			//nolint:staticcheck
 			operatorConfigurationResource.Spec.KubernetesInfrastructureMetricsCollectionEnabled,
 			operatorConfigurationResource.Spec.KubernetesInfrastructureMetricsCollection.Enabled,
 		)
 	collectPodLabelsAndAnnotationsEnabled :=
-		util.ReadBoolPointerWithDefault(
+		pointers.ReadBoolPointerWithDefault(
 			operatorConfigurationResource.Spec.CollectPodLabelsAndAnnotations.Enabled,
 			true,
 		)
+	collectNamespaceLabelsAndAnnotationsEnabled :=
+		pointers.ReadBoolPointerWithDefault(
+			operatorConfigurationResource.Spec.CollectNamespaceLabelsAndAnnotations.Enabled,
+			false,
+		)
 	prometheusCrdSupportEnabled =
-		util.ReadBoolPointerWithDefault(
+		pointers.ReadBoolPointerWithDefault(
 			operatorConfigurationResource.Spec.PrometheusCrdSupport.Enabled,
 			false,
 		)
+	profilingEnabled :=
+		operatorConfigurationResource.Spec.Profiling != nil &&
+			pointers.ReadBoolPointerWithDefault(
+				operatorConfigurationResource.Spec.Profiling.Enabled,
+				false,
+			)
 	clusterName = operatorConfigurationResource.Spec.ClusterName
 	kubeletStatsReceiverConfig :=
 		m.determineKubeletstatsReceiverEndpoint(
 			kubernetesInfrastructureMetricsCollectionEnabled,
+			probeKubeletStatsEndpoint,
 			logger,
 		)
 
@@ -138,22 +160,27 @@ func (m *OTelColResourceManager) CreateOrUpdateOpenTelemetryCollectorResources(
 		Namespaced: namespacedExporters,
 	}
 
-	authorizations := collectDash0ExporterAuthorizations(operatorConfigurationResource, allMonitoringResources)
-
 	config := &oTelColConfig{
-		OperatorNamespace:           m.collectorConfig.OperatorNamespace,
-		NamePrefix:                  m.collectorConfig.OTelCollectorNamePrefix,
-		Exporters:                   otlpExporters,
-		Authorizations:              authorizations,
-		AllMonitoringResources:      allMonitoringResources,
-		SendBatchMaxSize:            m.collectorConfig.SendBatchMaxSize,
-		SelfMonitoringConfiguration: selfMonitoringConfiguration,
+		OperatorNamespace:             m.collectorConfig.OperatorNamespace,
+		OperatorManagerDeploymentName: m.operatorManagerDeployment.Name,
+		NamePrefix:                    m.collectorConfig.OTelCollectorNamePrefix,
+		Exporters:                     otlpExporters,
+		AllMonitoringResources:        allMonitoringResources,
+		SendBatchSize:                 m.collectorConfig.SendBatchSize,
+		SendBatchMaxSize:              m.collectorConfig.SendBatchMaxSize,
+		SelfMonitoringConfiguration:   selfMonitoringConfiguration,
 		KubernetesInfrastructureMetricsCollectionEnabled: kubernetesInfrastructureMetricsCollectionEnabled,
 		CollectPodLabelsAndAnnotationsEnabled:            collectPodLabelsAndAnnotationsEnabled,
-		DisableReplicasetInformer:                        m.collectorConfig.DisableReplicasetInformer,
+		CollectNamespaceLabelsAndAnnotationsEnabled:      collectNamespaceLabelsAndAnnotationsEnabled,
+		K8sAttributesDisableReplicasetInformer:           m.collectorConfig.K8sAttributesDisableReplicasetInformer,
+		K8sAttributesWaitForMetadata:                     m.collectorConfig.K8sAttributesWaitForMetadata,
+		K8sAttributesWaitForMetadataTimeout:              m.collectorConfig.K8sAttributesWaitForMetadataTimeout,
 		PrometheusCrdSupportEnabled:                      prometheusCrdSupportEnabled,
 		TargetAllocatorNamePrefix:                        m.collectorConfig.TargetAllocatorNamePrefix,
+		Agent0ConnectorEnabled:                           m.collectorConfig.Agent0ConnectorEnabled,
+		Agent0ConnectorDeploymentName:                    a0cresources.DeploymentName(m.collectorConfig.OTelCollectorNamePrefix),
 		KubeletStatsReceiverConfig:                       kubeletStatsReceiverConfig,
+		AutoNamespaceMonitoringEnabled:                   operatorConfigurationResource.Spec.AutoMonitorNamespaces.IsEnabled(),
 		// The hostmetrics receiver requires mapping the root file system as a volume mount, see
 		// https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/hostmetricsreceiver#collecting-host-metrics-from-inside-a-container-linux-only.
 		// Therefore, we disable the hostmetrics receiver on platforms where this is not possible or not supported:
@@ -168,9 +195,12 @@ func (m *OTelColResourceManager) CreateOrUpdateOpenTelemetryCollectorResources(
 		Images:                 m.collectorConfig.Images,
 		IsIPv6Cluster:          m.collectorConfig.IsIPv6Cluster,
 		IsGkeAutopilot:         m.collectorConfig.IsGkeAutopilot,
+		IntelligentEdge:        intelligentEdgeConfigFromResource(intelligentEdgeResource, operatorConfigurationResource, m.collectorConfig.OperatorNamespace, m.collectorConfig.OTelCollectorNamePrefix, logger),
 		DevelopmentMode:        m.collectorConfig.DevelopmentMode,
 		DebugVerbosityDetailed: m.collectorConfig.DebugVerbosityDetailed,
 		EnableProfExtension:    m.collectorConfig.EnableProfExtension,
+		ProfilingEnabled:       profilingEnabled,
+		CompressConfigMap:      m.collectorConfig.CompressConfigMap,
 	}
 	if extraConfig.CollectorFilelogOffsetStorageVolume != nil {
 		config.OffsetStorageVolume = extraConfig.CollectorFilelogOffsetStorageVolume
@@ -214,7 +244,7 @@ func (m *OTelColResourceManager) CreateOrUpdateOpenTelemetryCollectorResources(
 func (m *OTelColResourceManager) createOrUpdateResource(
 	ctx context.Context,
 	desiredResource client.Object,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (bool, bool, error) {
 	existingResource, err := resources.CreateEmptyReceiverFor(desiredResource)
 	if err != nil {
@@ -243,7 +273,7 @@ func (m *OTelColResourceManager) createOrUpdateResource(
 func (m *OTelColResourceManager) createResource(
 	ctx context.Context,
 	desiredResource client.Object,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	if err := resources.SetOwnerReference(m.operatorManagerDeployment, m.scheme, desiredResource, logger); err != nil {
 		return err
@@ -267,7 +297,7 @@ func (m *OTelColResourceManager) updateResource(
 	ctx context.Context,
 	existingResource client.Object,
 	desiredResource client.Object,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (bool, error) {
 	if err := resources.SetOwnerReference(m.operatorManagerDeployment, m.scheme, desiredResource, logger); err != nil {
 		return false, err
@@ -301,13 +331,14 @@ func (m *OTelColResourceManager) updateResource(
 		return false, err
 	}
 
-	if m.collectorConfig.DevelopmentMode {
-		logger.Info(fmt.Sprintf(
-			"resource %s/%s was out of sync and has been reconciled",
-			desiredResource.GetNamespace(),
-			desiredResource.GetName(),
-		))
-	}
+	logger.Debug(fmt.Sprintf(
+		"resource %s/%s was out of sync and has been reconciled",
+		desiredResource.GetNamespace(),
+		desiredResource.GetName(),
+	),
+		"patch",
+		string(patchResult.Patch),
+	)
 
 	return hasChanged, nil
 }
@@ -317,7 +348,10 @@ func isKnownIrrelevantPatch(patchResult *patch.PatchResult) bool {
 	return slices.Contains(knownIrrelevantPatches, p)
 }
 
-func (m *OTelColResourceManager) amendDeploymentAndDaemonSetWithSelfReferenceUIDs(existingResource client.Object, desiredResource client.Object) {
+func (m *OTelColResourceManager) amendDeploymentAndDaemonSetWithSelfReferenceUIDs(
+	existingResource client.Object,
+	desiredResource client.Object,
+) {
 	name := desiredResource.GetName()
 	uid := existingResource.GetUID()
 	if name == DaemonSetName(m.collectorConfig.OTelCollectorNamePrefix) {
@@ -331,14 +365,18 @@ func (m *OTelColResourceManager) amendDeploymentAndDaemonSetWithSelfReferenceUID
 
 func addSelfReferenceUidToAllContainers(containers *[]corev1.Container, envVarName string, uid types.UID) {
 	for i, container := range *containers {
-		selfReferenceUidIsAlreadyPresent := slices.ContainsFunc(container.Env, func(envVar corev1.EnvVar) bool {
-			return envVar.Name == envVarName
-		})
+		selfReferenceUidIsAlreadyPresent := slices.ContainsFunc(
+			container.Env, func(envVar corev1.EnvVar) bool {
+				return envVar.Name == envVarName
+			},
+		)
 		if !selfReferenceUidIsAlreadyPresent {
-			container.Env = append(container.Env, corev1.EnvVar{
-				Name:  envVarName,
-				Value: string(uid),
-			})
+			container.Env = append(
+				container.Env, corev1.EnvVar{
+					Name:  envVarName,
+					Value: string(uid),
+				},
+			)
 			(*containers)[i] = container
 		}
 	}
@@ -347,26 +385,30 @@ func addSelfReferenceUidToAllContainers(containers *[]corev1.Container, envVarNa
 func (m *OTelColResourceManager) DeleteResources(
 	ctx context.Context,
 	extraConfig util.ExtraConfig,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (bool, error) {
 	logger.Info(
 		fmt.Sprintf(
 			"Deleting the OpenTelemetry collector Kubernetes resources in the Dash0 operator namespace %s (if any exist).",
 			m.collectorConfig.OperatorNamespace,
-		))
+		),
+	)
 
 	config := &oTelColConfig{
 		OperatorNamespace: m.collectorConfig.OperatorNamespace,
 		NamePrefix:        m.collectorConfig.OTelCollectorNamePrefix,
 		// For deleting the resources, we do not need the actual export settings; we only use assembleDesiredState to
 		// collect the kinds and names of all resources that need to be deleted.
+		SendBatchSize:               m.collectorConfig.SendBatchSize,
 		SendBatchMaxSize:            m.collectorConfig.SendBatchMaxSize,
 		SelfMonitoringConfiguration: selfmonitoringapiaccess.SelfMonitoringConfiguration{SelfMonitoringEnabled: false},
 		// KubernetesInfrastructureMetricsCollectionEnabled=false would lead to not deleting the collector-deployment-
 		// related resources, we always try to delete all collector resources (daemonset & deployment), no matter
 		// whether both sets have been created earlier or not.
 		KubernetesInfrastructureMetricsCollectionEnabled: true,
-		DisableReplicasetInformer:                        m.collectorConfig.DisableReplicasetInformer,
+		K8sAttributesDisableReplicasetInformer:           m.collectorConfig.K8sAttributesDisableReplicasetInformer,
+		K8sAttributesWaitForMetadata:                     m.collectorConfig.K8sAttributesWaitForMetadata,
+		K8sAttributesWaitForMetadataTimeout:              m.collectorConfig.K8sAttributesWaitForMetadataTimeout,
 		UseHostMetricsReceiver:                           !m.collectorConfig.IsDocker,        // irrelevant for deletion
 		DisableHostPorts:                                 m.collectorConfig.DisableHostPorts, // irrelevant for deletion
 		Images:                                           dummyImagesForDeletion,
@@ -375,6 +417,7 @@ func (m *OTelColResourceManager) DeleteResources(
 		DevelopmentMode:                                  m.collectorConfig.DevelopmentMode,
 		DebugVerbosityDetailed:                           m.collectorConfig.DebugVerbosityDetailed,
 		EnableProfExtension:                              m.collectorConfig.EnableProfExtension,
+		CompressConfigMap:                                m.collectorConfig.CompressConfigMap,
 	}
 	if extraConfig.CollectorFilelogOffsetStorageVolume != nil {
 		config.OffsetStorageVolume = extraConfig.CollectorFilelogOffsetStorageVolume
@@ -396,11 +439,13 @@ func (m *OTelColResourceManager) DeleteResources(
 			}
 		} else {
 			resourcesHaveBeenDeleted = true
-			logger.Info(fmt.Sprintf(
-				"deleted resource %s/%s",
-				desiredResource.GetNamespace(),
-				desiredResource.GetName(),
-			))
+			logger.Info(
+				fmt.Sprintf(
+					"deleted resource %s/%s",
+					desiredResource.GetNamespace(),
+					desiredResource.GetName(),
+				),
+			)
 		}
 	}
 	if len(allErrors) > 0 {
@@ -414,7 +459,7 @@ func (m *OTelColResourceManager) deleteResourcesThatAreNoLongerDesired(
 	config oTelColConfig,
 	extraConfig util.ExtraConfig,
 	desiredState []clientObject,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	// override actual config settings with settings that will produce all possible resources
 	config.KubernetesInfrastructureMetricsCollectionEnabled = true
@@ -464,7 +509,7 @@ func (m *OTelColResourceManager) deleteResourcesThatAreNoLongerDesired(
 func (m *OTelColResourceManager) deleteObsoleteResourcesFromPreviousOperatorVersions(
 	ctx context.Context,
 	namespace string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	if m.obsoleteResourcesHaveBeenDeleted.Load() {
 		return nil
@@ -500,41 +545,62 @@ func (m *OTelColResourceManager) deleteObsoleteResourcesFromPreviousOperatorVers
 
 func (m *OTelColResourceManager) determineKubeletstatsReceiverEndpoint(
 	kubernetesInfrastructureMetricsCollectionEnabled bool,
-	logger *logr.Logger,
+	probeKubeletStatsEndpointFn endpointProbeFn,
+	logger logd.Logger,
 ) KubeletStatsReceiverConfig {
-	cachedConfig := m.kubeletStatsReceiverConfig.Load()
-	if cachedConfig != nil {
-		return *cachedConfig
-	}
-	if m.collectorConfig.NodeName == "" && m.collectorConfig.NodeIp == "" {
-		logger.Info("No K8s_NODE_NAME and no K8S_NODE_IP available, skipping kubeletstats receiver endpoint lookup. " +
-			"The kubeletstats receiver will be disabled. Some Kubernetes infrastructure metrics will be missing.")
-		return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{Enabled: false})
-	}
 	if !kubernetesInfrastructureMetricsCollectionEnabled {
-		// We do not need to run the test if we are not going to even use the kubeletstats receiver.
-		logger.Info("Kubernetes infrastructure metrics collection is disabled, skipping kubeletstats receiver endpoint lookup.")
-		return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{Enabled: false})
+		// No need to probe for the kubeletstats endpoint if metric collection is disabled. Not caching the
+		// KubeletStatsReceiverConfig for this case (and removing any potentially cached entry) makes sure that switching
+		// from kubernetesInfrastructureMetricsCollection.enabled=true to false and vice versa works correctly.
+		logger.Info(
+			"Kubernetes infrastructure metrics collection is disabled, skipping kubeletstats receiver endpoint lookup.")
+		m.kubeletStatsReceiverConfig.Store(nil)
+		return KubeletStatsReceiverConfig{Enabled: false}
+	}
+	if cached := m.kubeletStatsReceiverConfig.Load(); cached != nil {
+		return *cached
+	}
+	kubeletStatsReceiverConfig, ok := probeKubeletStatsEndpointFn(m.collectorConfig, logger)
+	if !ok {
+		logger.ErrorTelemetryCollectionIssue(
+			fmt.Errorf("cannot determine viable endpoint for kubeletstats receiver endpoint, see above"),
+			"The operator ran out of options when trying to find a viable kubeletstats receiver endpoint. The "+
+				"kubeletstats receiver will be disabled. Some Kubernetes infrastructure metrics will be missing.",
+		)
+	}
+	// Cache the KubeletStatsReceiverConfig, otherwise we would execute the DNS lookup and the probe HTTP request on every
+	// collector reconcile.
+	m.kubeletStatsReceiverConfig.Store(&kubeletStatsReceiverConfig)
+	return kubeletStatsReceiverConfig
+}
+
+func probeKubeletStatsEndpoint(collectorConfig util.CollectorConfig, logger logd.Logger) (KubeletStatsReceiverConfig, bool) {
+	if collectorConfig.NodeName == "" && collectorConfig.NodeIp == "" {
+		logger.Info(
+			"No K8s_NODE_NAME and no K8S_NODE_IP available, skipping kubeletstats receiver endpoint lookup. " +
+				"The kubeletstats receiver will be disabled. Some Kubernetes infrastructure metrics will be missing.",
+		)
+		return KubeletStatsReceiverConfig{Enabled: false}, false
 	}
 
-	logger.Info(fmt.Sprintf("Attempting DNS lookup for Kubernetes node name %s.", m.collectorConfig.NodeName))
-	_, err := net.LookupIP(m.collectorConfig.NodeName)
+	logger.Info(fmt.Sprintf("Attempting DNS lookup for Kubernetes node name %s.", collectorConfig.NodeName))
+	_, err := net.LookupIP(collectorConfig.NodeName)
 	if err == nil {
-		logger.Info(fmt.Sprintf("DNS lookup for Kubernetes node name %s has been successful.", m.collectorConfig.NodeName))
+		logger.Info(fmt.Sprintf("DNS lookup for Kubernetes node name %s has been successful.", collectorConfig.NodeName))
 		endpoint := kubeletStatsNodeNameEndpoint
 
-		nodeNameEndpointWithPath := fmt.Sprintf("https://%s:10250%s", m.collectorConfig.NodeName, kubeletStatsSummaryPath)
+		nodeNameEndpointWithPath := fmt.Sprintf("https://%s:10250%s", collectorConfig.NodeName, kubeletStatsSummaryPath)
 		logger.Info(fmt.Sprintf("Attempting probe request to %s.", nodeNameEndpointWithPath))
 		err = executeHttpRequest(httpClient, nodeNameEndpointWithPath)
 		if err == nil {
 			logger.Info(fmt.Sprintf("Probe request request to %s has been successful.", nodeNameEndpointWithPath))
 			logger.Info(fmt.Sprintf(usingKubeletStatsReceiverEndpointMsg, endpoint))
-			return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{
+			return KubeletStatsReceiverConfig{
 				Enabled:            true,
 				Endpoint:           endpoint,
 				AuthType:           kubeletStatsAuthTypeServiceAccount,
 				InsecureSkipVerify: false,
-			})
+			}, true
 		} else if isTlsError(err) {
 			logger.Info(
 				fmt.Sprintf(
@@ -544,45 +610,44 @@ func (m *OTelColResourceManager) determineKubeletstatsReceiverEndpoint(
 					err.Error(),
 				))
 			logger.Info(fmt.Sprintf(usingKubeletStatsReceiverEndpointMsg, endpoint))
-			return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{
+			return KubeletStatsReceiverConfig{
 				Enabled:            true,
 				Endpoint:           endpoint,
 				AuthType:           kubeletStatsAuthTypeServiceAccount,
 				InsecureSkipVerify: true,
-			})
-		} else {
-			logger.Info(
-				fmt.Sprintf(
-					"DNS lookup for Kubernetes node name %s has been successful, but the probe request to %s resulted "+
-						"in an error: %s. Will try using K8S_NODE_IP next.",
-					m.collectorConfig.NodeName,
-					nodeNameEndpointWithPath,
-					err.Error(),
-				))
+			}, true
 		}
+		logger.Info(
+			fmt.Sprintf(
+				"DNS lookup for Kubernetes node name %s has been successful, but the probe request to %s resulted "+
+					"in an error: %s. Will try using K8S_NODE_IP next.",
+				collectorConfig.NodeName,
+				nodeNameEndpointWithPath,
+				err.Error(),
+			))
 	} else {
 		logger.Info(
 			fmt.Sprintf(
 				"DNS lookup for Kubernetes node name %s failed with error: %s, will try K8S_NODE_IP next.",
-				m.collectorConfig.NodeName,
+				collectorConfig.NodeName,
 				err.Error(),
 			))
 	}
 
 	nodeIpEndpointResultsInTlsError := false
-	nodeIpEndpointWithPath := fmt.Sprintf("https://%s:10250%s", m.collectorConfig.NodeIp, kubeletStatsSummaryPath)
+	nodeIpEndpointWithPath := fmt.Sprintf("https://%s:10250%s", collectorConfig.NodeIp, kubeletStatsSummaryPath)
 	logger.Info(fmt.Sprintf("Attempting probe request %s.", nodeIpEndpointWithPath))
 	err = executeHttpRequest(httpClient, nodeIpEndpointWithPath)
 	if err == nil {
 		endpoint := kubeletStatsNodeIpEndpoint
 		logger.Info(fmt.Sprintf("Probe request request %s has been successful.", nodeIpEndpointWithPath))
 		logger.Info(fmt.Sprintf(usingKubeletStatsReceiverEndpointMsg, endpoint))
-		return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{
+		return KubeletStatsReceiverConfig{
 			Enabled:            true,
 			Endpoint:           endpoint,
 			AuthType:           kubeletStatsAuthTypeServiceAccount,
 			InsecureSkipVerify: false,
-		})
+		}, true
 	}
 	if isTlsError(err) {
 		logger.Info(
@@ -601,34 +666,39 @@ func (m *OTelColResourceManager) determineKubeletstatsReceiverEndpoint(
 			))
 	}
 
-	readOnlyNodeIpEndpointWithPath := fmt.Sprintf("http://%s:10255%s", m.collectorConfig.NodeIp, kubeletStatsSummaryPath)
+	readOnlyNodeIpEndpointWithPath := fmt.Sprintf("http://%s:10255%s", collectorConfig.NodeIp, kubeletStatsSummaryPath)
 	logger.Info(fmt.Sprintf("Attempting probe request to to read-only endpoint %s.", readOnlyNodeIpEndpointWithPath))
 	err = executeHttpRequest(httpClient, readOnlyNodeIpEndpointWithPath)
 	if err == nil {
 		endpoint := kubetletStatsReadyOnlyEndpoint
-		logger.Info(fmt.Sprintf("Probe request request to read-only endpoint %s has been successful.", readOnlyNodeIpEndpointWithPath))
+		logger.Info(
+			fmt.Sprintf(
+				"Probe request request to read-only endpoint %s has been successful.",
+				readOnlyNodeIpEndpointWithPath,
+			),
+		)
 		logger.Info(fmt.Sprintf("Using read-only endpoint %s as kubeletstats receiver endpoint.", endpoint))
-		return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{
+		return KubeletStatsReceiverConfig{
 			Enabled:            true,
 			Endpoint:           endpoint,
 			AuthType:           kubeletStatsAuthTypeNone,
 			InsecureSkipVerify: false,
-		})
-	} else {
-		logger.Info(
-			fmt.Sprintf(
-				"The probe request to %s resulted in an error: %s.",
-				readOnlyNodeIpEndpointWithPath,
-				err.Error(),
-			))
+		}, true
 	}
+	logger.Info(
+		fmt.Sprintf(
+			"The probe request to %s resulted in an error: %s.",
+			readOnlyNodeIpEndpointWithPath,
+			err.Error(),
+		))
 
 	if !nodeIpEndpointResultsInTlsError {
-		return m.cacheKubeletStatsReceiverConfig(m.logErrorAndDisableKubeletStatsReceiver(logger))
+		return KubeletStatsReceiverConfig{Enabled: false}, false
 	}
 
 	logger.Info(
-		fmt.Sprintf("Attempting probe request to %s without TLS certificate verification.", nodeIpEndpointWithPath))
+		fmt.Sprintf("Attempting probe request to %s without TLS certificate verification.", nodeIpEndpointWithPath),
+	)
 	err = executeHttpRequest(insecureClient, nodeIpEndpointWithPath)
 	if err == nil {
 		endpoint := kubeletStatsNodeIpEndpoint
@@ -638,27 +708,20 @@ func (m *OTelColResourceManager) determineKubeletstatsReceiverEndpoint(
 				nodeIpEndpointWithPath,
 			))
 		logger.Info(fmt.Sprintf("Using %s as kubeletstats receiver endpoint with insecure_skip_verify: true.", endpoint))
-		return m.cacheKubeletStatsReceiverConfig(KubeletStatsReceiverConfig{
+		return KubeletStatsReceiverConfig{
 			Enabled:            true,
 			Endpoint:           endpoint,
 			AuthType:           kubeletStatsAuthTypeServiceAccount,
 			InsecureSkipVerify: true,
-		})
-	} else {
-		logger.Info(
-			fmt.Sprintf(
-				"The probe request to %s without TLS certificate verification resulted in an error: %s.",
-				readOnlyNodeIpEndpointWithPath,
-				err.Error(),
-			))
+		}, true
 	}
-
-	return m.cacheKubeletStatsReceiverConfig(m.logErrorAndDisableKubeletStatsReceiver(logger))
-}
-
-func (m *OTelColResourceManager) cacheKubeletStatsReceiverConfig(config KubeletStatsReceiverConfig) KubeletStatsReceiverConfig {
-	m.kubeletStatsReceiverConfig.Store(&config)
-	return config
+	logger.Info(
+		fmt.Sprintf(
+			"The probe request to %s without TLS certificate verification resulted in an error: %s.",
+			readOnlyNodeIpEndpointWithPath,
+			err.Error(),
+		))
+	return KubeletStatsReceiverConfig{Enabled: false}, false
 }
 
 func executeHttpRequest(httpClient *http.Client, endpoint string) error {
@@ -676,10 +739,162 @@ func isTlsError(err error) bool {
 	return strings.Contains(err.Error(), "tls: failed to verify certificate:")
 }
 
-func (m *OTelColResourceManager) logErrorAndDisableKubeletStatsReceiver(logger *logr.Logger) KubeletStatsReceiverConfig {
-	logger.Error(
-		fmt.Errorf("cannot determine viable endpoint for kubeletstats receiver endpoint, see above"),
-		"The operator ran out of options when trying to find a viable kubeletstats receiver endpoint. The "+
-			"kubeletstats receiver will be disabled. Some Kubernetes infrastructure metrics will be missing.")
-	return KubeletStatsReceiverConfig{Enabled: false}
+func intelligentEdgeConfigFromResource(
+	resource *dash0v1alpha1.Dash0IntelligentEdge,
+	operatorConfig *dash0v1alpha1.Dash0OperatorConfiguration,
+	operatorNamespace string,
+	namePrefix string,
+	logger logd.Logger,
+) IntelligentEdgeConfig {
+	if resource == nil {
+		return IntelligentEdgeConfig{Enabled: false}
+	}
+	if !pointers.ReadBoolPointerWithDefault(resource.Spec.Enabled, true) {
+		logger.Info("Intelligent edge is explicitly disabled via the Dash0IntelligentEdge resource.")
+		return IntelligentEdgeConfig{Enabled: false}
+	}
+
+	barkerEnabled := pointers.ReadBoolPointerWithDefault(resource.Spec.Barker.Enabled, true)
+	samplingEnabled := pointers.ReadBoolPointerWithDefault(resource.Spec.Sampling.Enabled, true)
+	var samplingFallbackSampleRatio string
+	if r := resource.Spec.Sampling.FallbackSampleRatio; r != nil {
+		samplingFallbackSampleRatio = *r
+	}
+	samplingDebug := pointers.ReadBoolPointerWithDefault(resource.Spec.Sampling.Debug, false)
+	samplingReservoirMaxDiskBytes := reservoirDefaultMaxDiskBytes
+	samplingReservoirMetricLevel := string(dash0v1alpha1.ReservoirMetricLevelBasic)
+	if r := resource.Spec.Sampling.Reservoir; r != nil {
+		if r.MaxDiskBytes != nil {
+			maxDiskBytes := r.MaxDiskBytes.Value()
+			if maxDiskBytes < reservoirMaxDiskBytesFloor {
+				if samplingEnabled {
+					logger.WarnTelemetryCollectionIssue(fmt.Sprintf("The configured trace reservoir maxDiskBytes "+
+						"(%d bytes) is below the minimum of %d bytes; the minimum is used instead.",
+						maxDiskBytes, reservoirMaxDiskBytesFloor))
+				}
+				maxDiskBytes = reservoirMaxDiskBytesFloor
+			}
+			samplingReservoirMaxDiskBytes = maxDiskBytes
+		}
+		if r.MetricLevel != nil && *r.MetricLevel != "" {
+			samplingReservoirMetricLevel = string(*r.MetricLevel)
+		}
+	}
+	signalToMetricsEnabled := pointers.ReadBoolPointerWithDefault(resource.Spec.SignalToMetrics.Enabled, true)
+	var signalToMetricsFlushInterval string
+	if d := resource.Spec.SignalToMetrics.FlushInterval; d != nil && d.Duration > 0 {
+		signalToMetricsFlushInterval = d.Duration.String()
+	}
+	spamFilterEnabled := pointers.ReadBoolPointerWithDefault(resource.Spec.SpamFilter.Enabled, true)
+	var spamFilterCacheExpiration string
+	if d := resource.Spec.SpamFilter.CacheExpiration; d != nil && d.Duration > 0 {
+		spamFilterCacheExpiration = d.Duration.String()
+	}
+	spamFilterAllowNoSettingsExt := pointers.ReadBoolPointerWithDefault(resource.Spec.SpamFilter.AllowNoSettingsExt, false)
+
+	operationPreferSpanName := pointers.ReadBoolPointerWithDefault(resource.Spec.OperationProcessor.PreferSpanName, false)
+	var operationCardinalityRules []IntelligentEdgeCardinalityRule
+	for _, rule := range resource.Spec.OperationProcessor.CardinalityRules {
+		matchers := make([]IntelligentEdgeOperationMatcher, 0, len(rule.OperationMatchers))
+		for _, matcher := range rule.OperationMatchers {
+			matchers = append(matchers, IntelligentEdgeOperationMatcher{
+				Regex:        matcher.Regex,
+				Replacements: matcher.Replacements,
+				QuickFilter:  matcher.QuickFilter,
+				Literal:      pointers.ReadBoolPointerWithDefault(matcher.Literal, false),
+			})
+		}
+		operationCardinalityRules = append(operationCardinalityRules, IntelligentEdgeCardinalityRule{
+			Id:                rule.Id,
+			SourceAttribute:   rule.SourceAttribute,
+			QuickFilter:       rule.QuickFilter,
+			OperationMatchers: matchers,
+		})
+	}
+
+	derivedEndpoint, derivedApiEndpoint, dataset := deriveDash0EndpointsAndDataset(operatorConfig)
+	hasDash0Export := derivedEndpoint != "" || derivedApiEndpoint != ""
+	endpoint := derivedEndpoint
+	apiEndpoint := derivedApiEndpoint
+	if resource.Spec.Sampling.DecisionMakerEndpoint != "" {
+		endpoint = resource.Spec.Sampling.DecisionMakerEndpoint
+	}
+	if resource.Spec.ControlPlaneApiEndpoint != "" {
+		apiEndpoint = resource.Spec.ControlPlaneApiEndpoint
+	}
+	if !hasDash0Export {
+		logger.WarnTelemetryCollectionIssue("No Dash0 export is configured in the operator configuration resource. The " +
+			"sampling processor and barker will not have an authorization token for the Decision Maker. " +
+			"Configure a Dash0 export with an auth token in the operator configuration resource.")
+	}
+	insecure := false
+	if barkerEnabled {
+		endpoint = fmt.Sprintf("%s-barker.%s.svc.cluster.local:8011", namePrefix, operatorNamespace)
+		insecure = true
+	}
+
+	if endpoint == "" && apiEndpoint == "" {
+		logger.Info("Intelligent edge is enabled but no Decision Maker or control plane API endpoints could be " +
+			"derived from the operator configuration resource (and no explicit overrides are set). Intelligent " +
+			"edge will remain disabled in the collector config until a valid operator configuration with a " +
+			"Dash0 export is available.")
+		return IntelligentEdgeConfig{Enabled: false}
+	}
+
+	return IntelligentEdgeConfig{
+		Enabled:                            true,
+		SamplingEnabled:                    samplingEnabled,
+		SamplingFallbackSampleRatio:        samplingFallbackSampleRatio,
+		SamplingDebug:                      samplingDebug,
+		SamplingReservoirMaxDiskBytes:      samplingReservoirMaxDiskBytes,
+		SamplingReservoirMetricLevel:       samplingReservoirMetricLevel,
+		SignalToMetricsEnabled:             signalToMetricsEnabled,
+		SignalToMetricsMaxTimeSeries:       resource.Spec.SignalToMetrics.MaxTimeSeries,
+		SignalToMetricsFlushInterval:       signalToMetricsFlushInterval,
+		RedMetricsMaxTimeSeries:            resource.Spec.RedMetrics.MaxTimeSeries,
+		RedMetricsAdditionalSpanAttributes: resource.Spec.RedMetrics.AdditionalSpanAttributes,
+		SpamFilterEnabled:                  spamFilterEnabled,
+		SpamFilterCacheExpiration:          spamFilterCacheExpiration,
+		SpamFilterAllowNoSettingsExt:       spamFilterAllowNoSettingsExt,
+		OperationPreferSpanName:            operationPreferSpanName,
+		OperationCardinalityRules:          operationCardinalityRules,
+		Endpoint:                           endpoint,
+		ApiEndpoint:                        apiEndpoint,
+		AuthEnvVar:                         authEnvVarNameDefaultIndexed(0),
+		Dataset:                            dataset,
+		Insecure:                           insecure,
+		BarkerEnabled:                      barkerEnabled,
+		BarkerName:                         namePrefix + "-barker",
+	}
+}
+
+func deriveDash0EndpointsAndDataset(operatorConfig *dash0v1alpha1.Dash0OperatorConfiguration) (string, string, string) {
+	if operatorConfig == nil {
+		return "", "", util.DatasetDefault
+	}
+	exports := operatorConfig.EffectiveExports()
+	for _, export := range exports {
+		if export.Dash0 != nil {
+			dmEndpoint := util.DeriveDecisionMakerEndpoint(export.Dash0.Endpoint)
+			cpaEndpoint := deriveCpaEndpoint(export.Dash0.ApiEndpoint)
+			dataset := export.Dash0.Dataset
+			if dataset == "" {
+				dataset = util.DatasetDefault
+			}
+			return dmEndpoint, cpaEndpoint, dataset
+		}
+	}
+	return "", "", util.DatasetDefault
+}
+
+// deriveCpaEndpoint derives the control-plane API endpoint from a Dash0 API endpoint.
+// This assumes the input is a Dash0-hosted API endpoint (e.g., https://api.eu-central-1.aws.dash0.com).
+func deriveCpaEndpoint(apiEndpoint string) string {
+	host := strings.TrimPrefix(apiEndpoint, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimSuffix(host, "/")
+	if idx := strings.Index(host, "dash0"); idx > 0 {
+		return "https://control-plane-api." + host[idx:]
+	}
+	return apiEndpoint
 }

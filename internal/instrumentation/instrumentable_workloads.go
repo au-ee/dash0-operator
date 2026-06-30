@@ -4,7 +4,6 @@
 package instrumentation
 
 import (
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,7 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 	"github.com/dash0hq/dash0-operator/internal/workloads"
 )
 
@@ -24,13 +25,13 @@ type instrumentableWorkload interface {
 	asClientObject() client.Object
 	instrument(
 		clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-		namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-		logger *logr.Logger,
+		namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+		logger logd.Logger,
 	) workloads.ModificationResult
 	revert(
 		clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-		namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-		logger *logr.Logger,
+		namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+		logger logd.Logger,
 	) workloads.ModificationResult
 }
 
@@ -47,15 +48,15 @@ func (w *cronJobWorkload) asRuntimeObject() runtime.Object { return w.cronJob }
 func (w *cronJobWorkload) asClientObject() client.Object   { return w.cronJob }
 func (w *cronJobWorkload) instrument(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).ModifyCronJob(w.cronJob)
 }
 func (w *cronJobWorkload) revert(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).RevertCronJob(w.cronJob)
 }
@@ -73,15 +74,15 @@ func (w *daemonSetWorkload) asRuntimeObject() runtime.Object { return w.daemonSe
 func (w *daemonSetWorkload) asClientObject() client.Object   { return w.daemonSet }
 func (w *daemonSetWorkload) instrument(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).ModifyDaemonSet(w.daemonSet)
 }
 func (w *daemonSetWorkload) revert(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).RevertDaemonSet(w.daemonSet)
 }
@@ -99,15 +100,15 @@ func (w *deploymentWorkload) asRuntimeObject() runtime.Object { return w.deploym
 func (w *deploymentWorkload) asClientObject() client.Object   { return w.deployment }
 func (w *deploymentWorkload) instrument(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).ModifyDeployment(w.deployment)
 }
 func (w *deploymentWorkload) revert(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).RevertDeployment(w.deployment)
 }
@@ -125,15 +126,15 @@ func (w *replicaSetWorkload) asRuntimeObject() runtime.Object { return w.replica
 func (w *replicaSetWorkload) asClientObject() client.Object   { return w.replicaSet }
 func (w *replicaSetWorkload) instrument(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).ModifyReplicaSet(w.replicaSet)
 }
 func (w *replicaSetWorkload) revert(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).RevertReplicaSet(w.replicaSet)
 }
@@ -151,15 +152,15 @@ func (w *statefulSetWorkload) asRuntimeObject() runtime.Object { return w.statef
 func (w *statefulSetWorkload) asClientObject() client.Object   { return w.statefulSet }
 func (w *statefulSetWorkload) instrument(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).ModifyStatefulSet(w.statefulSet)
 }
 func (w *statefulSetWorkload) revert(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) workloads.ModificationResult {
 	return newWorkloadModifier(clusterInstrumentationConfig, namespaceInstrumentationConfig, logger).RevertStatefulSet(w.statefulSet)
 }

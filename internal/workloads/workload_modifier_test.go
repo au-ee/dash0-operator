@@ -10,12 +10,15 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/images/pkg/common"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/cluster"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -32,11 +35,36 @@ const (
 // be used to verify external effects (recording events etc.) that cannot be covered in this test.
 
 var (
-	clusterInstrumentationConfig = util.NewClusterInstrumentationConfig(
+	clusterInstrumentationConfigWithInitContainer = util.NewClusterInstrumentationConfig(
 		TestImages,
+		PossibleCollectorUrlsTest,
 		OTelCollectorNodeLocalBaseUrlTest,
 		util.ExtraConfigDefaults,
+		cluster.ResolvedInstrumentationDeliveryInitContainer,
 		nil,
+		false,
+		false,
+	)
+
+	clusterInstrumentationConfigWithImageVolumes = util.NewClusterInstrumentationConfig(
+		TestImages,
+		PossibleCollectorUrlsTest,
+		OTelCollectorNodeLocalBaseUrlTest,
+		util.ExtraConfigDefaults,
+		cluster.ResolvedInstrumentationDeliveryImageVolume,
+		nil,
+		false,
+		false,
+	)
+
+	clusterInstrumentationConfigWithServiceUrl = util.NewClusterInstrumentationConfig(
+		TestImages,
+		PossibleCollectorUrlsTest,
+		OTelCollectorServiceBaseUrlTest,
+		util.ExtraConfigDefaults,
+		cluster.ResolvedInstrumentationDeliveryInitContainer,
+		nil,
+		false,
 		false,
 	)
 )
@@ -44,12 +72,18 @@ var (
 var _ = Describe("Dash0 Workload Modification", func() {
 
 	ctx := context.Background()
-	logger := log.FromContext(ctx)
-	workloadModifier := NewResourceModifier(
-		clusterInstrumentationConfig,
+	logger := logd.FromContext(ctx)
+	workloadModifierInitCnt := NewResourceModifier(
+		clusterInstrumentationConfigWithInitContainer,
 		DefaultNamespaceInstrumentationConfig,
 		testActor,
-		&logger,
+		logger,
+	)
+	workloadModifierImgVol := NewResourceModifier(
+		clusterInstrumentationConfigWithImageVolumes,
+		DefaultNamespaceInstrumentationConfig,
+		testActor,
+		logger,
 	)
 
 	type envVarModificationTest struct {
@@ -57,10 +91,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 		expectations map[string]*EnvVarExpectation
 	}
 
-	Describe("when instrumenting workloads", func() {
+	Context("when instrumenting workloads", func() {
 		It("should instrument a basic cron job", func() {
 			workload := BasicCronJob(TestNamespaceName, CronJobNamePrefix)
-			modificationResult := workloadModifier.ModifyCronJob(workload)
+			modificationResult := workloadModifierInitCnt.ModifyCronJob(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedCronJob(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -68,18 +102,26 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a basic daemon set", func() {
 			workload := BasicDaemonSet(TestNamespaceName, DaemonSetNamePrefix)
-			modificationResult := workloadModifier.ModifyDaemonSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDaemonSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedDaemonSet(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
 		})
 
-		It("should add Dash0 to a basic deployment", func() {
+		It("should add Dash0 to a basic deployment (instrumentation init container)", func() {
 			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.ModifyDeployment(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedDeployment(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
+		})
+
+		It("should add Dash0 to a basic deployment (instrumentation image volume)", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+			modificationResult := workloadModifierImgVol.ModifyDeployment(workload)
+
+			Expect(modificationResult.HasBeenModified).To(BeTrue())
+			VerifyModifiedDeployment(workload, BasicInstrumentedPodSpecExpectationsWithImageVolume(), IgnoreManagedFields)
 		})
 
 		It("should use the collector service URL instead of the node-local endpoint if requested", func() {
@@ -88,14 +130,17 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				NewResourceModifier(
 					util.NewClusterInstrumentationConfig(
 						TestImages,
+						PossibleCollectorUrlsTest,
 						OTelCollectorServiceBaseUrlTest,
 						util.ExtraConfigDefaults,
+						cluster.ResolvedInstrumentationDeliveryInitContainer,
 						nil,
+						false,
 						false,
 					),
 					DefaultNamespaceInstrumentationConfig,
 					testActor,
-					&logger,
+					logger,
 				).ModifyDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
@@ -108,7 +153,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a deployment that has multiple containers, and already has volumes and init containers", func() {
 			workload := DeploymentWithMoreBellsAndWhistles(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.ModifyDeployment(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedDeployment(workload, PodSpecExpectations{
@@ -132,7 +177,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 								Value: "/__otel_auto_instrumentation/injector/libotelinject.so",
 							},
 							"OTEL_INJECTOR_CONFIG_FILE": {
-								Value: "/__otel_auto_instrumentation/injector/otelinject.conf",
+								Value: "/__otel_auto_instrumentation/injector/injector.conf",
 							},
 							"DASH0_OTEL_COLLECTOR_BASE_URL": {
 								Value: OTelCollectorNodeLocalBaseUrlTest,
@@ -142,6 +187,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 							},
 							"OTEL_EXPORTER_OTLP_PROTOCOL": {
 								Value: common.ProtocolHttpProtobuf,
+							},
+							"OTEL_LOGS_EXPORTER": {
+								Value: "none",
 							},
 							"OTEL_INJECTOR_K8S_NAMESPACE_NAME": {
 								ValueFrom: "metadata.namespace",
@@ -193,7 +241,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 								Value: "/__otel_auto_instrumentation/injector/libotelinject.so",
 							},
 							"OTEL_INJECTOR_CONFIG_FILE": {
-								Value: "/__otel_auto_instrumentation/injector/otelinject.conf",
+								Value: "/__otel_auto_instrumentation/injector/injector.conf",
 							},
 							"DASH0_OTEL_COLLECTOR_BASE_URL": {
 								Value: OTelCollectorNodeLocalBaseUrlTest,
@@ -203,6 +251,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 							},
 							"OTEL_EXPORTER_OTLP_PROTOCOL": {
 								Value: common.ProtocolHttpProtobuf,
+							},
+							"OTEL_LOGS_EXPORTER": {
+								Value: "none",
 							},
 							"OTEL_INJECTOR_K8S_NAMESPACE_NAME": {
 								ValueFrom: "metadata.namespace",
@@ -244,7 +295,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should update existing Dash0 artifacts in a deployment", func() {
 			workload := DeploymentWithExistingDash0Artifacts(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.ModifyDeployment(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedDeployment(workload, PodSpecExpectations{
@@ -270,7 +321,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 								ValueFrom: "metadata.namespace",
 							},
 							"OTEL_INJECTOR_CONFIG_FILE": {
-								Value: "/__otel_auto_instrumentation/injector/otelinject.conf",
+								Value: "/__otel_auto_instrumentation/injector/injector.conf",
 							},
 							"DASH0_OTEL_COLLECTOR_BASE_URL": {
 								Value: OTelCollectorNodeLocalBaseUrlTest,
@@ -280,6 +331,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 							},
 							"OTEL_EXPORTER_OTLP_PROTOCOL": {
 								Value: common.ProtocolHttpProtobuf,
+							},
+							"OTEL_LOGS_EXPORTER": {
+								Value: "none",
 							},
 							"OTEL_INJECTOR_K8S_NAMESPACE_NAME": {
 								ValueFrom: "metadata.namespace",
@@ -307,7 +361,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 								Value: "/__otel_auto_instrumentation/injector/libotelinject.so third_party_preload.so another_third_party_preload.so",
 							},
 							"OTEL_INJECTOR_CONFIG_FILE": {
-								Value: "/__otel_auto_instrumentation/injector/otelinject.conf",
+								Value: "/__otel_auto_instrumentation/injector/injector.conf",
 							},
 							"DASH0_OTEL_COLLECTOR_BASE_URL": {
 								Value: OTelCollectorNodeLocalBaseUrlTest,
@@ -317,6 +371,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 							},
 							"OTEL_EXPORTER_OTLP_PROTOCOL": {
 								Value: common.ProtocolHttpProtobuf,
+							},
+							"OTEL_LOGS_EXPORTER": {
+								Value: "none",
 							},
 							"OTEL_INJECTOR_K8S_NAMESPACE_NAME": {
 								ValueFrom: "metadata.namespace",
@@ -343,7 +400,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a basic job", func() {
 			workload := BasicJob(TestNamespaceName, JobNamePrefix)
-			modificationResult := workloadModifier.ModifyJob(workload)
+			modificationResult := workloadModifierInitCnt.ModifyJob(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedJob(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -351,7 +408,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a basic ownerless pod", func() {
 			workload := BasicPod(TestNamespaceName, PodNamePrefix)
-			modificationResult := workloadModifier.ModifyPod(workload)
+			modificationResult := workloadModifierInitCnt.ModifyPod(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedPod(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -363,7 +420,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				APIVersion: "core.strimzi.io/v1beta2",
 				Kind:       "StrimziPodSet",
 			}}
-			modificationResult := workloadModifier.ModifyPod(workload)
+			modificationResult := workloadModifierInitCnt.ModifyPod(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedPod(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -375,7 +432,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				APIVersion: owner.APIVersion,
 				Kind:       owner.Kind,
 			}}
-			modificationResult := workloadModifier.ModifyPod(workload)
+			modificationResult := workloadModifierInitCnt.ModifyPod(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
@@ -390,7 +447,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a basic ownerless replica set", func() {
 			workload := BasicReplicaSet(TestNamespaceName, ReplicaSetNamePrefix)
-			modificationResult := workloadModifier.ModifyReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedReplicaSet(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -402,7 +459,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				APIVersion: "something.com/v2alpha47",
 				Kind:       "SomeKind",
 			}}
-			modificationResult := workloadModifier.ModifyReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedReplicaSet(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -410,7 +467,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should not instrument a basic replica set that is owned by a deployment", func() {
 			workload := ReplicaSetOwnedByDeployment(TestNamespaceName, ReplicaSetNamePrefix)
-			modificationResult := workloadModifier.ModifyReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
@@ -420,7 +477,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should instrument a basic stateful set", func() {
 			workload := BasicStatefulSet(TestNamespaceName, StatefulSetNamePrefix)
-			modificationResult := workloadModifier.ModifyStatefulSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyStatefulSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyModifiedStatefulSet(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -431,7 +488,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 			workload.Spec.Template.Spec.NodeSelector = map[string]string{
 				util.KubernetesIoOs: "windows",
 			}
-			modificationResult := workloadModifier.ModifyDeployment(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
@@ -440,15 +497,67 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					"Details: pod.spec.nodeSelector: \"kubernetes.io/os=windows\""))
 			VerifyUnmodifiedDeployment(workload)
 		})
+
+		It("should not instrument workloads with init container where a container's ephemeral-storage limit is below the threshold", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+			workload.Spec.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse("100M"),
+			}
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
+
+			Expect(modificationResult.HasBeenModified).To(BeFalse())
+			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
+				"The actor has not modified this workload since container \"test-container-0\" has an ephemeral-storage " +
+					"limit of 100M, which is below the required threshold of 500M. The Dash0 init-container instrumentation " +
+					"requires at least 500M of ephemeral storage, raise the limit or remove it to enable instrumentation, or " +
+					"use image volume instrumentation delivery."))
+			VerifyUnmodifiedDeployment(workload)
+		})
+
+		It("should instrument workloads with image volume even if a container's ephemeral-storage limit is below the threshold", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+			workload.Spec.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse("100M"),
+			}
+			modificationResult := workloadModifierImgVol.ModifyDeployment(workload)
+
+			Expect(modificationResult.HasBeenModified).To(BeTrue())
+		})
+
+		It("should instrument workloads where the ephemeral-storage limit equals the threshold", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+			workload.Spec.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse("500M"),
+			}
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
+
+			Expect(modificationResult.HasBeenModified).To(BeTrue())
+		})
+
+		It("should instrument workloads where the ephemeral-storage limit is only set on an init container", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+			workload.Spec.Template.Spec.InitContainers = []corev1.Container{{
+				Name:  "user-init-container",
+				Image: "ubuntu",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceEphemeralStorage: resource.MustParse("10M"),
+					},
+				},
+			}}
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
+
+			Expect(modificationResult.HasBeenModified).To(BeTrue())
+		})
 	})
 
-	Describe("when instrumenting workloads multiple times (instrumentation needs to be idempotent)", func() {
+	Context("when instrumenting workloads multiple times (instrumentation needs to be idempotent)", func() {
 		It("cron job instrumentation needs to be idempotent", func() {
 			workload := BasicCronJob(TestNamespaceName, CronJobNamePrefix)
-			modificationResult := workloadModifier.ModifyCronJob(workload)
+			modificationResult := workloadModifierInitCnt.ModifyCronJob(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyCronJob(workload)
+			modificationResult = workloadModifierInitCnt.ModifyCronJob(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -458,10 +567,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("daemon set instrumentation needs to be idempotent", func() {
 			workload := BasicDaemonSet(TestNamespaceName, DaemonSetNamePrefix)
-			modificationResult := workloadModifier.ModifyDaemonSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDaemonSet(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyDaemonSet(workload)
+			modificationResult = workloadModifierInitCnt.ModifyDaemonSet(workload)
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
 			VerifyModifiedDaemonSet(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -470,10 +579,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("deployment instrumentation needs to be idempotent", func() {
 			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.ModifyDeployment(workload)
+			modificationResult := workloadModifierInitCnt.ModifyDeployment(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyDeployment(workload)
+			modificationResult = workloadModifierInitCnt.ModifyDeployment(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -483,10 +592,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("job instrumentation needs to be idempotent", func() {
 			workload := BasicJob(TestNamespaceName, JobNamePrefix)
-			modificationResult := workloadModifier.ModifyJob(workload)
+			modificationResult := workloadModifierInitCnt.ModifyJob(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyJob(workload)
+			modificationResult = workloadModifierInitCnt.ModifyJob(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -496,10 +605,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("ownerless pod instrumentation needs to be idempotent", func() {
 			workload := BasicPod(TestNamespaceName, PodNamePrefix)
-			modificationResult := workloadModifier.ModifyPod(workload)
+			modificationResult := workloadModifierInitCnt.ModifyPod(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyPod(workload)
+			modificationResult = workloadModifierInitCnt.ModifyPod(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -509,10 +618,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("ownerless replica set instrumentation needs to be idempotent", func() {
 			workload := BasicReplicaSet(TestNamespaceName, ReplicaSetNamePrefix)
-			modificationResult := workloadModifier.ModifyReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyReplicaSet(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyReplicaSet(workload)
+			modificationResult = workloadModifierInitCnt.ModifyReplicaSet(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -522,10 +631,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("stateful set instrumentation needs to be idempotent", func() {
 			workload := BasicStatefulSet(TestNamespaceName, StatefulSetNamePrefix)
-			modificationResult := workloadModifier.ModifyStatefulSet(workload)
+			modificationResult := workloadModifierInitCnt.ModifyStatefulSet(workload)
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			instrumentedOnce := workload.DeepCopy()
-			modificationResult = workloadModifier.ModifyStatefulSet(workload)
+			modificationResult = workloadModifierInitCnt.ModifyStatefulSet(workload)
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
 				"Dash0 instrumentation was already present on this workload, no modification by the actor is necessary."))
@@ -534,10 +643,48 @@ var _ = Describe("Dash0 Workload Modification", func() {
 		})
 	})
 
-	Describe("when reverting workloads", func() {
+	Context("when the instrumentation delivery mode changes between reconciliations", func() {
+		It("should clean up init container artifacts when re-instrumenting init-container -> image-volume", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+
+			firstResult := workloadModifierInitCnt.ModifyDeployment(workload)
+			Expect(firstResult.HasBeenModified).To(BeTrue())
+			VerifyModifiedDeployment(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
+
+			secondResult := workloadModifierImgVol.ModifyDeployment(workload)
+			Expect(secondResult.HasBeenModified).To(BeTrue())
+			// The end state must match what would result from instrumenting via image-volume delivery from scratch:
+			// no dash0-instrumentation init container, no safe-to-evict-local-volumes annotation, the volume
+			// switched from emptyDir to image, and the container volume mount carries the image-volume SubPath.
+			VerifyModifiedDeployment(
+				workload, BasicInstrumentedPodSpecExpectationsWithImageVolume(), IgnoreManagedFields)
+			Expect(workload.Spec.Template.Spec.InitContainers).To(BeEmpty())
+			Expect(workload.Spec.Template.Annotations).
+				NotTo(HaveKey(safeToEviceLocalVolumesAnnotationName))
+		})
+
+		It("should produce a correct image-volume->init-container layout when re-instrumenting", func() {
+			workload := BasicDeployment(TestNamespaceName, DeploymentNamePrefix)
+
+			firstResult := workloadModifierImgVol.ModifyDeployment(workload)
+			Expect(firstResult.HasBeenModified).To(BeTrue())
+			VerifyModifiedDeployment(
+				workload, BasicInstrumentedPodSpecExpectationsWithImageVolume(), IgnoreManagedFields)
+
+			secondResult := workloadModifierInitCnt.ModifyDeployment(workload)
+			Expect(secondResult.HasBeenModified).To(BeTrue())
+			// The end state must match what would result from instrumenting via init-container delivery from
+			// scratch: the dash0-instrumentation init container is added, the safe-to-evict-local-volumes
+			// annotation lists the Dash0 volume, the volume switched from image to emptyDir, and the container
+			// volume mount no longer has the image-volume SubPath.
+			VerifyModifiedDeployment(workload, BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
+		})
+	})
+
+	Context("when reverting workloads", func() {
 		It("should remove Dash0 from an instrumented cron job", func() {
 			workload := InstrumentedCronJob(TestNamespaceName, CronJobNamePrefix)
-			modificationResult := workloadModifier.RevertCronJob(workload)
+			modificationResult := workloadModifierInitCnt.RevertCronJob(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedCronJob(workload)
@@ -545,7 +692,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should remove Dash0 from an instrumented daemon set", func() {
 			workload := InstrumentedDaemonSet(TestNamespaceName, DaemonSetNamePrefix)
-			modificationResult := workloadModifier.RevertDaemonSet(workload)
+			modificationResult := workloadModifierInitCnt.RevertDaemonSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedDaemonSet(workload)
@@ -553,7 +700,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should remove Dash0 from an instrumented deployment", func() {
 			workload := InstrumentedDeployment(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.RevertDeployment(workload)
+			modificationResult := workloadModifierInitCnt.RevertDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedDeployment(workload)
@@ -561,7 +708,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should remove Dash0 from an instrumented deployment that has multiple containers, and already has volumes and init containers previous to being instrumented", func() {
 			workload := InstrumentedDeploymentWithMoreBellsAndWhistles(TestNamespaceName, DeploymentNamePrefix)
-			modificationResult := workloadModifier.RevertDeployment(workload)
+			modificationResult := workloadModifierInitCnt.RevertDeployment(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyRevertedDeployment(workload, PodSpecExpectations{
@@ -602,7 +749,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should remove Dash0 from an instrumented ownerless replica set", func() {
 			workload := InstrumentedReplicaSet(TestNamespaceName, ReplicaSetNamePrefix)
-			modificationResult := workloadModifier.RevertReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.RevertReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedReplicaSet(workload)
@@ -614,7 +761,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				APIVersion: "something.com/v2alpha47",
 				Kind:       "SomeKind",
 			}}
-			modificationResult := workloadModifier.RevertReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.RevertReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedReplicaSet(workload)
@@ -622,7 +769,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should not remove Dash0 from a replica set that is owned by a deployment", func() {
 			workload := InstrumentedReplicaSetOwnedByDeployment(TestNamespaceName, ReplicaSetNamePrefix)
-			modificationResult := workloadModifier.RevertReplicaSet(workload)
+			modificationResult := workloadModifierInitCnt.RevertReplicaSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeFalse())
 			Expect(modificationResult.RenderReasonMessage(testActor)).To(Equal(
@@ -632,21 +779,83 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		It("should remove Dash0 from an instrumented stateful set", func() {
 			workload := InstrumentedStatefulSet(TestNamespaceName, StatefulSetNamePrefix)
-			modificationResult := workloadModifier.RevertStatefulSet(workload)
+			modificationResult := workloadModifierInitCnt.RevertStatefulSet(workload)
 
 			Expect(modificationResult.HasBeenModified).To(BeTrue())
 			VerifyUnmodifiedStatefulSet(workload)
 		})
 	})
 
-	Describe("individual modification functions", func() {
+	Context("individual modification functions", func() {
 		ctx := context.Background()
-		logger := log.FromContext(ctx)
+		logger := logd.FromContext(ctx)
 		workloadModifier := NewResourceModifier(
-			clusterInstrumentationConfig,
+			clusterInstrumentationConfigWithInitContainer,
 			DefaultNamespaceInstrumentationConfig,
 			testActor,
-			&logger,
+			logger,
+		)
+
+		type instrumentationDeliveryTest struct {
+			instrumentationDelivery cluster.ResolvedInstrumentationDelivery
+		}
+
+		DescribeTable("should attach the instrumentation either via init container or image volume",
+			func(testConfig instrumentationDeliveryTest) {
+				config := clusterInstrumentationConfigWithInitContainer
+				if testConfig.instrumentationDelivery == cluster.ResolvedInstrumentationDeliveryImageVolume {
+					config = clusterInstrumentationConfigWithImageVolumes
+				}
+				modifier := NewResourceModifier(
+					config,
+					DefaultNamespaceInstrumentationConfig,
+					testActor,
+					logger,
+				)
+
+				podSpec := &corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "test-container-0"}},
+				}
+				podMeta := &metav1.ObjectMeta{}
+
+				modifier.modifyPodSpec(podSpec, &metav1.ObjectMeta{}, podMeta)
+
+				Expect(podSpec.Volumes).To(HaveLen(1))
+				volume := podSpec.Volumes[0]
+				Expect(volume.Name).To(Equal(dash0VolumeName))
+
+				mounts := podSpec.Containers[0].VolumeMounts
+				Expect(mounts).To(HaveLen(1))
+				Expect(mounts[0].Name).To(Equal(dash0VolumeName))
+				Expect(mounts[0].MountPath).To(Equal(otelAutoInstrumentationBaseDirectory))
+
+				if testConfig.instrumentationDelivery == cluster.ResolvedInstrumentationDeliveryImageVolume {
+					Expect(volume.EmptyDir).To(BeNil())
+					Expect(volume.Image).NotTo(BeNil())
+					Expect(volume.Image.Reference).To(Equal(InitContainerImageTest))
+					Expect(podSpec.InitContainers).To(BeEmpty())
+					Expect(mounts[0].SubPath).To(Equal(imageVolumeSubPath))
+					Expect(podMeta.Annotations).To(BeEmpty())
+				} else {
+					Expect(volume.EmptyDir).NotTo(BeNil())
+					Expect(volume.Image).To(BeNil())
+					Expect(podSpec.InitContainers).To(HaveLen(1))
+					Expect(podSpec.InitContainers[0].Name).To(Equal(initContainerName))
+					Expect(podSpec.InitContainers[0].Image).To(Equal(InitContainerImageTest))
+					Expect(podSpec.InitContainers[0].VolumeMounts).To(HaveLen(1))
+					Expect(podSpec.InitContainers[0].VolumeMounts[0].Name).To(Equal(dash0VolumeName))
+					Expect(podSpec.InitContainers[0].VolumeMounts[0].MountPath).To(
+						Equal(otelAutoInstrumentationBaseDirectory))
+					Expect(mounts[0].SubPath).To(BeEmpty())
+					Expect(podMeta.Annotations[safeToEviceLocalVolumesAnnotationName]).To(Equal(dash0VolumeName))
+				}
+			},
+			Entry("via init container", instrumentationDeliveryTest{
+				instrumentationDelivery: cluster.ResolvedInstrumentationDeliveryInitContainer,
+			}),
+			Entry("via image volume", instrumentationDeliveryTest{
+				instrumentationDelivery: cluster.ResolvedInstrumentationDeliveryImageVolume,
+			}),
 		)
 
 		type detectNonLinuxPodTest struct {
@@ -684,7 +893,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name: corev1.Windows,
 					},
 				},
-				expectedMessage: ptr.To(
+				expectedMessage: new(
 					"The actor has not modified this workload since it seems to be targeting a non-Linux operating " +
 						"system, workload modifications are only supported for Linux workloads. Details: " +
 						"pod.spec.os.name: \"windows\"",
@@ -696,7 +905,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name: "whatever",
 					},
 				},
-				expectedMessage: ptr.To(
+				expectedMessage: new(
 					"The actor has not modified this workload since it seems to be targeting a non-Linux operating " +
 						"system, workload modifications are only supported for Linux workloads. Details: " +
 						"pod.spec.os.name: \"whatever\""),
@@ -724,7 +933,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						util.KubernetesIoOs: "windows",
 					},
 				},
-				expectedMessage: ptr.To(
+				expectedMessage: new(
 					"The actor has not modified this workload since it seems to be targeting a non-Linux operating " +
 						"system, workload modifications are only supported for Linux workloads. " +
 						"Details: pod.spec.nodeSelector: \"kubernetes.io/os=windows\"",
@@ -815,7 +1024,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						},
 					},
 				},
-				expectedMessage: ptr.To(
+				expectedMessage: new(
 					"The actor has not modified this workload since it seems to be targeting a non-Linux operating " +
 						"system, workload modifications are only supported for Linux workloads. " +
 						"Details: pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution." +
@@ -861,12 +1070,87 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						},
 					},
 				},
-				expectedMessage: ptr.To(
+				expectedMessage: new(
 					"The actor has not modified this workload since it seems to be targeting a non-Linux operating " +
 						"system, workload modifications are only supported for Linux workloads. " +
 						"Details: pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution." +
 						"nodeSelectorTerms.matchExpression: key: \"kubernetes.io/os\", operator: \"NotIn\", " +
 						"values: \"[linux some-operating-system]\"",
+				),
+			}),
+		)
+
+		type ephemeralStorageLimitTest struct {
+			// Per-container ephemeral-storage limit, parsed via resource.MustParse. Empty string means "no limit set".
+			containerLimits []string
+			expectedMessage *string
+		}
+
+		buildPodSpec := func(containerLimits []string) corev1.PodSpec {
+			containers := make([]corev1.Container, len(containerLimits))
+			for i, limitStr := range containerLimits {
+				containers[i] = corev1.Container{
+					Name:  fmt.Sprintf("c%d", i),
+					Image: "ubuntu",
+				}
+				if limitStr != "" {
+					containers[i].Resources.Limits = corev1.ResourceList{
+						corev1.ResourceEphemeralStorage: resource.MustParse(limitStr),
+					}
+				}
+			}
+			return corev1.PodSpec{Containers: containers}
+		}
+
+		DescribeTable("should detect containers with too-low ephemeral-storage limits",
+			func(testConfig ephemeralStorageLimitTest) {
+				podSpec := buildPodSpec(testConfig.containerLimits)
+				result := workloadModifier.checkEligibleForModification(&podSpec)
+				if testConfig.expectedMessage == nil {
+					Expect(result).To(BeNil())
+				} else {
+					Expect(result).ToNot(BeNil())
+					Expect(result.HasBeenModified).To(BeFalse())
+					Expect(result.RenderReasonMessage(testActor)).To(Equal(*testConfig.expectedMessage))
+				}
+			},
+			Entry("no ephemeral-storage limit set is eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{""},
+				expectedMessage: nil,
+			}),
+			Entry("ephemeral-storage limit equal to the threshold is eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{"500M"},
+				expectedMessage: nil,
+			}),
+			Entry("ephemeral-storage limit above the threshold is eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{"1Gi"},
+				expectedMessage: nil,
+			}),
+			Entry("ephemeral-storage limit below the threshold is non-eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{"100M"},
+				expectedMessage: new(
+					"The actor has not modified this workload since container \"c0\" has an ephemeral-storage limit " +
+						"of 100M, which is below the required threshold of 500M. The Dash0 init-container instrumentation " +
+						"requires at least 500M of ephemeral storage, raise the limit or remove it to enable " +
+						"instrumentation, or use image volume instrumentation delivery.",
+				),
+			}),
+			Entry("ephemeral-storage limit just below the threshold is non-eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{"499999999"},
+				expectedMessage: new(
+					"The actor has not modified this workload since container \"c0\" has an ephemeral-storage limit " +
+						"of 499999999, which is below the required threshold of 500M. The Dash0 init-container instrumentation " +
+						"requires at least 500M of ephemeral storage, raise the limit or remove it to enable instrumentation, " +
+						"or use image volume instrumentation delivery.",
+				),
+			}),
+			Entry("only the second container has a too-low limit; workload is non-eligible", ephemeralStorageLimitTest{
+				containerLimits: []string{"1Gi", "50M"},
+				expectedMessage: new(
+					"The actor has not modified this workload since container \"c1\" has an ephemeral-storage limit " +
+						"of 50M, which is below the required threshold of 500M. The Dash0 init-container instrumentation " +
+						"requires at least 500M of ephemeral storage, raise the limit or remove it to enable " +
+						"instrumentation, or use image volume instrumentation delivery.",
 				),
 			}),
 		)
@@ -1387,21 +1671,40 @@ var _ = Describe("Dash0 Workload Modification", func() {
 		)
 
 		type otelExporterEnvVarsTest struct {
-			existingEnvVars              []corev1.EnvVar
-			expectedEnvVars              map[string]*EnvVarExpectation
-			expectedInstrumentationIssue string
-			expectedLogMessage           string
+			existingEnvVars                       []corev1.EnvVar
+			clusterInstrumentationConfig          *util.ClusterInstrumentationConfig
+			expectedPreInstrumentationCheckResult bool
+			expectedEnvVars                       map[string]*EnvVarExpectation
+			expectedInstrumentationIssue          string
+			expectedLogMessage                    string
 		}
 
-		DescribeTable("should add (but not replace) OTEL_EXPORTER_OTLP_ENDPOINT/OTEL_EXPORTER_OTLP_PROTOCOL",
+		DescribeTable("should add or update OTEL_EXPORTER_OTLP_ENDPOINT/OTEL_EXPORTER_OTLP_PROTOCOL",
 			func(testConfig otelExporterEnvVarsTest) {
 				container := &corev1.Container{}
 				if testConfig.existingEnvVars != nil {
 					container.Env = testConfig.existingEnvVars
 				}
 
+				clusterInstrumentationConfig := testConfig.clusterInstrumentationConfig
+				if clusterInstrumentationConfig == nil {
+					clusterInstrumentationConfig = clusterInstrumentationConfigWithInitContainer
+				}
+
+				preInstrumentationCheckResult := otelExportEnvVarsWillBeUpdatedForAtLeastOneContainer([]corev1.Container{
+					*container,
+				}, clusterInstrumentationConfig)
+				Expect(preInstrumentationCheckResult).To(Equal(testConfig.expectedPreInstrumentationCheckResult))
+
+				modifier := NewResourceModifier(
+					clusterInstrumentationConfig,
+					DefaultNamespaceInstrumentationConfig,
+					testActor,
+					logger,
+				)
+
 				capturingLogger, capturingLogSink := NewCapturingLogger()
-				instrumentationIssues := workloadModifier.addEnvironmentVariables(
+				instrumentationIssues := modifier.addEnvironmentVariables(
 					container,
 					&metav1.ObjectMeta{},
 					&metav1.ObjectMeta{},
@@ -1424,7 +1727,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				}
 			},
 			Entry("should add OTEL_EXPORTER_OTLP_* to container without environment variables", otelExporterEnvVarsTest{
-				existingEnvVars: nil,
+				existingEnvVars:                       nil,
+				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorNodeLocalBaseUrlTest},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
@@ -1438,16 +1742,75 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  "ENV_VAR_2",
 					Value: "VALUE 2",
 				}},
+				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorNodeLocalBaseUrlTest},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
 				},
 			}),
-			Entry("should not overwrite OTEL_EXPORTER_OTLP_* when OTEL_EXPORTER_OTLP_ENDPOINT is already set", otelExporterEnvVarsTest{
+			Entry("should update OTEL_EXPORTER_OTLP_ENDPOINT when switching from node-local to service URL", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelExporterOtlpEndpointName,
+					Value: OTelCollectorNodeLocalBaseUrlTest,
+				}, {
+					Name:  envVarOtelExporterOtlpProtocolName,
+					Value: common.ProtocolHttpProtobuf,
+				}},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorServiceBaseUrlTest},
+					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
+				},
+				clusterInstrumentationConfig: clusterInstrumentationConfigWithServiceUrl,
+			}),
+			Entry("should update OTEL_EXPORTER_OTLP_ENDPOINT when switching from service URL to node-local", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelExporterOtlpEndpointName,
+					Value: OTelCollectorServiceBaseUrlTest,
+				}, {
+					Name:  envVarOtelExporterOtlpProtocolName,
+					Value: common.ProtocolHttpProtobuf,
+				}},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorNodeLocalBaseUrlTest},
+					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
+				},
+			}),
+			Entry("should update OTEL_EXPORTER_OTLP_ENDPOINT and add missing _PROTOCOL when switching from node-local to service URL", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelExporterOtlpEndpointName,
+					Value: OTelCollectorNodeLocalBaseUrlTest,
+				}},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorServiceBaseUrlTest},
+					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
+				},
+				clusterInstrumentationConfig: clusterInstrumentationConfigWithServiceUrl,
+			}),
+			Entry("should not update OTEL_EXPORTER_OTLP_ENDPOINT when _PROTOCOL is set and has an unexpected value", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelExporterOtlpEndpointName,
+					Value: OTelCollectorServiceBaseUrlTest,
+				}, {
+					Name:  envVarOtelExporterOtlpProtocolName,
+					Value: common.ProtocolGrpc,
+				}},
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorServiceBaseUrlTest},
+					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolGrpc},
+				},
+				expectedInstrumentationIssue: otelExporterOtlpNoOverwriteMsg,
+				expectedLogMessage:           otelExporterOtlpNoOverwriteMsg,
+			}),
+			Entry("should not overwrite OTEL_EXPORTER_OTLP_* when OTEL_EXPORTER_OTLP_ENDPOINT is already set to a value not set by the operator", otelExporterEnvVarsTest{
 				existingEnvVars: []corev1.EnvVar{{
 					Name:  envVarOtelExporterOtlpEndpointName,
 					Value: "http://some-endpoint.tld",
 				}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: "http://some-endpoint.tld"},
 					envVarOtelExporterOtlpProtocolName: nil,
@@ -1460,6 +1823,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  envVarOtelExporterOtlpProtocolName,
 					Value: common.ProtocolGrpc,
 				}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: nil,
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolGrpc},
@@ -1477,6 +1841,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name:  envVarOtelExporterOtlpProtocolName,
 						Value: common.ProtocolGrpc,
 					}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: "http://some-endpoint.tld"},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolGrpc},
@@ -1494,6 +1859,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name:  envVarOtelExporterOtlpProtocolName,
 						Value: common.ProtocolHttpProtobuf,
 					}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorNodeLocalBaseUrlTest},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
@@ -1505,6 +1871,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name:  envVarOtelExporterOtlpEndpointName,
 						Value: OTelCollectorNodeLocalBaseUrlTest,
 					}},
+				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: OTelCollectorNodeLocalBaseUrlTest},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
@@ -1520,6 +1887,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name:  envVarOtelExporterOtlpProtocolName,
 						Value: common.ProtocolHttpProtobuf,
 					}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: {Value: " "},
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
@@ -1533,6 +1901,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						Name:  envVarOtelExporterOtlpProtocolName,
 						Value: common.ProtocolHttpProtobuf,
 					}},
+				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					envVarOtelExporterOtlpEndpointName: nil,
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
@@ -1549,12 +1918,22 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					container.Env = testConfig.existingEnvVars
 				}
 
-				workloadModifier.removeEnvironmentVariables(container)
+				clusterInstrumentationConfig := testConfig.clusterInstrumentationConfig
+				if clusterInstrumentationConfig == nil {
+					clusterInstrumentationConfig = clusterInstrumentationConfigWithInitContainer
+				}
+				modifier := NewResourceModifier(
+					clusterInstrumentationConfig,
+					DefaultNamespaceInstrumentationConfig,
+					testActor,
+					logger,
+				)
+				modifier.removeEnvironmentVariables(container)
 
 				envVars := container.Env
 				VerifyEnvVarsFromMap(testConfig.expectedEnvVars, envVars)
 			},
-			Entry("should remove OTEL_EXPORTER_OTLP_* when values match config", otelExporterEnvVarsTest{
+			Entry("should remove OTEL_EXPORTER_OTLP_* when values match the current config", otelExporterEnvVarsTest{
 				existingEnvVars: []corev1.EnvVar{
 					{
 						Name:  envVarOtelExporterOtlpEndpointName,
@@ -1569,7 +1948,39 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					envVarOtelExporterOtlpProtocolName: nil,
 				},
 			}),
-			Entry("should leave OTEL_EXPORTER_OTLP_* in place when values do not match config", otelExporterEnvVarsTest{
+			Entry("should remove OTEL_EXPORTER_OTLP_* when current env var is service and new config is node-local", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{
+					{
+						Name:  envVarOtelExporterOtlpEndpointName,
+						Value: OTelCollectorServiceBaseUrlTest,
+					},
+					{
+						Name:  envVarOtelExporterOtlpProtocolName,
+						Value: common.ProtocolHttpProtobuf,
+					}},
+				clusterInstrumentationConfig: clusterInstrumentationConfigWithInitContainer,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: nil,
+					envVarOtelExporterOtlpProtocolName: nil,
+				},
+			}),
+			Entry("should remove OTEL_EXPORTER_OTLP_* when current env var is node local and new config is service", otelExporterEnvVarsTest{
+				existingEnvVars: []corev1.EnvVar{
+					{
+						Name:  envVarOtelExporterOtlpEndpointName,
+						Value: OTelCollectorNodeLocalBaseUrlTest,
+					},
+					{
+						Name:  envVarOtelExporterOtlpProtocolName,
+						Value: common.ProtocolHttpProtobuf,
+					}},
+				clusterInstrumentationConfig: clusterInstrumentationConfigWithServiceUrl,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelExporterOtlpEndpointName: nil,
+					envVarOtelExporterOtlpProtocolName: nil,
+				},
+			}),
+			Entry("should leave OTEL_EXPORTER_OTLP_* in place when value is not a value that the operator would set", otelExporterEnvVarsTest{
 				existingEnvVars: []corev1.EnvVar{
 					{
 						Name:  envVarOtelExporterOtlpEndpointName,
@@ -1605,6 +2016,119 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					envVarOtelExporterOtlpEndpointName: nil,
 					envVarOtelExporterOtlpProtocolName: {Value: common.ProtocolHttpProtobuf},
 				},
+			}),
+		)
+
+		type otelLogsExporterEnvVarTest struct {
+			logCollectionEnabled         bool
+			previousLogCollectionEnabled bool
+			existingEnvVars              []corev1.EnvVar
+			expectedEnvVar               *EnvVarExpectation
+		}
+
+		DescribeTable("should set OTEL_LOGS_EXPORTER=none when log collection is enabled in the namespace",
+			func(testConfig otelLogsExporterEnvVarTest) {
+				container := &corev1.Container{}
+				if testConfig.existingEnvVars != nil {
+					container.Env = testConfig.existingEnvVars
+				}
+
+				nsConfig := DefaultNamespaceInstrumentationConfig
+				nsConfig.LogCollectionEnabled = testConfig.logCollectionEnabled
+				modifier := NewResourceModifier(clusterInstrumentationConfigWithInitContainer, nsConfig, testActor, logger)
+				modifier.addOtelLogsExporterEnvVar(container)
+
+				VerifyEnvVarsFromMap(
+					map[string]*EnvVarExpectation{envVarOtelLogsExporterName: testConfig.expectedEnvVar},
+					container.Env,
+				)
+			},
+			Entry("should set OTEL_LOGS_EXPORTER=none when log collection is enabled and env var is absent", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: true,
+				existingEnvVars:      nil,
+				expectedEnvVar:       &EnvVarExpectation{Value: "none"},
+			}),
+			Entry("should not override an existing OTEL_LOGS_EXPORTER user value when log collection is enabled", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: true,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "otlp",
+				}},
+				expectedEnvVar: &EnvVarExpectation{Value: "otlp"},
+			}),
+			Entry("should not override an existing OTEL_LOGS_EXPORTER=none set by the user when log collection is enabled", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: true,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "none",
+				}},
+				expectedEnvVar: &EnvVarExpectation{Value: "none"},
+			}),
+			Entry("should not override OTEL_LOGS_EXPORTER set via ValueFrom when log collection is enabled", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: true,
+				existingEnvVars: []corev1.EnvVar{{
+					Name: envVarOtelLogsExporterName,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+					},
+				}},
+				expectedEnvVar: &EnvVarExpectation{ValueFrom: "metadata.name"},
+			}),
+			Entry("should not set OTEL_LOGS_EXPORTER when log collection is disabled", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: false,
+				existingEnvVars:      nil,
+				expectedEnvVar:       nil,
+			}),
+			Entry("should not override an existing OTEL_LOGS_EXPORTER user value when log collection is disabled", otelLogsExporterEnvVarTest{
+				logCollectionEnabled: false,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "otlp",
+				}},
+				expectedEnvVar: &EnvVarExpectation{Value: "otlp"},
+			}),
+		)
+
+		DescribeTable("should remove OTEL_LOGS_EXPORTER on uninstrumentation only when we set it",
+			func(testConfig otelLogsExporterEnvVarTest) {
+				container := &corev1.Container{}
+				if testConfig.existingEnvVars != nil {
+					container.Env = testConfig.existingEnvVars
+				}
+
+				nsConfig := DefaultNamespaceInstrumentationConfig
+				nsConfig.PreviousLogCollectionEnabled = testConfig.previousLogCollectionEnabled
+				modifier := NewResourceModifier(clusterInstrumentationConfigWithInitContainer, nsConfig, testActor, logger)
+				modifier.removeOtelLogsExporterEnvVar(container)
+
+				VerifyEnvVarsFromMap(
+					map[string]*EnvVarExpectation{envVarOtelLogsExporterName: testConfig.expectedEnvVar},
+					container.Env,
+				)
+			},
+			Entry("should remove OTEL_LOGS_EXPORTER=none when we previously set it", otelLogsExporterEnvVarTest{
+				previousLogCollectionEnabled: true,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "none",
+				}},
+				expectedEnvVar: nil,
+			}),
+			Entry("should not remove a user-set OTEL_LOGS_EXPORTER value", otelLogsExporterEnvVarTest{
+				previousLogCollectionEnabled: true,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "otlp",
+				}},
+				expectedEnvVar: &EnvVarExpectation{Value: "otlp"},
+			}),
+			Entry("should not touch OTEL_LOGS_EXPORTER when log collection was not enabled previously", otelLogsExporterEnvVarTest{
+				previousLogCollectionEnabled: false,
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelLogsExporterName,
+					Value: "none",
+				}},
+				expectedEnvVar: &EnvVarExpectation{Value: "none"},
 			}),
 		)
 
@@ -1760,6 +2284,99 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					envVarOTelInjectorServiceName:        {Value: "workload-name"},
 					envVarOTelInjectorServiceNamespace:   {Value: "workload-part-of"},
 					envVarOTelInjectorServiceVersionName: nil,
+				},
+			}),
+			Entry("resource.opentelemetry.io/service.name should win over app.kubernetes.io/name", objectMetaResourceAttributesTest{
+				workloadLabels: map[string]string{
+					util.AppKubernetesIoNameLabel:    "app.kubernetes.io/name-value",
+					util.AppKubernetesIoPartOfLabel:  "app.kubernetes.io/part-of-value",
+					util.AppKubernetesIoVersionLabel: "app.kubernetes.io/version-value",
+				},
+				workloadAnnotations: map[string]string{
+					"resource.opentelemetry.io/service.name": "resource.opentelemetry.io/service.name-value",
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOTelInjectorServiceName:        {Value: "resource.opentelemetry.io/service.name-value"},
+					envVarOTelInjectorServiceNamespace:   {Value: "app.kubernetes.io/part-of-value"},
+					envVarOTelInjectorServiceVersionName: {Value: "app.kubernetes.io/version-value"},
+				},
+				expectedResourceAttributeEnvVar: []string{
+					"service.name=resource.opentelemetry.io/service.name-value",
+				},
+			}),
+			Entry("resource.opentelemetry.io/service.namespace should win over app.kubernetes.io/part-of", objectMetaResourceAttributesTest{
+				workloadLabels: map[string]string{
+					util.AppKubernetesIoNameLabel:    "app.kubernetes.io/name-value",
+					util.AppKubernetesIoPartOfLabel:  "app.kubernetes.io/part-of-value",
+					util.AppKubernetesIoVersionLabel: "app.kubernetes.io/version-value",
+				},
+				workloadAnnotations: map[string]string{
+					"resource.opentelemetry.io/service.namespace": "resource.opentelemetry.io/service.namespace-value",
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOTelInjectorServiceName:        {Value: "app.kubernetes.io/name-value"},
+					envVarOTelInjectorServiceNamespace:   {Value: "resource.opentelemetry.io/service.namespace-value"},
+					envVarOTelInjectorServiceVersionName: {Value: "app.kubernetes.io/version-value"},
+				},
+				expectedResourceAttributeEnvVar: []string{
+					"service.namespace=resource.opentelemetry.io/service.namespace-value",
+				},
+			}),
+			Entry("resource.opentelemetry.io/service.version should win over app.kubernetes.io/version", objectMetaResourceAttributesTest{
+				workloadLabels: map[string]string{
+					util.AppKubernetesIoNameLabel:    "app.kubernetes.io/name-value",
+					util.AppKubernetesIoPartOfLabel:  "app.kubernetes.io/part-of-value",
+					util.AppKubernetesIoVersionLabel: "app.kubernetes.io/version-value",
+				},
+				workloadAnnotations: map[string]string{
+					"resource.opentelemetry.io/service.version": "resource.opentelemetry.io/service.version-value",
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOTelInjectorServiceName:        {Value: "app.kubernetes.io/name-value"},
+					envVarOTelInjectorServiceNamespace:   {Value: "app.kubernetes.io/part-of-value"},
+					envVarOTelInjectorServiceVersionName: {Value: "resource.opentelemetry.io/service.version-value"},
+				},
+				expectedResourceAttributeEnvVar: []string{
+					"service.version=resource.opentelemetry.io/service.version-value",
+				},
+			}),
+			Entry("resource.opentelemetry.io/service.* should win over app.kubernetes.io/*", objectMetaResourceAttributesTest{
+				workloadLabels: map[string]string{
+					util.AppKubernetesIoNameLabel:    "app.kubernetes.io/name-value",
+					util.AppKubernetesIoPartOfLabel:  "app.kubernetes.io/part-of-value",
+					util.AppKubernetesIoVersionLabel: "app.kubernetes.io/version-value",
+				},
+				workloadAnnotations: map[string]string{
+					"resource.opentelemetry.io/service.name":      "resource.opentelemetry.io/service.name-value",
+					"resource.opentelemetry.io/service.namespace": "resource.opentelemetry.io/service.namespace-value",
+					"resource.opentelemetry.io/service.version":   "resource.opentelemetry.io/service.version-value",
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOTelInjectorServiceName:        {Value: "resource.opentelemetry.io/service.name-value"},
+					envVarOTelInjectorServiceNamespace:   {Value: "resource.opentelemetry.io/service.namespace-value"},
+					envVarOTelInjectorServiceVersionName: {Value: "resource.opentelemetry.io/service.version-value"},
+				},
+				expectedResourceAttributeEnvVar: []string{
+					"service.name=resource.opentelemetry.io/service.name-value",
+					"service.namespace=resource.opentelemetry.io/service.namespace-value",
+					"service.version=resource.opentelemetry.io/service.version-value",
+				},
+			}),
+			Entry("resource.opentelemetry.io/service.* should be set independently of app.kubernetes.io/*", objectMetaResourceAttributesTest{
+				workloadAnnotations: map[string]string{
+					"resource.opentelemetry.io/service.name":      "resource.opentelemetry.io/service.name-value",
+					"resource.opentelemetry.io/service.namespace": "resource.opentelemetry.io/service.namespace-value",
+					"resource.opentelemetry.io/service.version":   "resource.opentelemetry.io/service.version-value",
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOTelInjectorServiceName:        {Value: "resource.opentelemetry.io/service.name-value"},
+					envVarOTelInjectorServiceNamespace:   {Value: "resource.opentelemetry.io/service.namespace-value"},
+					envVarOTelInjectorServiceVersionName: {Value: "resource.opentelemetry.io/service.version-value"},
+				},
+				expectedResourceAttributeEnvVar: []string{
+					"service.name=resource.opentelemetry.io/service.name-value",
+					"service.namespace=resource.opentelemetry.io/service.namespace-value",
+					"service.version=resource.opentelemetry.io/service.version-value",
 				},
 			}),
 			Entry("should ignore workload labels if name is not set", objectMetaResourceAttributesTest{
@@ -1981,7 +2598,7 @@ var _ = Describe("Dash0 Workload Modification", func() {
 
 		type otelPropagatorsTest struct {
 			existingEnvVars                       []corev1.EnvVar
-			namespaceInstrumentationConfig        util.NamespaceInstrumentationConfig
+			namespaceInstrumentationConfig        dash0v1beta1.NamespaceInstrumentationConfig
 			expectedPreInstrumentationCheckResult bool
 			expectedEnvVars                       map[string]*EnvVarExpectation
 		}
@@ -2002,10 +2619,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				Expect(preInstrumentationCheckResult).To(Equal(testConfig.expectedPreInstrumentationCheckResult))
 
 				NewResourceModifier(
-					clusterInstrumentationConfig,
+					clusterInstrumentationConfigWithInitContainer,
 					testConfig.namespaceInstrumentationConfig,
 					testActor,
-					&logger,
+					logger,
 				).addEnvironmentVariables(
 					container,
 					&metav1.ObjectMeta{},
@@ -2039,8 +2656,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "tracecontext,baggage",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					PreviousTraceContextPropagators: ptr.To("something,else"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					PreviousTraceContextPropagators: new("something,else"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2052,8 +2669,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "tracecontext,baggage",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					PreviousTraceContextPropagators: ptr.To("tracecontext,baggage"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					PreviousTraceContextPropagators: new("tracecontext,baggage"),
 				},
 				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2061,8 +2678,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				},
 			}),
 			Entry("should not add OTEL_PROPAGATORS if configured as empty string", otelPropagatorsTest{
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To(""),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new(""),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2070,8 +2687,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				},
 			}),
 			Entry("should not add OTEL_PROPAGATORS if configured string is only whitespace", otelPropagatorsTest{
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("   "),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("   "),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2079,8 +2696,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				},
 			}),
 			Entry("should add OTEL_PROPAGATORS if configured and the env var does not exist on the container", otelPropagatorsTest{
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2096,8 +2713,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						},
 					},
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2109,8 +2726,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "jaeger,b3multi",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2122,9 +2739,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "jaeger,b3multi",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators:         ptr.To("tracecontext,xray"),
-					PreviousTraceContextPropagators: ptr.To("something,else"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators:         new("tracecontext,xray"),
+					PreviousTraceContextPropagators: new("something,else"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2136,9 +2753,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "jaeger,b3multi",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators:         ptr.To("tracecontext,xray"),
-					PreviousTraceContextPropagators: ptr.To("jaeger,b3multi"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators:         new("tracecontext,xray"),
+					PreviousTraceContextPropagators: new("jaeger,b3multi"),
 				},
 				expectedPreInstrumentationCheckResult: true,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2150,9 +2767,9 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "tracecontext,xray",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators:         ptr.To("tracecontext,xray"),
-					PreviousTraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators:         new("tracecontext,xray"),
+					PreviousTraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2169,8 +2786,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						},
 					},
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedPreInstrumentationCheckResult: false,
 				expectedEnvVars: map[string]*EnvVarExpectation{
@@ -2187,10 +2804,10 @@ var _ = Describe("Dash0 Workload Modification", func() {
 				}
 
 				NewResourceModifier(
-					clusterInstrumentationConfig,
+					clusterInstrumentationConfigWithInitContainer,
 					testConfig.namespaceInstrumentationConfig,
 					testActor,
-					&logger,
+					logger,
 				).removeEnvironmentVariables(container)
 
 				envVars := container.Env
@@ -2211,8 +2828,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "jaeger,b3multi",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					util.OtelPropagatorsEnvVarName: {Value: "jaeger,b3multi"},
@@ -2228,8 +2845,8 @@ var _ = Describe("Dash0 Workload Modification", func() {
 						},
 					},
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					util.OtelPropagatorsEnvVarName: {ValueFrom: "tracecontext,xray"},
@@ -2240,19 +2857,604 @@ var _ = Describe("Dash0 Workload Modification", func() {
 					Name:  util.OtelPropagatorsEnvVarName,
 					Value: "tracecontext,xray",
 				}},
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					util.OtelPropagatorsEnvVarName: nil,
 				},
 			}),
 			Entry("should do nothing if env var is not set", otelPropagatorsTest{
-				namespaceInstrumentationConfig: util.NamespaceInstrumentationConfig{
-					TraceContextPropagators: ptr.To("tracecontext,xray"),
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					TraceContextPropagators: new("tracecontext,xray"),
 				},
 				expectedEnvVars: map[string]*EnvVarExpectation{
 					util.OtelPropagatorsEnvVarName: nil,
+				},
+			}),
+		)
+
+		type captureSqlQueryParametersTest struct {
+			existingEnvVars                       []corev1.EnvVar
+			namespaceInstrumentationConfig        dash0v1beta1.NamespaceInstrumentationConfig
+			expectedPreInstrumentationCheckResult bool
+			expectedEnvVars                       map[string]*EnvVarExpectation
+		}
+
+		DescribeTable("should add or remove SQL query parameter capture env vars",
+			func(testConfig captureSqlQueryParametersTest) {
+				container := &corev1.Container{}
+				if testConfig.existingEnvVars != nil {
+					container.Env = testConfig.existingEnvVars
+				}
+
+				preInstrumentationCheckResult := captureSqlQueryParametersEnvVarWillBeUpdatedForAtLeastOneContainer([]corev1.Container{
+					*container,
+				}, testConfig.namespaceInstrumentationConfig)
+				Expect(preInstrumentationCheckResult).To(Equal(testConfig.expectedPreInstrumentationCheckResult))
+
+				NewResourceModifier(
+					clusterInstrumentationConfigWithInitContainer,
+					testConfig.namespaceInstrumentationConfig,
+					testActor,
+					logger,
+				).addEnvironmentVariables(
+					container,
+					&metav1.ObjectMeta{},
+					&metav1.ObjectMeta{},
+					logger,
+				)
+
+				VerifyEnvVarsFromMap(testConfig.expectedEnvVars, container.Env)
+			},
+			Entry("should not add the env vars if not configured", captureSqlQueryParametersTest{
+				namespaceInstrumentationConfig:        DefaultNamespaceInstrumentationConfig,
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+			Entry("should not add the env vars if configured to false", captureSqlQueryParametersTest{
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(false),
+				},
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+			Entry("should add all env vars if configured to true and none exist on the container", captureSqlQueryParametersTest{
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should do nothing if configured to true and all env vars are already set to true", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should apply per-env-var decisions independently when configured to true (mix of true, user-set non-true and ValueFrom)", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "false"},
+					{
+						Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName,
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "field.path"},
+						},
+					},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "false"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {ValueFrom: "field.path"},
+				},
+			}),
+			Entry("should not update JDBC env var if already set to true, but should add missing .NET env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName,
+					Value: "true",
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should not update .NET SqlClient env var if already set to true, but should add missing JDBC and EF Core env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName,
+					Value: "true",
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should leave existing JDBC env var with non-true value alone if configured to true (user-set, no previous), but should add .NET env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName,
+					Value: "false",
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "false"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should leave existing .NET EF Core env var with non-true value alone if configured to true (user-set, no previous), but should add other env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName,
+					Value: "false",
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "false"},
+				},
+			}),
+			Entry("should leave existing JDBC env var via ValueFrom alone even if configured to true, but should add .NET env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "field.path",
+						},
+					},
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {ValueFrom: "field.path"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should leave existing .NET SqlClient env var via ValueFrom alone even if configured to true, but should add other env vars", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "field.path",
+						},
+					},
+				}},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {ValueFrom: "field.path"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should remove existing env vars if not configured anymore and previous was true and value matches", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					PreviousCaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+			Entry("should remove existing env vars if configured to false and previous was true and value matches", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters:         ptr.To(false),
+					PreviousCaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+			Entry("should not remove existing env vars if previous was true but value differs (user changed them)", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "false"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "false"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "false"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					PreviousCaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "false"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "false"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "false"},
+				},
+			}),
+			Entry("should not remove existing env vars if no previous setting (env vars are user-set)", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig:        DefaultNamespaceInstrumentationConfig,
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+		)
+
+		DescribeTable("should remove SQL query parameter capture env vars when uninstrumenting workloads",
+			func(testConfig captureSqlQueryParametersTest) {
+				container := &corev1.Container{}
+				if testConfig.existingEnvVars != nil {
+					container.Env = testConfig.existingEnvVars
+				}
+
+				NewResourceModifier(
+					clusterInstrumentationConfigWithInitContainer,
+					testConfig.namespaceInstrumentationConfig,
+					testActor,
+					logger,
+				).removeEnvironmentVariables(container)
+
+				VerifyEnvVarsFromMap(testConfig.expectedEnvVars, container.Env)
+			},
+			Entry("should not remove any env var if not configured", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig: DefaultNamespaceInstrumentationConfig,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "true"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "true"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "true"},
+				},
+			}),
+			Entry("should not remove any env var if configured but current values differ from what we would set", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "false"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "false"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "false"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {Value: "false"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "false"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {Value: "false"},
+				},
+			}),
+			Entry("should not remove any env var if configured but existing env vars use ValueFrom", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{
+						Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName,
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "field.path"},
+						},
+					},
+					{
+						Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName,
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "field.path"},
+						},
+					},
+					{
+						Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName,
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "field.path"},
+						},
+					},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: {ValueFrom: "field.path"},
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {ValueFrom: "field.path"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {ValueFrom: "field.path"},
+				},
+			}),
+			Entry("should remove env vars individually based on per-env-var state (mix of matching, user-set and ValueFrom)", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "false"},
+					{
+						Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName,
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{FieldPath: "field.path"},
+						},
+					},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     {Value: "false"},
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        {ValueFrom: "field.path"},
+				},
+			}),
+			Entry("should remove all env vars if configured and current values match what we would set", captureSqlQueryParametersTest{
+				existingEnvVars: []corev1.EnvVar{
+					{Name: envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName, Value: "true"},
+					{Name: envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName, Value: "true"},
+				},
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+			Entry("should do nothing if env vars are not set", captureSqlQueryParametersTest{
+				namespaceInstrumentationConfig: dash0v1beta1.NamespaceInstrumentationConfig{
+					CaptureSqlQueryParameters: ptr.To(true),
+				},
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInstrumentationJdbcExperimentalCaptureQueryParametersName: nil,
+					envVarOtelDotnetExperimentalSqlClientCaptureQueryParametersName:     nil,
+					envVarOtelDotnetExperimentalEfCoreCaptureQueryParametersName:        nil,
+				},
+			}),
+		)
+
+		type pythonAutoInstrumentationTest struct {
+			existingEnvVars                       []corev1.EnvVar
+			clusterInstrumentationConfig          *util.ClusterInstrumentationConfig
+			expectedPreInstrumentationCheckResult bool
+			expectedEnvVars                       map[string]*EnvVarExpectation
+		}
+
+		DescribeTable("should update Python auto-instrumentation support",
+			func(testConfig pythonAutoInstrumentationTest) {
+				container := &corev1.Container{}
+				if testConfig.existingEnvVars != nil {
+					container.Env = testConfig.existingEnvVars
+				}
+
+				preInstrumentationCheckResult := otelInjectorConfEnvVarWillBeUpdatedForAtLeastOneContainer([]corev1.Container{
+					*container,
+				}, testConfig.clusterInstrumentationConfig)
+				Expect(preInstrumentationCheckResult).To(Equal(testConfig.expectedPreInstrumentationCheckResult))
+
+				NewResourceModifier(
+					testConfig.clusterInstrumentationConfig,
+					dash0v1beta1.NamespaceInstrumentationConfig{},
+					testActor,
+					logger,
+				).addEnvironmentVariables(
+					container,
+					&metav1.ObjectMeta{},
+					&metav1.ObjectMeta{},
+					logger,
+				)
+
+				envVars := container.Env
+				VerifyEnvVarsFromMap(testConfig.expectedEnvVars, envVars)
+			},
+			Entry("should change OTEL_INJECTOR_CONFIG_FILE to injector-with-python.conf when enabling Python auto-instrumentation", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInjectorConfigFileName,
+					Value: envVarOtelInjectorConfigFileValue,
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					true,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFilePythonEnabledValue},
+				},
+			}),
+			Entry("should do nothing if Python auto-instrumentation is already enabled for the container", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInjectorConfigFileName,
+					Value: envVarOtelInjectorConfigFilePythonEnabledValue,
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					true,
+				),
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFilePythonEnabledValue},
+				},
+			}),
+			Entry("should change OTEL_INJECTOR_CONFIG_FILE to injector.conf when disabling Python auto-instrumentation", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInjectorConfigFileName,
+					Value: envVarOtelInjectorConfigFilePythonEnabledValue,
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					false,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFileValue},
+				},
+			}),
+			Entry("should do nothing if Python auto-instrumentation is already disabled for the container", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInjectorConfigFileName,
+					Value: envVarOtelInjectorConfigFileValue,
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					false,
+				),
+				expectedPreInstrumentationCheckResult: false,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFileValue},
+				},
+			}),
+			Entry("should change OTEL_INJECTOR_CONFIG_FILE to injector-with-python.conf if the existing env var uses ValueFrom", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name: envVarOtelInjectorConfigFileName,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "whatever",
+						},
+					},
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					true,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFilePythonEnabledValue},
+				},
+			}),
+			Entry("should change OTEL_INJECTOR_CONFIG_FILE to injector.conf if the existing env var uses ValueFrom", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name: envVarOtelInjectorConfigFileName,
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "whatever",
+						},
+					},
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					false,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFileValue},
+				},
+			}),
+			Entry("should set OTEL_INJECTOR_CONFIG_FILE to injector-with-python.conf if the env var does not exist", pythonAutoInstrumentationTest{
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					true,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFilePythonEnabledValue},
+				},
+			}),
+			Entry("should set OTEL_INJECTOR_CONFIG_FILE to injector.conf if the existing env var is empty", pythonAutoInstrumentationTest{
+				existingEnvVars: []corev1.EnvVar{{
+					Name:  envVarOtelInjectorConfigFileName,
+					Value: "",
+				}},
+				clusterInstrumentationConfig: util.NewClusterInstrumentationConfig(
+					TestImages,
+					PossibleCollectorUrlsTest,
+					OTelCollectorNodeLocalBaseUrlTest,
+					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
+					nil,
+					false,
+					false,
+				),
+				expectedPreInstrumentationCheckResult: true,
+				expectedEnvVars: map[string]*EnvVarExpectation{
+					envVarOtelInjectorConfigFileName: {Value: envVarOtelInjectorConfigFileValue},
 				},
 			}),
 		)

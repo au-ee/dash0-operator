@@ -4,10 +4,17 @@
 package webhooks
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
+	"encoding/json"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -20,7 +27,21 @@ type normalizeOperatorConfigurationResourceSpecTestConfig struct {
 	wanted dash0v1alpha1.Dash0OperatorConfigurationSpec
 }
 
+type migrateOperatorConfigExportToExportsTestConfig struct {
+	operation admissionv1.Operation
+	oldSpec   *dash0v1alpha1.Dash0OperatorConfigurationSpec
+	spec      dash0v1alpha1.Dash0OperatorConfigurationSpec
+	wanted    dash0v1alpha1.Dash0OperatorConfigurationSpec
+}
+
+type setMonitoringTemplateDefaultsTestConfig struct {
+	autoMonitorNamespacesEnabled bool
+	template                     *dash0v1alpha1.MonitoringTemplate
+	wanted                       *dash0v1alpha1.MonitoringTemplate
+}
+
 var _ = Describe("The mutating webhook for the operator configuration resource", func() {
+	logger := logd.FromContext(ctx)
 
 	Describe("when a new operator configuration resource is created", Ordered, func() {
 		AfterEach(func() {
@@ -36,7 +57,7 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 						Name: "dash0-operator-configuration-test-1",
 					},
 					Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-						Export: Dash0ExportWithEndpointAndToken(),
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 					},
 				})
 			Expect(err).ToNot(HaveOccurred())
@@ -44,12 +65,13 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			Eventually(func(g Gomega) {
 				operatorConfigurationResource := LoadOperatorConfigurationResourceOrFail(ctx, k8sClient, g)
 				spec := operatorConfigurationResource.Spec
-				g.Expect(spec.SelfMonitoring.Enabled).To(Equal(ptr.To(true)))
-				g.Expect(spec.KubernetesInfrastructureMetricsCollection.Enabled).To(Equal(ptr.To(true)))
+				g.Expect(spec.SelfMonitoring.Enabled).To(Equal(new(true)))
+				g.Expect(spec.KubernetesInfrastructureMetricsCollection.Enabled).To(Equal(new(true)))
 				//nolint:staticcheck
-				g.Expect(spec.KubernetesInfrastructureMetricsCollectionEnabled).To(Equal(ptr.To(true)))
-				g.Expect(spec.CollectPodLabelsAndAnnotations.Enabled).To(Equal(ptr.To(true)))
-				g.Expect(spec.TelemetryCollection.Enabled).To(Equal(ptr.To(true)))
+				g.Expect(spec.KubernetesInfrastructureMetricsCollectionEnabled).To(Equal(new(true)))
+				g.Expect(spec.CollectPodLabelsAndAnnotations.Enabled).To(Equal(new(true)))
+				g.Expect(spec.CollectNamespaceLabelsAndAnnotations.Enabled).To(Equal(new(false)))
+				g.Expect(spec.TelemetryCollection.Enabled).To(Equal(new(true)))
 			})
 		})
 
@@ -62,9 +84,9 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 						Name: "dash0-operator-configuration-test-1",
 					},
 					Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-						Export: Dash0ExportWithEndpointAndToken(),
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 						TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 					},
 				})
@@ -73,42 +95,52 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			Eventually(func(g Gomega) {
 				operatorConfigurationResource := LoadOperatorConfigurationResourceOrFail(ctx, k8sClient, g)
 				spec := operatorConfigurationResource.Spec
-				g.Expect(spec.SelfMonitoring.Enabled).To(Equal(ptr.To(false)))
-				g.Expect(spec.KubernetesInfrastructureMetricsCollection.Enabled).To(Equal(ptr.To(false)))
+				g.Expect(spec.SelfMonitoring.Enabled).To(Equal(new(false)))
+				g.Expect(spec.KubernetesInfrastructureMetricsCollection.Enabled).To(Equal(new(false)))
 				//nolint:staticcheck
-				g.Expect(spec.KubernetesInfrastructureMetricsCollectionEnabled).To(Equal(ptr.To(false)))
-				g.Expect(spec.CollectPodLabelsAndAnnotations.Enabled).To(Equal(ptr.To(false)))
-				g.Expect(spec.TelemetryCollection.Enabled).To(Equal(ptr.To(false)))
+				g.Expect(spec.KubernetesInfrastructureMetricsCollectionEnabled).To(Equal(new(false)))
+				g.Expect(spec.CollectPodLabelsAndAnnotations.Enabled).To(Equal(new(false)))
+				g.Expect(spec.CollectNamespaceLabelsAndAnnotations.Enabled).To(Equal(new(false)))
+				g.Expect(spec.TelemetryCollection.Enabled).To(Equal(new(false)))
 			})
 		})
 	})
 
 	DescribeTable("should normalize the resource spec", func(testConfig normalizeOperatorConfigurationResourceSpecTestConfig) {
 		spec := testConfig.spec
-		operatorConfigurationMutatingWebhookHandler.normalizeOperatorConfigurationResourceSpec(&spec)
+		_, errorResponse := operatorConfigurationMutatingWebhookHandler.normalizeOperatorConfigurationResourceSpec(
+			admission.Request{},
+			&spec,
+			logger,
+		)
+		Expect(errorResponse).To(BeNil())
 		Expect(spec).To(Equal(testConfig.wanted))
-	}, Entry("given an empty spec, set all default values",
-		normalizeOperatorConfigurationResourceSpecTestConfig{
-			spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{},
-			wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-				SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-					Enabled: ptr.To(true),
+	},
+		Entry("given an empty spec, set all default values",
+			normalizeOperatorConfigurationResourceSpecTestConfig{
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
+					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
+					},
+					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
+						Enabled: new(false),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(true),
+					},
 				},
-				KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-					Enabled: ptr.To(true),
-				},
-				KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(true),
-				CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-					Enabled: ptr.To(true),
-				},
-				PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-					Enabled: ptr.To(false),
-				},
-				TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-					Enabled: ptr.To(true),
-				},
-			},
-		}),
+			}),
 		Entry("given empty structs, set all default values",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				// This is actully the same test case as before, given how the default values for a structs work in Go.
@@ -120,20 +152,23 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(true),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			}),
@@ -141,26 +176,29 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
 						// self-monitoring does not depend on the telemetry collection flag
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			}),
@@ -171,25 +209,28 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{},
 					CollectPodLabelsAndAnnotations:            dash0v1alpha1.CollectPodLabelsAndAnnotations{},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			}),
@@ -197,74 +238,86 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			}),
-		Entry("given telemetry collection enabled explicitly & individual flags disabled, do nothing",
+		Entry("given telemetry collection enabled explicitly & individual flags disabled, leave everything as provided",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			}),
@@ -272,35 +325,41 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(true),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(true),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			}),
@@ -311,37 +370,353 @@ var _ = Describe("The mutating webhook for the operator configuration resource",
 			normalizeOperatorConfigurationResourceSpecTestConfig{
 				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(false),
+					KubernetesInfrastructureMetricsCollectionEnabled: new(false),
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
+					},
+				},
+			}),
+
+		Entry("should migrate deprecated export to exports when only export is set",
+			normalizeOperatorConfigurationResourceSpecTestConfig{
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export: Dash0ExportWithEndpointAndToken(),
+				},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export:  nil,
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
+					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
+					},
+					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
+						Enabled: new(false),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(true),
+					},
+				},
+			}),
+		Entry("should not modify exports when only exports is set",
+			normalizeOperatorConfigurationResourceSpecTestConfig{
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+				},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export:  nil,
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
+					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
+					},
+					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
+						Enabled: new(false),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(true),
+					},
+				},
+			}),
+		Entry("CREATE: should clear export and keep exports when both are set",
+			normalizeOperatorConfigurationResourceSpecTestConfig{
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export:  Dash0ExportWithEndpointAndToken(),
+					Exports: []dash0common.Export{*GrpcExportTest()},
+				},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					// export is cleared, exports is kept as-is
+					Export:  nil,
+					Exports: []dash0common.Export{*GrpcExportTest()},
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
+						Enabled: new(true),
+					},
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
+					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
+						Enabled: new(true),
+					},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(false),
+					},
+					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
+						Enabled: new(false),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(true),
 					},
 				},
 			}),
 	)
+
+	DescribeTable("should set monitoring template defaults", func(testConfig setMonitoringTemplateDefaultsTestConfig) {
+		spec := dash0v1alpha1.Dash0OperatorConfigurationSpec{
+			AutoMonitorNamespaces: dash0v1alpha1.AutoMonitorNamespaces{
+				Enabled: new(testConfig.autoMonitorNamespacesEnabled),
+			},
+			MonitoringTemplate: testConfig.template,
+		}
+		_, errorResponse := operatorConfigurationMutatingWebhookHandler.normalizeOperatorConfigurationResourceSpec(
+			admission.Request{},
+			&spec,
+			logger,
+		)
+		Expect(errorResponse).To(BeNil())
+		Expect(spec.MonitoringTemplate).To(Equal(testConfig.wanted))
+	},
+		Entry("if automatic namespace monitoring is disabled and template is nil, do nothing",
+			setMonitoringTemplateDefaultsTestConfig{
+				autoMonitorNamespacesEnabled: false,
+				template:                     nil,
+				wanted:                       nil,
+			}),
+		Entry("if automatic namespace monitoring is disabled but there is a template, set all monitoring template defaults",
+			setMonitoringTemplateDefaultsTestConfig{
+				autoMonitorNamespacesEnabled: false,
+				template: &dash0v1alpha1.MonitoringTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "monitoring",
+					},
+				},
+				wanted: &dash0v1alpha1.MonitoringTemplate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "monitoring",
+					},
+					Spec: dash0v1beta1.Dash0MonitoringSpec{
+						InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+							Mode:          dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+							LabelSelector: "dash0.com/enable!=false",
+						},
+						LogCollection: dash0common.LogCollection{
+							Enabled: new(true),
+						},
+						EventCollection: dash0common.EventCollection{
+							Enabled: new(true),
+						},
+						PrometheusScraping: dash0common.PrometheusScraping{
+							Enabled: new(true),
+						},
+					},
+				},
+			}),
+		Entry("given no MonitoringTemplate, set all monitoring template defaults",
+			setMonitoringTemplateDefaultsTestConfig{
+				autoMonitorNamespacesEnabled: true,
+				template:                     nil,
+				wanted: &dash0v1alpha1.MonitoringTemplate{
+					Spec: dash0v1beta1.Dash0MonitoringSpec{
+						InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+							Mode:          dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+							LabelSelector: "dash0.com/enable!=false",
+						},
+						LogCollection: dash0common.LogCollection{
+							Enabled: new(true),
+						},
+						EventCollection: dash0common.EventCollection{
+							Enabled: new(true),
+						},
+						PrometheusScraping: dash0common.PrometheusScraping{
+							Enabled: new(true),
+						},
+					},
+				},
+			}),
+		Entry("given an empty MonitoringTemplate, set all monitoring template defaults",
+			setMonitoringTemplateDefaultsTestConfig{
+				autoMonitorNamespacesEnabled: true,
+				template:                     &dash0v1alpha1.MonitoringTemplate{},
+				wanted: &dash0v1alpha1.MonitoringTemplate{
+					Spec: dash0v1beta1.Dash0MonitoringSpec{
+						InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+							Mode:          dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+							LabelSelector: "dash0.com/enable!=false",
+						},
+						LogCollection: dash0common.LogCollection{
+							Enabled: new(true),
+						},
+						EventCollection: dash0common.EventCollection{
+							Enabled: new(true),
+						},
+						PrometheusScraping: dash0common.PrometheusScraping{
+							Enabled: new(true),
+						},
+					},
+				},
+			}),
+		Entry("given a MonitoringTemplate with all attributes set to non-default values, leave them unchanged",
+			setMonitoringTemplateDefaultsTestConfig{
+				autoMonitorNamespacesEnabled: true,
+				template: &dash0v1alpha1.MonitoringTemplate{
+					Spec: dash0v1beta1.Dash0MonitoringSpec{
+						InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+							Mode:          dash0common.InstrumentWorkloadsModeAll,
+							LabelSelector: "myapp.com/monitored=true",
+						},
+						LogCollection: dash0common.LogCollection{
+							Enabled: new(false),
+						},
+						EventCollection: dash0common.EventCollection{
+							Enabled: new(false),
+						},
+						PrometheusScraping: dash0common.PrometheusScraping{
+							Enabled: new(false),
+						},
+					},
+				},
+				wanted: &dash0v1alpha1.MonitoringTemplate{
+					Spec: dash0v1beta1.Dash0MonitoringSpec{
+						InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+							Mode:          dash0common.InstrumentWorkloadsModeAll,
+							LabelSelector: "myapp.com/monitored=true",
+						},
+						LogCollection: dash0common.LogCollection{
+							Enabled: new(false),
+						},
+						EventCollection: dash0common.EventCollection{
+							Enabled: new(false),
+						},
+						PrometheusScraping: dash0common.PrometheusScraping{
+							Enabled: new(false),
+						},
+					},
+				},
+			}),
+	)
+
+	DescribeTable("should handle export to exports migration on UPDATE",
+		func(testConfig migrateOperatorConfigExportToExportsTestConfig) {
+			spec := testConfig.spec
+			req := toOperatorConfigAdmissionRequestWithOldObject(
+				spec,
+				testConfig.operation,
+				testConfig.oldSpec,
+			)
+			_, errorResponse := operatorConfigurationMutatingWebhookHandler.normalizeOperatorConfigurationResourceSpec(
+				req,
+				&spec,
+				logger,
+			)
+			Expect(errorResponse).To(BeNil())
+			// Only check export/exports fields; other defaults are tested elsewhere.
+			//nolint:staticcheck
+			Expect(spec.Export).To(Equal(testConfig.wanted.Export))
+			Expect(spec.Exports).To(Equal(testConfig.wanted.Exports))
+		},
+		Entry("UPDATE: should use export when exports is unchanged from stored resource (three-way merge carry-over)",
+			migrateOperatorConfigExportToExportsTestConfig{
+				operation: admissionv1.Update,
+				oldSpec: &dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					// This is what was stored after the previous webhook migration.
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+				},
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					// export has the user's new intended value
+					Export: GrpcExportTest(),
+					// exports is the same as oldSpec.Exports — carried over by three-way merge
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+				},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export: nil,
+					// The webhook should use the value from export, not the stale exports.
+					Exports: []dash0common.Export{*GrpcExportTest()},
+				},
+			}),
+		Entry("UPDATE: should keep exports when exports has been changed by the user",
+			migrateOperatorConfigExportToExportsTestConfig{
+				operation: admissionv1.Update,
+				oldSpec: &dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+				},
+				spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export: HttpExportTest(),
+					// exports differs from oldSpec — user intentionally changed it
+					Exports: []dash0common.Export{*GrpcExportTest()},
+				},
+				wanted: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Export:  nil,
+					Exports: []dash0common.Export{*GrpcExportTest()},
+				},
+			}),
+	)
 })
+
+func toOperatorConfigAdmissionRequestWithOldObject(
+	spec dash0v1alpha1.Dash0OperatorConfigurationSpec,
+	operation admissionv1.Operation,
+	oldSpec *dash0v1alpha1.Dash0OperatorConfigurationSpec,
+) admission.Request {
+	rawJson, err := json.Marshal(dash0v1alpha1.Dash0OperatorConfiguration{
+		Spec: spec,
+	})
+	Expect(err).ToNot(HaveOccurred())
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Name:      OperatorConfigurationResourceName,
+			Operation: operation,
+			Object: runtime.RawExtension{
+				Raw: rawJson,
+			},
+		},
+	}
+
+	if oldSpec != nil {
+		oldRawJson, err := json.Marshal(dash0v1alpha1.Dash0OperatorConfiguration{
+			Spec: *oldSpec,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		req.AdmissionRequest.OldObject = runtime.RawExtension{
+			Raw: oldRawJson,
+		}
+	}
+
+	return req
+}

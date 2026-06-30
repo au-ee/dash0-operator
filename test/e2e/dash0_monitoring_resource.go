@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"text/template"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -120,7 +122,7 @@ func deployRenderedMonitoringResourceWithRetry(
 	By(fmt.Sprintf(
 		"deploying the Dash0 monitoring resource to namespace %s with values %v from file %s, operator namespace is %s",
 		namespace, dash0MonitoringValues, renderedResourceFileName, operatorNamespace))
-	retryLogger := zap.New()
+	retryLogger := logd.NewLogger(zap.New())
 	err := util.RetryWithCustomBackoff("deploying the Dash0 monitoring resource to namespace", func() error {
 		return runAndIgnoreOutput(exec.Command(
 			"kubectl",
@@ -137,14 +139,14 @@ func deployRenderedMonitoringResourceWithRetry(
 		},
 		true,
 		true,
-		&retryLogger,
+		retryLogger,
 	)
 	Expect(err).ToNot(HaveOccurred())
 
-	waitForMonitoringResourceToBecomeAvailable(namespace)
+	waitForMonitoringResourceToBecomeAvailable(namespace, dash0MonitoringResourceName)
 }
 
-func waitForMonitoringResourceToBecomeAvailable(namespace string) {
+func waitForMonitoringResourceToBecomeAvailable(namespace string, name string) {
 	By("waiting for the Dash0 monitoring resource to become available")
 	Eventually(func(g Gomega) {
 		g.Expect(
@@ -153,7 +155,7 @@ func waitForMonitoringResourceToBecomeAvailable(namespace string) {
 				"get",
 				"--namespace",
 				namespace,
-				"dash0monitorings.operator.dash0.com/dash0-monitoring-resource-e2e",
+				fmt.Sprintf("dash0monitorings.operator.dash0.com/%s", name),
 			))).To(Succeed())
 	}, 60*time.Second, 1*time.Second).Should(Succeed())
 	Expect(
@@ -162,7 +164,7 @@ func waitForMonitoringResourceToBecomeAvailable(namespace string) {
 			"wait",
 			"--namespace",
 			namespace,
-			"dash0monitorings.operator.dash0.com/dash0-monitoring-resource-e2e",
+			fmt.Sprintf("dash0monitorings.operator.dash0.com/%s", name),
 			"--for",
 			"condition=Available",
 			"--timeout",
@@ -188,6 +190,21 @@ func updateInstrumentWorkloadsModeOfDash0MonitoringResource(
 	)
 }
 
+func updateLogCollectionEnabledOfDash0MonitoringResource(namespace string, enabled bool) {
+	updateDash0MonitoringResource(
+		namespace,
+		fmt.Sprintf(`
+{
+  "spec": {
+    "logCollection": {
+      "enabled": %t
+    }
+  }
+}
+`, enabled),
+	)
+}
+
 func updateDash0MonitoringResource(
 	namespace string,
 	jsonPatch string,
@@ -207,21 +224,48 @@ func updateDash0MonitoringResource(
 		))).To(Succeed())
 }
 
-func undeployDash0MonitoringResource(namespace string) {
-	By(fmt.Sprintf("removing the Dash0 monitoring resource from namespace %s", namespace))
-	Expect(
-		runAndIgnoreOutput(exec.Command(
-			"kubectl",
-			"delete",
-			"--namespace",
-			namespace,
-			"dash0monitoring",
-			dash0MonitoringResourceName,
-			"--ignore-not-found",
-		))).To(Succeed())
+func verifyDash0MonitoringResourceInstrumentWorkloadsMode(
+	g Gomega,
+	namespace string,
+	name string,
+	expectedMode dash0common.InstrumentWorkloadsMode,
+) {
+	output, err := run(exec.Command(
+		"kubectl",
+		"get",
+		"--namespace",
+		namespace,
+		fmt.Sprintf("dash0monitorings.operator.dash0.com/%s", name),
+		"-o",
+		"jsonpath={.spec.instrumentWorkloads.mode}",
+	))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(output).To(Equal(string(expectedMode)))
 }
 
-func verifyDash0MonitoringResourceDoesNotExist(g Gomega, namespace string) {
+func undeployDash0MonitoringResource(namespace string) {
+	By(fmt.Sprintf("removing the Dash0 monitoring resource from namespace %s", namespace))
+	Expect(undeployDash0MonitoringResourceIgnoringMissingCrdErrors(namespace)).To(Succeed())
+}
+
+func undeployDash0MonitoringResourceIgnoringMissingCrdErrors(namespace string) error {
+	output, err := run(exec.Command(
+		"kubectl",
+		"delete",
+		"--namespace",
+		namespace,
+		"dash0monitoring",
+		dash0MonitoringResourceName,
+		"--wait",
+		"--ignore-not-found",
+	))
+	if err != nil && strings.HasPrefix(output, "error: the server doesn't have a resource type \"dash0monitoring\"") {
+		return nil
+	}
+	return err
+}
+
+func verifyDash0MonitoringResourceDoesNotExist(g Gomega, namespace string, name string) {
 	output, err := run(exec.Command(
 		"kubectl",
 		"get",
@@ -229,8 +273,13 @@ func verifyDash0MonitoringResourceDoesNotExist(g Gomega, namespace string) {
 		namespace,
 		"--ignore-not-found",
 		"dash0monitoring",
-		dash0MonitoringResourceName,
+		name,
 	))
+	// We run this verification after uninstalling the operator Helm chart, naturally, the Dash0Monitoring CRD will no
+	// longer exist.
+	if err != nil && strings.HasPrefix(output, "error: the server doesn't have a resource type \"dash0monitoring\"") {
+		return
+	}
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(output).NotTo(ContainSubstring(dash0MonitoringResourceName))
 }

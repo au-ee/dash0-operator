@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -15,64 +16,10 @@ import (
 
 const (
 	testAppHelmInstallTimeout = "120s"
+	maxLengthHelmReleaseName  = 53
 )
 
 var (
-	workloadTypeCronjob = workloadType{
-		workloadTypeString:          "cronjob",
-		workloadTypeStringCamelCase: "CronJob",
-		isBatch:                     true,
-	}
-	workloadTypeDaemonSet = workloadType{
-		workloadTypeString:          "daemonset",
-		workloadTypeStringCamelCase: "DaemonSet",
-		isBatch:                     false,
-	}
-	workloadTypeDeployment = workloadType{
-		workloadTypeString:          "deployment",
-		workloadTypeStringCamelCase: "Deployment",
-		isBatch:                     false,
-	}
-	workloadTypeJob = workloadType{
-		workloadTypeString:          "job",
-		workloadTypeStringCamelCase: "Job",
-		isBatch:                     true,
-	}
-	workloadTypePod = workloadType{
-		workloadTypeString:          "pod",
-		workloadTypeStringCamelCase: "Pod",
-		isBatch:                     false,
-	}
-	workloadTypeReplicaSet = workloadType{
-		workloadTypeString:          "replicaset",
-		workloadTypeStringCamelCase: "ReplicaSet",
-		isBatch:                     false,
-	}
-	workloadTypeStatefulSet = workloadType{
-		workloadTypeString:          "statefulset",
-		workloadTypeStringCamelCase: "StatefulSet",
-		isBatch:                     false,
-	}
-
-	runtimeTypeNodeJs = runtimeType{
-		runtimeTypeLabel: runtimeTypeLabelNodeJs,
-		workloadName:     workloadNameNodeJs,
-		helmChartPath:    chartPathNodeJs,
-		helmReleaseName:  releaseNameNodeJs,
-	}
-	runtimeTypeJvm = runtimeType{
-		runtimeTypeLabel: runtimeTypeLabelJvm,
-		workloadName:     workloadNameJvm,
-		helmChartPath:    chartPathJvm,
-		helmReleaseName:  releaseNameJvm,
-	}
-	runtimeTypeDotnet = runtimeType{
-		runtimeTypeLabel: runtimeTypeLabelDotnet,
-		workloadName:     workloadNameDotnet,
-		helmChartPath:    chartPathDotnet,
-		helmReleaseName:  releaseNameDotnet,
-	}
-
 	testAppImages = make(map[runtimeType]ImageSpec)
 )
 
@@ -99,6 +46,14 @@ func determineTestAppImages() {
 			"TEST_APP_NODEJS",
 			repositoryPrefix,
 			"dash0-operator-nodejs-20-express-test-app",
+			imageTag,
+			pullPolicy,
+		)
+	testAppImages[runtimeTypePython] =
+		determineContainerImage(
+			"TEST_APP_PYTHON",
+			repositoryPrefix,
+			"dash0-operator-python-flask-test-app",
 			imageTag,
 			pullPolicy,
 		)
@@ -209,6 +164,18 @@ func installNodeJsStatefulSet(namespace string) error {
 	)
 }
 
+//nolint:unparam
+func installPythonDeployment(namespace string) error {
+	return installTestAppWorkload(
+		runtimeTypePython,
+		workloadTypeDeployment,
+		namespace,
+		"",
+		nil,
+		nil,
+	)
+}
+
 // installTestAppWorkload runs helm install for a single workload, that is, for one particular runtime (Node.js, JVM,
 // ...) and one particular workload type (i.e. Deployment, DaemonSet, ...).
 func installTestAppWorkload(
@@ -263,7 +230,7 @@ func installTestAppWorkloads(
 	// Add testIds for batch workloads
 	for _, wt := range workloadTypes {
 		if wt.isBatch {
-			if testId := getTestIdFromMap(testIds, runtime, wt); testId != "" {
+			if testId := getTestIdFromMap(testIds, runtime, wt, namespace); testId != "" {
 				helmSetParams =
 					append(
 						helmSetParams,
@@ -286,6 +253,7 @@ func runTestAppHelmInstall(
 	runtime runtimeType,
 	setValues []string,
 ) error {
+	//nolint:prealloc
 	args := []string{
 		"install",
 		"--namespace",
@@ -293,7 +261,7 @@ func runTestAppHelmInstall(
 		"--wait",
 		"--timeout",
 		testAppHelmInstallTimeout,
-		runtime.helmReleaseName,
+		helmReleaseName(runtime, namespace),
 		runtime.helmChartPath,
 	}
 	args = append(args, setValues...)
@@ -314,15 +282,19 @@ func runTestAppHelmUninstall(namespace string, releaseName string) error {
 }
 
 func uninstallDotnetRelease(namespace string) error {
-	return runTestAppHelmUninstall(namespace, runtimeTypeDotnet.helmReleaseName)
+	return runTestAppHelmUninstall(namespace, helmReleaseName(runtimeTypeDotnet, namespace))
 }
 
 func uninstallJvmRelease(namespace string) error {
-	return runTestAppHelmUninstall(namespace, runtimeTypeJvm.helmReleaseName)
+	return runTestAppHelmUninstall(namespace, helmReleaseName(runtimeTypeJvm, namespace))
 }
 
 func uninstallNodeJsRelease(namespace string) error {
-	return runTestAppHelmUninstall(namespace, runtimeTypeNodeJs.helmReleaseName)
+	return runTestAppHelmUninstall(namespace, helmReleaseName(runtimeTypeNodeJs, namespace))
+}
+
+func uninstallPythonRelease(namespace string) error {
+	return runTestAppHelmUninstall(namespace, helmReleaseName(runtimeTypePython, namespace))
 }
 
 func killBatchJobsAndPods(namespace string) {
@@ -365,6 +337,7 @@ func removeAllTestApplications(namespace string) {
 	Expect(uninstallDotnetRelease(namespace)).To(Succeed())
 	Expect(uninstallJvmRelease(namespace)).To(Succeed())
 	Expect(uninstallNodeJsRelease(namespace)).To(Succeed())
+	Expect(uninstallPythonRelease(namespace)).To(Succeed())
 }
 
 // compileWorkloadTypeSetParams creates a list of Helm --set flags for the test app Helm chart to deploy a specific set
@@ -389,6 +362,15 @@ func addTestAppImageSetParams(runtime runtimeType, helmSetParams []string) []str
 }
 
 func addOptOutLabel(namespace string, workloadType string, workloadName string) error {
+	return addLabel(
+		namespace,
+		workloadType,
+		workloadName,
+		"dash0.com/enable=false",
+	)
+}
+
+func addLabel(namespace string, workloadType string, workloadName string, label string) error {
 	return runAndIgnoreOutput(
 		exec.Command(
 			"kubectl",
@@ -398,7 +380,7 @@ func addOptOutLabel(namespace string, workloadType string, workloadName string) 
 			"--overwrite",
 			workloadType,
 			workloadName,
-			"dash0.com/enable=false",
+			label,
 		))
 }
 
@@ -413,4 +395,20 @@ func removeOptOutLabel(namespace string, workloadType string, workloadName strin
 			workloadName,
 			"dash0.com/enable-",
 		))
+}
+
+func helmReleaseName(runtime runtimeType, namespace string) string {
+	return truncateHelmReleaseName(runtime.helmReleasePrefix + "-" + namespace)
+}
+
+func truncateHelmReleaseName(releaseName string) string {
+	if len(releaseName) <= maxLengthHelmReleaseName {
+		return releaseName
+	}
+	shortReleaseName := releaseName[:maxLengthHelmReleaseName]
+	if !strings.HasSuffix(shortReleaseName, "-") {
+		return shortReleaseName
+	}
+	// if the release name ends with "-" after shortening (which is invalid), remove one more character
+	return shortReleaseName[:maxLengthHelmReleaseName-1]
 }

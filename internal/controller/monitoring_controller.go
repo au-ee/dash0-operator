@@ -5,35 +5,43 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/collectors"
 	"github.com/dash0hq/dash0-operator/internal/instrumentation"
 	"github.com/dash0hq/dash0-operator/internal/resources"
+	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/targetallocator"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 type MonitoringReconciler struct {
 	client.Client
 	clientset              *kubernetes.Clientset
+	namespacedApiClients   []NamespacedApiClient
 	instrumenter           *instrumentation.Instrumenter
 	collectorManager       *collectors.CollectorManager
 	targetAllocatorManager *targetallocator.TargetAllocatorManager
 	danglingEventsTimeouts *util.DanglingEventsTimeouts
+	operatorNamespace      string
 }
 
 type statusUpdateInfo struct {
@@ -43,6 +51,10 @@ type statusUpdateInfo struct {
 	currentInstrumentWorkloadsLabelSelector  string
 	previousTraceContextPropagators          *string
 	currentTraceContextPropagators           *string
+	previousCaptureSqlQueryParameters        *bool
+	currentCaptureSqlQueryParameters         *bool
+	previousLogCollectionEnabled             bool
+	currentLogCollectionEnabled              bool
 }
 
 const (
@@ -66,18 +78,22 @@ var (
 func NewMonitoringReconciler(
 	k8sClient client.Client,
 	clientset *kubernetes.Clientset,
+	namespacedApiClients []NamespacedApiClient,
 	instrumenter *instrumentation.Instrumenter,
 	collectorManager *collectors.CollectorManager,
 	targetAllocatorManager *targetallocator.TargetAllocatorManager,
 	danglingEventsTimeouts *util.DanglingEventsTimeouts,
+	operatorNamespace string,
 ) *MonitoringReconciler {
 	return &MonitoringReconciler{
 		Client:                 k8sClient,
 		clientset:              clientset,
+		namespacedApiClients:   namespacedApiClients,
 		instrumenter:           instrumenter,
 		collectorManager:       collectorManager,
 		targetAllocatorManager: targetAllocatorManager,
 		danglingEventsTimeouts: danglingEventsTimeouts,
+		operatorNamespace:      operatorNamespace,
 	}
 }
 
@@ -87,13 +103,14 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dash0v1beta1.Dash0Monitoring{}).
+		WithEventFilter(monitoringPredicate{}).
 		Complete(r)
 }
 
 func (r *MonitoringReconciler) InitializeSelfMonitoringMetrics(
 	meter otelmetric.Meter,
 	metricNamePrefix string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	reconcileRequestMetricName := fmt.Sprintf("%s%s", metricNamePrefix, "monitoring.reconcile_requests")
 	var err error
@@ -106,32 +123,25 @@ func (r *MonitoringReconciler) InitializeSelfMonitoringMetrics(
 	}
 }
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// It is essential for the controller's reconciliation loop to be idempotent. By following the Operator
-// pattern you will create Controllers which provide a reconcile function
-// responsible for synchronizing resources until the desired state is reached on the cluster.
-// Breaking this recommendation goes against the design principles of controller-runtime.
-// and may lead to unforeseen consequences such as resources becoming stuck and requiring manual intervention.
-// For further info:
-// - About Operator Pattern: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
-// - About Controllers: https://kubernetes.io/docs/concepts/architecture/controller/
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.16.3/pkg/reconcile
+// Reconcile is part of the main kubernetes reconciliation loop which aims to move the current state of the cluster
+// closer to the desired state. Needs to be idempotent.
 func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if monitoringReconcileRequestMetric != nil {
 		monitoringReconcileRequestMetric.Add(ctx, 1)
 	}
 
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("processing reconcile request for a monitoring resource")
 
-	namespaceStillExists, err := resources.CheckIfNamespaceExists(ctx, r.clientset, req.Namespace, &logger)
+	namespaceStillExists, err := resources.CheckIfNamespaceExists(ctx, r.clientset, req.Namespace, logger)
 	if err != nil {
 		// The error has already been logged in checkIfNamespaceExists.
 		return ctrl.Result{}, err
 	} else if !namespaceStillExists {
-		logger.Info("The namespace seems to have been deleted after this reconcile request has been scheduled. " +
-			"Ignoring the reconcile request.")
+		logger.Info(
+			"The namespace seems to have been deleted after this reconcile request has been scheduled. " +
+				"Ignoring the reconcile request.",
+		)
 		return ctrl.Result{}, nil
 	}
 
@@ -141,7 +151,7 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		req,
 		&dash0v1beta1.Dash0Monitoring{},
 		updateStatusFailedMessageMonitoring,
-		&logger,
+		logger,
 	)
 	if err != nil {
 		// For all errors, we assume it is a temporary error and requeue the request.
@@ -152,10 +162,10 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// prometheus scraping) after removing the monitoring resource from this namespace. Or, to be more precise,
 		// when r.reconcileOpenTelemetryCollector runs, the monitoring resource in this namespace is still present, but
 		// it is no longer marked as available.
-		if err = r.reconcileOpenTelemetryCollector(ctx, &logger); err != nil {
+		if err = r.reconcileOpenTelemetryCollector(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err = r.reconcileOpenTelemetryTargetAllocator(ctx, &logger); err != nil {
+		if err = r.reconcileOpenTelemetryTargetAllocator(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -165,32 +175,37 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	monitoringResource := checkResourceResult.Resource.(*dash0v1beta1.Dash0Monitoring)
+	defer func() {
+		monitoringResource.LogResourceAsEvent(logger)
+	}()
 
 	isFirstReconcile, err := resources.InitStatusConditions(
 		ctx,
 		r.Client,
 		monitoringResource,
 		monitoringResource.Status.Conditions,
-		&logger,
+		logger,
 	)
 	if err != nil {
 		// The error has already been logged in initStatusConditions
 		return ctrl.Result{}, err
 	}
+	logger.Debug("determined first reconcile status for monitoring resource", "isFirstReconcile", isFirstReconcile)
 
 	isMarkedForDeletion, runCleanupActions, err := resources.CheckImminentDeletionAndHandleFinalizers(
 		ctx,
 		r.Client,
 		monitoringResource,
 		dash0common.MonitoringFinalizerId,
-		&logger,
+		logger,
 	)
 	if err != nil {
 		// The error has already been logged in checkImminentDeletionAndHandleFinalizers
 		return ctrl.Result{}, err
 	} else if runCleanupActions {
 		// r.runCleanupActions will uninstrument workloads and then remove the finalizer.
-		err = r.runCleanupActions(ctx, monitoringResource, &logger)
+		logger.Debug("monitoring resource is marked for deletion, running cleanup actions")
+		err = r.runCleanupActions(ctx, monitoringResource, logger)
 		if err != nil {
 			// error has already been logged in runCleanupActions
 			return ctrl.Result{}, err
@@ -207,10 +222,10 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// resources.VerifyThatUniqueNonDegradedResourceExists check, due to checkResourceResult.ResourceDoesNotExist
 		// being true. We still want to handle this case correctly for good measure (reconcile the otel collector, then
 		// stop the reconcile of the monitoring resource).
-		if r.reconcileOpenTelemetryCollector(ctx, &logger) != nil {
+		if err = r.reconcileOpenTelemetryCollector(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
-		if r.reconcileOpenTelemetryTargetAllocator(ctx, &logger) != nil {
+		if err = r.reconcileOpenTelemetryTargetAllocator(ctx, logger); err != nil {
 			return ctrl.Result{}, err
 		}
 		// The Dash0 monitoring resource is slated for deletion, the finalizer has already been removed in the last
@@ -221,41 +236,132 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	var requiredAction util.ModificationMode
 	monitoringResource, requiredAction, statusUpdate :=
-		r.manageInstrumentWorkloadsChanges(monitoringResource, isFirstReconcile, &logger)
+		r.manageInstrumentWorkloadsChanges(monitoringResource, isFirstReconcile, logger)
 
-	if isFirstReconcile || requiredAction == util.ModificationModeInstrumentation {
-		if err = r.instrumenter.CheckSettingsAndInstrumentExistingWorkloads(ctx, monitoringResource, &logger); err != nil {
-			// The error has already been logged in checkSettingsAndInstrumentExistingWorkloads
-			logger.Info("Requeuing reconcile request.")
-			return ctrl.Result{}, err
-		}
-	} else if requiredAction == util.ModificationModeUninstrumentation {
-		if err = r.instrumenter.UninstrumentWorkloadsIfAvailable(ctx, monitoringResource, &logger); err != nil {
-			logger.Error(err, "Failed to uninstrument workloads, requeuing reconcile request.")
-			return ctrl.Result{}, err
+	if r.instrumenter != nil {
+		// If telemetry collection is disabled via Helm, the instrumenter is not initialized.
+		if isFirstReconcile || requiredAction == util.ModificationModeInstrumentation {
+			if err = r.instrumenter.CheckSettingsAndInstrumentExistingWorkloads(ctx, monitoringResource, logger); err != nil {
+				// The error has already been logged in checkSettingsAndInstrumentExistingWorkloads
+				logger.Info("Requeuing reconcile request.")
+				return ctrl.Result{}, err
+			}
+		} else if requiredAction == util.ModificationModeUninstrumentation {
+			if err = r.instrumenter.UninstrumentWorkloadsIfAvailable(ctx, monitoringResource, logger); err != nil {
+				logger.ErrorAsWarn(err, "Failed to uninstrument workloads, requeuing reconcile request.")
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
-	if err = r.updateStatusAfterReconcile(ctx, monitoringResource, statusUpdate, &logger); err != nil {
+	r.scheduleAttachDanglingEvents(ctx, monitoringResource, logger)
+
+	if err = r.updateStatusAfterReconcile(ctx, monitoringResource, statusUpdate, logger); err != nil {
 		// The error has already been logged in updateStatusAfterReconcile
 		return ctrl.Result{}, err
 	}
 
-	if r.reconcileOpenTelemetryCollector(ctx, &logger) != nil {
+	r.applyApiAccessSettings(ctx, monitoringResource, logger)
+
+	if err = r.reconcileOpenTelemetryCollector(ctx, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if r.reconcileOpenTelemetryTargetAllocator(ctx, &logger) != nil {
+	if err = r.reconcileOpenTelemetryTargetAllocator(ctx, logger); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	logger.Debug("reconciliations triggered by monitoring resource were successful")
 	return ctrl.Result{}, nil
+}
+
+func (r *MonitoringReconciler) applyApiAccessSettings(
+	ctx context.Context,
+	monitoringResource *dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) {
+	if monitoringResource.HasDash0ApiAccessConfigured() {
+		logger.Debug(
+			"applying API access settings for monitoring resource",
+			"namespace",
+			monitoringResource.Namespace,
+		)
+		var apiConfigs []ApiConfig
+		for idx, dash0Config := range monitoringResource.GetDash0Exports() {
+			token, err := selfmonitoringapiaccess.GetAuthTokenForDash0Export(
+				ctx,
+				r.Client,
+				r.operatorNamespace,
+				dash0Config,
+				logger,
+			)
+			if err != nil || token == nil {
+				logger.Warn(
+					fmt.Sprintf(
+						"Could not retrieve token for export #%d (endpoint: %s) in namespace %s. "+
+							"This export will be skipped, but other exports will continue to be processed.",
+						idx+1,
+						dash0Config.ApiEndpoint,
+						monitoringResource.Namespace,
+					),
+				)
+				continue
+			}
+			apiConfig := ApiConfig{
+				Endpoint: dash0Config.ApiEndpoint,
+				Dataset:  dash0Config.Dataset,
+				Token:    *token,
+			}
+			apiConfigs = append(apiConfigs, apiConfig)
+		}
+		if len(apiConfigs) == 0 {
+			logger.Info(
+				fmt.Sprintf(
+					"None of the configured exports in namespace %s have valid tokens. "+
+						"API sync in this namespace will attempt to use the defaults from the operator configuration.",
+					monitoringResource.Namespace,
+				),
+			)
+			for _, apiClient := range r.namespacedApiClients {
+				apiClient.RemoveNamespacedApiConfigs(ctx, monitoringResource.Namespace, logger)
+			}
+		} else {
+			for _, apiClient := range r.namespacedApiClients {
+				apiClient.SetNamespacedApiConfigs(
+					ctx,
+					monitoringResource.Namespace,
+					apiConfigs,
+					logger,
+				)
+			}
+		}
+	} else {
+		logger.Info(
+			fmt.Sprintf(
+				"The API config settings required for managing dashboards, check rules, synthetic checks and "+
+					"views via the operator are not set or have been removed from the monitoring resource in namespace %s. API sync will use "+
+					"defaults from the operator configuration.", monitoringResource.Namespace,
+			),
+		)
+		for _, apiClient := range r.namespacedApiClients {
+			apiClient.RemoveNamespacedApiConfigs(ctx, monitoringResource.Namespace, logger)
+		}
+	}
+
+	for _, apiClient := range r.namespacedApiClients {
+		apiClient.SetSynchronizationEnabled(
+			ctx,
+			monitoringResource.Namespace,
+			monitoringResource,
+			logger,
+		)
+	}
 }
 
 func (r *MonitoringReconciler) manageInstrumentWorkloadsChanges(
 	monitoringResource *dash0v1beta1.Dash0Monitoring,
 	isFirstReconcile bool,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (*dash0v1beta1.Dash0Monitoring, util.ModificationMode, statusUpdateInfo) {
 	previousInstrumentWorkloadsMode := monitoringResource.Status.PreviousInstrumentWorkloads.Mode
 	currentInstrumentWorkloadsMode := monitoringResource.ReadInstrumentWorkloadsMode()
@@ -266,20 +372,32 @@ func (r *MonitoringReconciler) manageInstrumentWorkloadsChanges(
 	previousTraceContextPropagators := monitoringResource.Status.PreviousInstrumentWorkloads.TraceContext.Propagators
 	currentTraceContextPropagators := monitoringResource.Spec.InstrumentWorkloads.TraceContext.Propagators
 
+	previousCaptureSqlQueryParameters := monitoringResource.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters
+	currentCaptureSqlQueryParameters := monitoringResource.Spec.InstrumentWorkloads.CaptureSqlQueryParameters
+
+	previousLogCollectionEnabled := pointers.ReadBoolPointerWithDefault(monitoringResource.Status.PreviousLogCollection.Enabled, true)
+	currentLogCollectionEnabled := pointers.ReadBoolPointerWithDefault(monitoringResource.Spec.LogCollection.Enabled, true)
+
 	var requiredAction util.ModificationMode
 	if !isFirstReconcile {
 		if previousInstrumentWorkloadsMode != dash0common.InstrumentWorkloadsModeAll && previousInstrumentWorkloadsMode != "" && currentInstrumentWorkloadsMode == dash0common.InstrumentWorkloadsModeAll {
-			logger.Info(fmt.Sprintf(
-				"The instrumentWorkloads mode has changed from \"%s\" to \"%s\" (or it is absent, in which case it"+
-					"defaults to \"all\"). Workloads in this namespace will now be instrumented so they send "+
-					"telemetry to Dash0.", previousInstrumentWorkloadsMode, currentInstrumentWorkloadsMode))
+			logger.Info(
+				fmt.Sprintf(
+					"The instrumentWorkloads mode has changed from \"%s\" to \"%s\" (or it is absent, in which case it"+
+						"defaults to \"all\"). Workloads in this namespace will now be instrumented so they send "+
+						"telemetry to Dash0.", previousInstrumentWorkloadsMode, currentInstrumentWorkloadsMode,
+				),
+			)
 			requiredAction = util.ModificationModeInstrumentation
 		} else if previousInstrumentWorkloadsMode != dash0common.InstrumentWorkloadsModeNone && currentInstrumentWorkloadsMode == dash0common.InstrumentWorkloadsModeNone {
-			logger.Info(fmt.Sprintf(
-				"The instrumentWorkloads mode has changed from \"%s\" to \"%s\". Instrumented workloads in this "+
-					"namespace will now be uninstrumented, they will no longer send telemetry to Dash0.",
-				previousInstrumentWorkloadsMode,
-				currentInstrumentWorkloadsMode))
+			logger.Info(
+				fmt.Sprintf(
+					"The instrumentWorkloads mode has changed from \"%s\" to \"%s\". Instrumented workloads in this "+
+						"namespace will now be uninstrumented, they will no longer send telemetry to Dash0.",
+					previousInstrumentWorkloadsMode,
+					currentInstrumentWorkloadsMode,
+				),
+			)
 			requiredAction = util.ModificationModeUninstrumentation
 		}
 
@@ -292,12 +410,24 @@ func (r *MonitoringReconciler) manageInstrumentWorkloadsChanges(
 			if strings.TrimSpace(previousLabelSelector) != strings.TrimSpace(currentLabelSelector) {
 				requiredAction = util.ModificationModeInstrumentation
 			}
-			if util.IsStringPointerValueDifferent(previousTraceContextPropagators, currentTraceContextPropagators) {
+			if pointers.IsStringPointerValueDifferent(previousTraceContextPropagators, currentTraceContextPropagators) {
+				requiredAction = util.ModificationModeInstrumentation
+			}
+			if pointers.ReadBoolPointerWithDefault(previousCaptureSqlQueryParameters, false) !=
+				pointers.ReadBoolPointerWithDefault(currentCaptureSqlQueryParameters, false) {
+				requiredAction = util.ModificationModeInstrumentation
+			}
+			if previousLogCollectionEnabled != currentLogCollectionEnabled {
 				requiredAction = util.ModificationModeInstrumentation
 			}
 		}
 	}
 
+	logger.Debug(
+		"manageInstrumentWorkloadsChanges has determined whether instrumentation needs to be updates",
+		"required action",
+		requiredAction,
+	)
 	return monitoringResource, requiredAction, statusUpdateInfo{
 		previousInstrumentWorkloadsMode:          previousInstrumentWorkloadsMode,
 		currentInstrumentWorkloadsMode:           currentInstrumentWorkloadsMode,
@@ -305,21 +435,31 @@ func (r *MonitoringReconciler) manageInstrumentWorkloadsChanges(
 		currentInstrumentWorkloadsLabelSelector:  currentLabelSelector,
 		previousTraceContextPropagators:          previousTraceContextPropagators,
 		currentTraceContextPropagators:           currentTraceContextPropagators,
+		previousCaptureSqlQueryParameters:        previousCaptureSqlQueryParameters,
+		currentCaptureSqlQueryParameters:         currentCaptureSqlQueryParameters,
+		previousLogCollectionEnabled:             previousLogCollectionEnabled,
+		currentLogCollectionEnabled:              currentLogCollectionEnabled,
 	}
 }
 
 func (r *MonitoringReconciler) runCleanupActions(
 	ctx context.Context,
 	monitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
-	if err := r.instrumenter.UninstrumentWorkloadsIfAvailable(
-		ctx,
-		monitoringResource,
-		logger,
-	); err != nil {
-		logger.Error(err, "Failed to uninstrument workloads, requeuing reconcile request.")
-		return err
+	if r.instrumenter != nil {
+		if err := r.instrumenter.UninstrumentWorkloadsIfAvailable(
+			ctx,
+			monitoringResource,
+			logger,
+		); err != nil {
+			logger.Error(err, "Failed to uninstrument workloads, requeuing reconcile request.")
+			return err
+		}
+	}
+
+	for _, apiClient := range r.namespacedApiClients {
+		apiClient.RemoveSynchronizationEnabled(monitoringResource.Namespace)
 	}
 
 	// The Dash0 monitoring resource will be deleted after this reconcile finished. We still need to update its status,
@@ -342,20 +482,128 @@ func (r *MonitoringReconciler) runCleanupActions(
 		return err
 	}
 
-	if finalizersUpdated := controllerutil.RemoveFinalizer(monitoringResource, dash0common.MonitoringFinalizerId); finalizersUpdated {
+	if finalizersUpdated := controllerutil.RemoveFinalizer(
+		monitoringResource,
+		dash0common.MonitoringFinalizerId,
+	); finalizersUpdated {
 		if err := r.Update(ctx, monitoringResource); err != nil {
-			logger.Error(err, "Failed to remove the finalizer from the Dash0 monitoring resource, requeuing reconcile "+
-				"request.")
+			logger.Error(
+				err, "Failed to remove the finalizer from the Dash0 monitoring resource, requeuing reconcile "+
+					"request.",
+			)
 			return err
 		}
 	}
 	return nil
 }
 
+func (r *MonitoringReconciler) scheduleAttachDanglingEvents(
+	ctx context.Context,
+	monitoringResource *dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) {
+	// execute the event attaching in a separate go routine to not block the main reconcile loop
+	go func() {
+		if r.danglingEventsTimeouts.InitialTimeout > 0 {
+			// wait a bit before attempting to attach dangling events, since the K8s resources do not exist yet when
+			// the webhook queues the events
+			time.Sleep(r.danglingEventsTimeouts.InitialTimeout)
+		}
+		r.attachDanglingEvents(ctx, monitoringResource, logger)
+	}()
+}
+
+// attachDanglingEvents attaches events that have been created by the webhook to the involved object of the event.
+// When the webhook creates the respective events, the workload might not exist yet, so the UID of the workload is not
+// set in the event. The list of events for that workload will not contain this event. We go the extra mile here and
+// retroactively fix the reference of all those events.
+//
+// Without doing this, the event will not show up in the event section of "kubectl describe" for the workload, because
+// kubectl always searches for related events with the object's uid.
+//
+// This code still uses the legacy event API, as the regarding.UID field is immutable in the new k8s.io/api/events/v1
+// API.
+func (r *MonitoringReconciler) attachDanglingEvents(
+	ctx context.Context,
+	monitoringResource *dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) {
+	namespace := monitoringResource.Namespace
+	legacyEventApi := r.clientset.CoreV1().Events(namespace)
+	backoff := r.danglingEventsTimeouts.Backoff
+	for _, eventType := range util.AllEvents {
+		retryErr := util.RetryWithCustomBackoff(
+			"attaching dangling event to involved object",
+			func() error {
+				danglingEvents, listErr := legacyEventApi.List(
+					ctx, metav1.ListOptions{
+						FieldSelector: fmt.Sprintf("involvedObject.uid=,reason=%s", eventType),
+					},
+				)
+				if listErr != nil {
+					return listErr
+				}
+
+				if len(danglingEvents.Items) > 0 {
+					logger.Info(fmt.Sprintf("Attempting to attach %d dangling event(s).", len(danglingEvents.Items)))
+				}
+
+				var allAttachErrors []error
+				for _, event := range danglingEvents.Items {
+					attachErr := util.AttachEventToInvolvedObject(ctx, r.Client, legacyEventApi, &event)
+					if attachErr != nil {
+						allAttachErrors = append(allAttachErrors, attachErr)
+					} else {
+						involvedObject := event.InvolvedObject
+						logger.Info(
+							fmt.Sprintf(
+								"Attached '%s' event (uid: %s) to its associated object (%s %s/%s).",
+								eventType, event.UID, involvedObject.Kind, involvedObject.Namespace, involvedObject.Name,
+							),
+						)
+					}
+				}
+				if len(allAttachErrors) > 0 {
+					return errors.Join(allAttachErrors...)
+				}
+
+				if len(danglingEvents.Items) > 0 {
+					logger.Info(
+						fmt.Sprintf(
+							"%d dangling event(s) have been successfully attached to its/their associated object(s).",
+							len(danglingEvents.Items),
+						),
+					)
+				}
+
+				return nil
+			},
+			backoff,
+			false,
+			false,
+			logger,
+		)
+
+		if retryErr != nil {
+			logger.ErrorAsWarn(
+				retryErr,
+				fmt.Sprintf("Could not attach all dangling events after %d retries.", backoff.Steps),
+			)
+		}
+	}
+}
+
 func (r *MonitoringReconciler) reconcileOpenTelemetryCollector(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
+	if r.collectorManager == nil {
+		// If telemetry collection is disabled via Helm, the collector manager is not initialized.
+		logger.Debug("collector manager is not initialized, possibly due to telemetry collection being disabled, " +
+			"skipping OpenTelemetry collector reconciliation")
+		return nil
+	}
+
 	// This will look up the operator configuration resource and all monitoring resources in the cluster (including
 	// the one that has just been reconciled, hence we must only do this _after_ this resource has been updated (e.g.
 	// marked as available). Otherwise, the reconciliation of the collectors would work with an outdated state.
@@ -370,8 +618,15 @@ func (r *MonitoringReconciler) reconcileOpenTelemetryCollector(
 
 func (r *MonitoringReconciler) reconcileOpenTelemetryTargetAllocator(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
+	if r.targetAllocatorManager == nil {
+		// If telemetry collection is disabled via Helm, the collector manager is not initialized.
+		logger.Debug("target allocator manager is not initialized, possibly due to telemetry collection being disabled, " +
+			"skipping OpenTelemetry target allocator reconciliation")
+		return nil
+	}
+
 	// This will look up the operator configuration resource and all monitoring resources in the cluster (including
 	// the one that has just been reconciled, hence we must only do this _after_ this resource has been updated (e.g.
 	// marked as available). Otherwise, the reconciliation of the collectors would work with an outdated state.
@@ -389,7 +644,7 @@ func (r *MonitoringReconciler) updateStatusAfterReconcile(
 	ctx context.Context,
 	monitoringResource *dash0v1beta1.Dash0Monitoring,
 	statusUpdate statusUpdateInfo,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	monitoringResource.EnsureResourceIsMarkedAsAvailable()
 	if statusUpdate.previousInstrumentWorkloadsMode != statusUpdate.currentInstrumentWorkloadsMode {
@@ -398,12 +653,62 @@ func (r *MonitoringReconciler) updateStatusAfterReconcile(
 	if strings.TrimSpace(statusUpdate.previousInstrumentWorkloadsLabelSelector) != strings.TrimSpace(statusUpdate.currentInstrumentWorkloadsLabelSelector) {
 		monitoringResource.Status.PreviousInstrumentWorkloads.LabelSelector = statusUpdate.currentInstrumentWorkloadsLabelSelector
 	}
-	if util.IsStringPointerValueDifferent(statusUpdate.previousTraceContextPropagators, statusUpdate.currentTraceContextPropagators) {
+	if pointers.IsStringPointerValueDifferent(
+		statusUpdate.previousTraceContextPropagators,
+		statusUpdate.currentTraceContextPropagators,
+	) {
 		monitoringResource.Status.PreviousInstrumentWorkloads.TraceContext.Propagators = statusUpdate.currentTraceContextPropagators
+	}
+	if pointers.ReadBoolPointerWithDefault(statusUpdate.previousCaptureSqlQueryParameters, false) !=
+		pointers.ReadBoolPointerWithDefault(statusUpdate.currentCaptureSqlQueryParameters, false) {
+		monitoringResource.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters = statusUpdate.currentCaptureSqlQueryParameters
+	}
+	if statusUpdate.previousLogCollectionEnabled != statusUpdate.currentLogCollectionEnabled ||
+		monitoringResource.Status.PreviousLogCollection.Enabled == nil {
+		currentLogCollectionEnabled := statusUpdate.currentLogCollectionEnabled
+		monitoringResource.Status.PreviousLogCollection.Enabled = &currentLogCollectionEnabled
 	}
 	if err := r.Status().Update(ctx, monitoringResource); err != nil {
 		logger.Error(err, updateStatusFailedMessageMonitoring)
 		return err
 	}
 	return nil
+}
+
+// An event filter that ignores changes in the status subresource but reacts on changes to spec, labels and
+// annotations. This is necessary because we update the status subresource when reconciling the resource, and without
+// the filter this would cause another no-op reconcile request. Additionally, third-party resource sync results are
+// written to the monitoring resource's status, which would also trigger unnecessary reconciliations.
+//
+// We also allow the transition of the Available condition to True to trigger a reconcile. This is needed because
+// reconcileOpenTelemetryCollector uses findAllMonitoringResources, which reads from the informer cache and filters by
+// Available=True. Due to cache lag, the first reconcile (triggered by the Create event) may run
+// reconcileOpenTelemetryCollector before the cache reflects the Available=True status that was just written. Allowing
+// this specific status transition ensures a second reconcile occurs after the cache has caught up.
+type monitoringPredicate struct {
+	predicate.Funcs
+}
+
+func (p monitoringPredicate) Update(e event.UpdateEvent) bool {
+	if e.ObjectOld == nil || e.ObjectNew == nil {
+		return true
+	}
+
+	oldObj, okOld := e.ObjectOld.(*dash0v1beta1.Dash0Monitoring)
+	newObj, okNew := e.ObjectNew.(*dash0v1beta1.Dash0Monitoring)
+
+	if !okOld || !okNew {
+		return true
+	}
+
+	if oldObj.DeletionTimestamp == nil && newObj.DeletionTimestamp != nil {
+		return true
+	}
+
+	specChanged := !reflect.DeepEqual(oldObj.Spec, newObj.Spec)
+	labelsChanged := !reflect.DeepEqual(oldObj.Labels, newObj.Labels)
+	annotationsChanged := !reflect.DeepEqual(oldObj.Annotations, newObj.Annotations)
+	availableBecameTrue := util.AvailableConditionBecameTrue(oldObj.Status.Conditions, newObj.Status.Conditions)
+
+	return specChanged || labelsChanged || annotationsChanged || availableBecameTrue
 }

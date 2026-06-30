@@ -47,23 +47,41 @@ fi
 if kubectl delete -n "$target_namespace" -f test-resources/customresources/dash0view/dash0view.yaml; then
   wait_for_third_party_resource_deletion="true"
 fi
-if kubectl delete -n "$target_namespace" -f test-resources/customresources/persesdashboard/persesdashboard.yaml; then
+if kubectl delete -n "$target_namespace" -f test-resources/customresources/dash0spamfilter/dash0spamfilter.yaml; then
+  wait_for_third_party_resource_deletion="true"
+fi
+if kubectl delete -n "$target_namespace" -f test-resources/customresources/persesdashboard/v1alpha2/persesdashboard.yaml; then
   wait_for_third_party_resource_deletion="true"
 fi
 if kubectl delete -n "$target_namespace" -f test-resources/customresources/prometheusrule/prometheusrule.yaml; then
   wait_for_third_party_resource_deletion="true"
 fi
+for notification_channel_file in test-resources/customresources/dash0notificationchannel/*.yaml; do
+  if kubectl delete -n "$target_namespace" -f "$notification_channel_file"; then
+    wait_for_third_party_resource_deletion="true"
+  fi
+done
+for signal_to_metrics_file in test-resources/customresources/dash0signaltometrics/*.yaml; do
+  if kubectl delete -n "$target_namespace" -f "$signal_to_metrics_file"; then
+    wait_for_third_party_resource_deletion="true"
+  fi
+done
+
 
 if [[ "$wait_for_third_party_resource_deletion" = "true" ]]; then
   echo "Waiting for third party resource deletion to be synchronized to the Dash0 API."
   sleep 2
 fi
 
-helm uninstall --namespace "$target_namespace" prometheus-crds --ignore-not-found || true
+helm uninstall --namespace "$operator_namespace" prometheus-crds --ignore-not-found || true
 
 kubectl delete -n "$target_namespace" -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
+kubectl delete -n test-namespace-1 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
 kubectl delete -n test-namespace-2 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
 kubectl delete -n test-namespace-3 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
+kubectl delete -n test-namespace-4 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
+kubectl delete -n test-namespace-5 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
+kubectl delete -n test-namespace-6 -f test-resources/customresources/dash0monitoring/dash0monitoring.yaml --wait=false || true
 sleep 1
 # If the cluster is in a bad state because an operator image has been deployed that terminates abruptly, the monitoring
 # resource's finalizer will block the deletion of the monitoring resource, and thus also the deletion of the
@@ -84,9 +102,15 @@ if [[ "${target_namespace}" != "default" ]] && [[ "${delete_namespaces}" = "true
   kubectl delete ns "${target_namespace}" --ignore-not-found
 fi
 if [[ "${delete_namespaces}" = "true" ]]; then
+  kubectl delete ns test-namespace-1 --ignore-not-found
   kubectl delete ns test-namespace-2 --ignore-not-found
   kubectl delete ns test-namespace-3 --ignore-not-found
+  kubectl delete ns test-namespace-4 --ignore-not-found
+  kubectl delete ns test-namespace-5 --ignore-not-found
+  kubectl delete ns test-namespace-6 --ignore-not-found
 fi
+
+helm uninstall --namespace "$operator_namespace" ebpf-profiler --ignore-not-found || true
 
 helm uninstall --namespace "$operator_namespace" dash0-operator --timeout 30s || true
 

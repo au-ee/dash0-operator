@@ -20,8 +20,7 @@ Note that the first option will also consume _all_ preceding line breaks, so if 
 use option 2.
 */}}
 
-{{- $root := . -}}
-{{- $hasNamespacedExporters := gt (len .NamespacedExporters) 0 -}}
+{{- $hasNamespacedExporters := gt (len .Exporters.Namespaced) 0 -}}
 
 extensions:
   health_check:
@@ -32,21 +31,69 @@ extensions:
   {{- if .EnableProfExtension }}
   pprof: {}
   {{- end }}
+{{- if .IntelligentEdge.Enabled }}
+  dash0settingsonedgeextension:
+    endpoint: {{ .IntelligentEdge.ApiEndpoint }}
+    auth_token: ${env:DASH0_SAMPLING_AUTH_TOKEN}
+{{- end }}
 
 connectors:
   forward/traces-processors: {}
   forward/metrics-processors: {}
   forward/logs-processors: {}
+  {{- if .ProfilingEnabled }}
+  forward/profiles-processors: {}
+  {{- end }}
   forward/traces-default-exporter: {}
   forward/metrics-default-exporter: {}
   forward/logs-default-exporter: {}
+{{- if .IntelligentEdge.Enabled }}
+{{- if .IntelligentEdge.SamplingEnabled }}
+  forward/traces-to-sampling: {}
+{{- end }}
+{{- if or .IntelligentEdge.RedMetricsMaxTimeSeries .IntelligentEdge.RedMetricsAdditionalSpanAttributes }}
+  dash0redmetrics:
+{{- if .IntelligentEdge.RedMetricsMaxTimeSeries }}
+    max_time_series: {{ .IntelligentEdge.RedMetricsMaxTimeSeries }}
+{{- end }}
+{{- if .IntelligentEdge.RedMetricsAdditionalSpanAttributes }}
+    additional_span_attributes:
+    {{- range $attr := .IntelligentEdge.RedMetricsAdditionalSpanAttributes }}
+    - '{{ $attr }}'
+    {{- end }}
+{{- end }}
+{{- else }}
+  dash0redmetrics: {}
+{{- end }}
+{{- if .IntelligentEdge.SignalToMetricsEnabled }}
+{{- if or .IntelligentEdge.SignalToMetricsMaxTimeSeries .IntelligentEdge.SignalToMetricsFlushInterval }}
+  dash0signaltometrics:
+{{- if .IntelligentEdge.SignalToMetricsMaxTimeSeries }}
+    max_time_series: {{ .IntelligentEdge.SignalToMetricsMaxTimeSeries }}
+{{- end }}
+{{- if .IntelligentEdge.SignalToMetricsFlushInterval }}
+    metrics_flush_interval: {{ .IntelligentEdge.SignalToMetricsFlushInterval }}
+{{- end }}
+{{- else }}
+  dash0signaltometrics: {}
+{{- end }}
+{{- end }}
+{{- end }}
+  {{- if .ProfilingEnabled }}
+  forward/profiles-default-exporter: {}
+  {{- end }}
 
   {{- if $hasNamespacedExporters }}
   routing/traces:
+{{- if .IntelligentEdge.Enabled }}
+    default_pipelines: [traces/ie-pre-sampling]
+{{- else }}
     default_pipelines: [traces/export/default]
+{{- end }}
     error_mode: ignore
     table:
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
       - context: resource
         condition: attributes["k8s.namespace.name"] == "{{ $ns }}"
         pipelines:
@@ -58,7 +105,8 @@ connectors:
     default_pipelines: [metrics/export/default]
     error_mode: ignore
     table:
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
       - context: resource
         condition: attributes["k8s.namespace.name"] == "{{ $ns }}"
         pipelines:
@@ -70,13 +118,29 @@ connectors:
     default_pipelines: [logs/export/default]
     error_mode: ignore
     table:
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
       - context: resource
         condition: attributes["k8s.namespace.name"] == "{{ $ns }}"
 
         pipelines:
         {{- range $i, $exporter := $exporters }}
           - logs/export/ns/{{ $ns }}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if and .ProfilingEnabled $hasNamespacedExporters }}
+  routing/profiles:
+    default_pipelines: [profiles/export/default]
+    error_mode: ignore
+    table:
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
+      - context: resource
+        condition: attributes["k8s.namespace.name"] == "{{ $ns }}"
+        pipelines:
+        {{- range $i, $exporter := $exporters }}
+          - profiles/export/ns/{{ $ns }}
         {{- end }}
     {{- end }}
   {{- end }}
@@ -125,6 +189,25 @@ receivers:
     {{- end }}
     k8s_api_config:
       auth_type: serviceAccount
+    {{- /*
+    As of version v0.146.0, the following volume-related resource attributes are deprecated but still enabled by
+    default. See for example
+    https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.146.0/receiver/kubeletstatsreceiver/metadata.yaml#L14
+    We have to disable them explicitly to avoid the associated warning log messages at collector startup.
+    */}}
+    resource_attributes:
+      aws.volume.id:
+        enabled: false
+      fs.type:
+        enabled: false
+      gce.pd.name:
+        enabled: false
+      glusterfs.endpoints.name:
+        enabled: false
+      glusterfs.path:
+        enabled: false
+      partition:
+        enabled: false
     metrics:
       container.cpu.usage:
         enabled: true
@@ -228,9 +311,15 @@ receivers:
 
   {{- $hasPrometheusScrapingEnabledForAtLeastOneNamespace := gt (len .NamespacesWithPrometheusScraping) 0 }}
 
-  {{- if $hasPrometheusScrapingEnabledForAtLeastOneNamespace }}
+  {{- if or $hasPrometheusScrapingEnabledForAtLeastOneNamespace (and .SelfMonitoringEnabled .PrometheusCrdSupportEnabled) }}
   prometheus:
-    {{- if .PrometheusCrdSupportEnabled }}
+    {{- if .DevelopmentMode }}
+    api_server:
+      enabled: true
+      server_config:
+        endpoint: "localhost:9191"
+    {{- end }}
+    {{- if and .PrometheusCrdSupportEnabled $hasPrometheusScrapingEnabledForAtLeastOneNamespace }}
     target_allocator:
       {{- if .TargetAllocatorMtlsEnabled }}
       endpoint: https://{{ .TargetAllocatorServiceName }}:443
@@ -247,14 +336,14 @@ receivers:
       {{- end }}
     {{- end }}
     config:
+      scrape_configs:
+      {{- if $hasPrometheusScrapingEnabledForAtLeastOneNamespace }}
       {{- /*
       This particular set of scrape config jobs (dash0-kubernetes-pods-scrape-config and
       dash0-kubernetes-pods-scrape-config-slow) is mostly a copy of
       https://github.com/prometheus-community/helm-charts/blob/5adf0ee898e8e5430471cb43a5f9532745c22f81/charts/prometheus/values.yaml
       to be compatible with the well-known configuration via annotations.
       */}}
-      scrape_configs:
-
       # The relabeling allows the actual pod scrape endpoint to be configured via the
       # following annotations:
       #
@@ -392,10 +481,59 @@ receivers:
           - source_labels: [__meta_kubernetes_pod_node_name]
             action: replace
             target_label: node
+      {{- end }}
+
+      {{- if and .SelfMonitoringEnabled .PrometheusCrdSupportEnabled }}
+      # The following job scrapes the prometheus endpoint exposed by the target-allocator.
+      - job_name: 'dash0-target-allocator-selfmonitoring'
+        honor_labels: true
+
+        kubernetes_sd_configs:
+          - role: pod
+            selectors:
+              - role: pod
+                label: {{ printf "app.kubernetes.io/instance=%s,app.kubernetes.io/name=%s" .TargetAllocatorAppKubernetesIoInstance .TargetAllocatorAppKubernetesIoName }}
+                field: "spec.nodeName=${K8S_NODE_NAME}"
+            namespaces:
+              names:
+                - "{{ .OperatorNamespace }}"
+
+        relabel_configs:
+          # set the scrape address from the pod IP and use the static port from the target-allocator
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: '$1:8080'
+          # labels to keep
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+        metric_relabel_configs:
+          # drop selected metrics
+          # note about opentelemetry_allocator_targets_unassigned: this would be an interesting metric, but it looks
+          # like its gauge does not get reset correctly atm, making it really misleading -> temporarily disabling it
+          - source_labels: [__name__]
+            regex: "go_.*|\
+              prometheus_sd_azure_.*|\
+              prometheus_sd_consul_.*|\
+              prometheus_sd_dns_.*|\
+              prometheus_sd_file_.*|\
+              prometheus_treecache_zookeeper.*|\
+              prometheus_sd_kuma_.*|\
+              prometheus_sd_linode.*|\
+              prometheus_sd_nomad_.*|\
+              opentelemetry_allocator_targets_unassigned"
+            action: drop
+      {{- end }}
   {{- end }}
 
   {{- if .NamespacesWithLogCollection }}
-  filelog:
+  file_log:
     include:
     {{- range $i, $namespace := .NamespacesWithLogCollection }}
       - /var/log/pods/{{ $namespace }}_*/*/*.log
@@ -410,25 +548,60 @@ receivers:
       type: container
   {{- end}}
 
+  {{- /*
+  Deliberately not checking $hasPrometheusScrapingEnabledForAtLeastOneNamespace here,to have logs in case the
+  target-allocator is running even though it shouldn't.
+  */}}
+  {{- if and .SelfMonitoringEnabled (or .PrometheusCrdSupportEnabled (and .IntelligentEdge.Enabled .IntelligentEdge.BarkerEnabled) .Agent0ConnectorEnabled) }}
+  file_log/selfmonitoring:
+    include:
+      {{- if .PrometheusCrdSupportEnabled }}
+      - /var/log/pods/{{ .OperatorNamespace }}_{{ .OperatorResourcesNamePrefix }}-opentelemetry-target-allocator*/*/*.log
+      {{- end }}
+      {{- if and .IntelligentEdge.Enabled .IntelligentEdge.BarkerEnabled }}
+      - /var/log/pods/{{ .OperatorNamespace }}_{{ .IntelligentEdge.BarkerName }}*/*/*.log
+      {{- end }}
+      {{- if .Agent0ConnectorEnabled }}
+      - /var/log/pods/{{ .OperatorNamespace }}_{{ .Agent0ConnectorDeploymentName }}*/*/*.log
+      {{- end }}
+    # the target-allocator starts faster than the collectors are created, we therefore need to read its logs from the
+    # beginning or we will miss the logs it prints during startup
+    start_at: beginning
+    storage: file_storage/filelogreceiver_offsets
+    include_file_path: true
+    include_file_name: false
+    include_file_record_number: true
+    operators:
+    - id: container-parser
+      max_log_size: 102400
+      type: container
+  {{- end}}
+
 processors:
-  {{- if .SendBatchMaxSize }}
+  {{- if or .SendBatchSize .SendBatchMaxSize }}
   batch:
+    {{- if .SendBatchSize }}
+    send_batch_size: {{ .SendBatchSize }}
+    {{- end }}
+    {{- if .SendBatchMaxSize }}
     send_batch_max_size: {{ .SendBatchMaxSize }}
+    {{- end }}
   {{- else }}
   batch: {}
   {{- end }}
 
   resourcedetection:
     detectors:
-    # note: later detectors override attributes provided by earlier detectors
-    - system
-    - ec2
+    # Note: Later detectors do *not* overwrite attributes provided by earlier detectors, hence more specific detectors
+    # must come first (e.g. eks before ec2 - both write to cloud.platform)
     - eks
     - ecs
+    - ec2
     - gcp
     - azure
     - aks
     - k8snode
+    - system
     timeout: 2s
     eks:
       node_from_env_var: K8S_NODE_NAME
@@ -441,9 +614,9 @@ processors:
           # hostname, see https://kubernetes.io/docs/concepts/containers/container-environment/#container-information.
           enabled: false
 
-  k8sattributes:
+  k8s_attributes:
     extract:
-      {{- if .DisableReplicasetInformer }}
+      {{- if .K8sAttributesDisableReplicasetInformer }}
       deployment_name_from_replicaset: true
       {{- end }}
       metadata:
@@ -453,7 +626,7 @@ processors:
       - k8s.daemonset.name
       - k8s.daemonset.uid
       - k8s.deployment.name
-      {{- if not .DisableReplicasetInformer }}
+      {{- if not .K8sAttributesDisableReplicasetInformer }}
       - k8s.deployment.uid
       {{- end }}
       - k8s.job.name
@@ -469,19 +642,40 @@ processors:
       - k8s.replicaset.uid
       - k8s.statefulset.name
       - k8s.statefulset.uid
-      # The following two work only if k8s.pod.uid and k8s.container.name are set
+      # The following three work only if k8s.pod.uid and k8s.container.name are set
+      - container.id
       - container.image.name
       - container.image.tag
-      {{- if .CollectPodLabelsAndAnnotationsEnabled }}
+      {{- if or .CollectNamespaceLabelsAndAnnotationsEnabled .CollectPodLabelsAndAnnotationsEnabled }}
       labels:
+        {{- if .CollectNamespaceLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.namespace.label.$$1
+          key_regex: (.*)
+          from: namespace
+        {{- end }}
+        {{- if .CollectPodLabelsAndAnnotationsEnabled }}
         - tag_name: k8s.pod.label.$$1
           key_regex: (.*)
           from: pod
+        {{- end }}
       annotations:
+        {{- if .CollectNamespaceLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.namespace.annotation.$$1
+          key_regex: (.*)
+          from: namespace
+        {{- end }}
+        {{- if .CollectPodLabelsAndAnnotationsEnabled }}
         - tag_name: k8s.pod.annotation.$$1
           key_regex: (.*)
           from: pod
-      {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- if .K8sAttributesWaitForMetadata }}
+    wait_for_metadata: true
+    {{- if .K8sAttributesWaitForMetadataTimeout }}
+    wait_for_metadata_timeout: {{ .K8sAttributesWaitForMetadataTimeout }}
+    {{- end }}
+    {{- end }}
     filter:
       node_from_env_var: K8S_NODE_NAME
     passthrough: false
@@ -494,6 +688,84 @@ processors:
         name: k8s.pod.uid
     - sources:
       - from: connection
+
+{{- if .ProfilingEnabled }}
+  k8s_attributes/profiles:
+    extract:
+      {{- if .K8sAttributesDisableReplicasetInformer }}
+      deployment_name_from_replicaset: true
+      {{- end }}
+      metadata:
+      - k8s.cluster.uid
+      - k8s.cronjob.name
+      - k8s.cronjob.uid
+      - k8s.daemonset.name
+      - k8s.daemonset.uid
+      - k8s.deployment.name
+      {{- if not .K8sAttributesDisableReplicasetInformer }}
+      - k8s.deployment.uid
+      {{- end }}
+      - k8s.job.name
+      - k8s.job.uid
+      - k8s.namespace.name
+      - k8s.node.name
+      - k8s.pod.hostname
+      - k8s.pod.ip
+      - k8s.pod.name
+      - k8s.pod.start_time
+      - k8s.pod.uid
+      - k8s.replicaset.name
+      - k8s.replicaset.uid
+      - k8s.statefulset.name
+      - k8s.statefulset.uid
+      # The following three work only if k8s.pod.uid and k8s.container.name are set
+      - container.id
+      - container.image.name
+      - container.image.tag
+      {{- if or .CollectNamespaceLabelsAndAnnotationsEnabled .CollectPodLabelsAndAnnotationsEnabled }}
+      labels:
+        {{- if .CollectNamespaceLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.namespace.label.$$1
+          key_regex: (.*)
+          from: namespace
+        {{- end }}
+        {{- if .CollectPodLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.pod.label.$$1
+          key_regex: (.*)
+          from: pod
+        {{- end }}
+      annotations:
+        {{- if .CollectNamespaceLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.namespace.annotation.$$1
+          key_regex: (.*)
+          from: namespace
+        {{- end }}
+        {{- if .CollectPodLabelsAndAnnotationsEnabled }}
+        - tag_name: k8s.pod.annotation.$$1
+          key_regex: (.*)
+          from: pod
+        {{- end }}
+    {{- end }}
+    {{- if .K8sAttributesWaitForMetadata }}
+    wait_for_metadata: true
+    {{- if .K8sAttributesWaitForMetadataTimeout }}
+    wait_for_metadata_timeout: {{ .K8sAttributesWaitForMetadataTimeout }}
+    {{- end }}
+    {{- end }}
+    filter:
+      node_from_env_var: K8S_NODE_NAME
+    passthrough: false
+    pod_association:
+    - sources:
+      - from: resource_attribute
+        name: container.id
+    - sources:
+      - from: resource_attribute
+        name: k8s.pod.ip
+    - sources:
+      - from: resource_attribute
+        name: k8s.pod.uid
+{{- end }}
 
   # Limit resource attributes to a reasonable maximum length. This is particularly important when transforming
   # Kubernetes pod annotations to resource attributes, which can hold up to 256KB of data.
@@ -511,8 +783,14 @@ processors:
       - context: resource
         statements:
         - truncate_all(resource.attributes, 2048)
+    {{- if .ProfilingEnabled }}
+    profile_statements:
+      - context: resource
+        statements:
+        - truncate_all(resource.attributes, 2048)
+    {{- end }}
 
-  {{- if $hasPrometheusScrapingEnabledForAtLeastOneNamespace }}
+  {{- if or $hasPrometheusScrapingEnabledForAtLeastOneNamespace (and .SelfMonitoringEnabled .PrometheusCrdSupportEnabled) }}
   transform/metrics/prometheus_service_attributes:
     error_mode: ignore
     metric_statements:
@@ -536,7 +814,7 @@ processors:
 
       # If the two rules above did not yield a result, remove the prometheus service name. Otherwise the service name
       # would become the name of the scrape job, e.g. "dash0-kubernetes-pods-scrape-config". It is better to not have
-      # any service name set as all than that, and let the backend merge the pod data with other telemetry for the pod,
+      # any service name set at all than that, and let the backend merge the pod data with other telemetry for the pod,
       # as other telemetry might have a service name. We also remove the service.instance.id that was potentially set by
       # the prometheus receiver, since its value (<host>:<port> of the scraped URL) is not useful either.
       - delete_key(resource.attributes, "service.instance.id") where IsMatch(resource.attributes["service.name"], "dash0-kubernetes-pods-scrape-config.*")
@@ -568,6 +846,21 @@ processors:
         action: insert
   {{- end }}
 
+  resource/dash0_operator_attributes:
+    attributes:
+      - key: dash0.operator.collector_managed_by
+        value: "dash0-operator"
+        action: upsert
+      - key: dash0.operator.collector_role
+        value: "daemonset"
+        action: upsert
+      - key: dash0.operator.version
+        value: "{{ .OperatorVersion }}"
+        action: upsert
+      - key: dash0.operator.uid
+        value: "{{ .PseudoClusterUid }}"
+        action: upsert
+
   {{- if .NamespaceOttlFilter }}
   # This is a standard filter which is always on; metrics collection receivers generate metrics for all namespaces in
   # the cluster, however, we only want to collect metrics from monitored namespaces, hence this filter.
@@ -576,6 +869,24 @@ processors:
     metrics:
       metric:
         - {{ .NamespaceOttlFilter }}
+  {{- end }}
+  {{- if and .ProfilingEnabled .NamespaceOttlFilter }}
+  # Similar to filter/metrics/only_monitored_namespaces, but for profiles: the eBPF profiler collects profiles from all
+  # processes on the node, hence we need to filter out profiles from non-monitored namespaces.
+  filter/profiles/only_monitored_namespaces:
+    profiles:
+      profile:
+        - {{ .NamespaceOttlFilter }}
+  {{- end }}
+  {{- if and .SelfMonitoringEnabled .IntelligentEdge.Enabled .IntelligentEdge.BarkerEnabled }}
+  # Barker's stdout logs are already collected by file_log/selfmonitoring, but the shared OpenTelemetry init helper also
+  # installs an OTLP log exporter whenever OTEL_EXPORTER_OTLP_ENDPOINT is set (no per-signal toggle), so barker also
+  # pushes its logs via OTLP. Drop those SDK-originated records to avoid duplicates. telemetry.sdk.language is set by
+  # the OTel SDK and absent on file_log-scraped records.
+  filter/logs/drop_barker_otlp_selfmonitoring:
+    logs:
+      log_record:
+        - 'resource.attributes["service.name"] == "barker" and resource.attributes["service.namespace"] == "dash0-operator" and resource.attributes["telemetry.sdk.language"] != nil'
   {{- end }}
 
   {{- if .CustomFilters.HasTraceFilters }}
@@ -693,6 +1004,119 @@ processors:
       {{- end }}
       {{- end }}
   {{- end }}
+  {{- if and .ProfilingEnabled .CustomFilters.HasProfileFilters }}
+  filter/profiles/custom_telemetry_filter:
+    error_mode: {{ .CustomFilters.ErrorMode }}
+    profiles:
+      {{- if .CustomFilters.ProfileConditions }}
+      profile:
+        {{- range $i, $condition := .CustomFilters.ProfileConditions }}
+        - '{{ $condition }}'
+        {{- end }}
+      {{- end }}
+  {{- end }}
+  {{- if and .ProfilingEnabled .CustomTransforms.HasProfileTransforms }}
+  transform/profiles/custom_telemetry_transform:
+    error_mode: {{ .CustomTransforms.GlobalErrorMode }}
+    profile_statements:
+      {{- range $i, $group := .CustomTransforms.ProfileGroups }}
+      - statements:
+          {{- range $i, $statement := $group.Statements }}
+          - '{{ $statement }}'
+          {{- end }}
+      {{- if $group.Conditions }}
+        conditions:
+          {{- range $i, $condition := $group.Conditions }}
+          - '{{ $condition }}'
+          {{- end }}
+      {{- end }}
+      {{- if $group.ErrorMode }}
+        error_mode: {{ $group.ErrorMode }}
+      {{- end }}
+      {{- if $group.Context }}
+        context: {{ $group.Context }}
+      {{- end }}
+      {{- end }}
+  {{- end }}
+
+{{- if .IntelligentEdge.Enabled }}
+  resource/ie_attributes:
+    attributes:
+    - key: dash0.org.technical.id
+      value: edge
+      action: upsert
+    - key: dash0.dataset
+      value: {{ .IntelligentEdge.Dataset }}
+      action: upsert
+  dash0resource: {}
+{{- if or .IntelligentEdge.OperationPreferSpanName .IntelligentEdge.OperationCardinalityRules }}
+  dash0operation:
+{{- if .IntelligentEdge.OperationPreferSpanName }}
+    prefer_span_name: true
+{{- end }}
+{{- if .IntelligentEdge.OperationCardinalityRules }}
+    cardinality_rules:
+    {{- range $rule := .IntelligentEdge.OperationCardinalityRules }}
+    - id: '{{ $rule.Id }}'
+{{- if $rule.SourceAttribute }}
+      source_attribute: '{{ $rule.SourceAttribute }}'
+{{- end }}
+{{- if $rule.QuickFilter }}
+      quick_filter: '{{ $rule.QuickFilter }}'
+{{- end }}
+      operation_matchers:
+      {{- range $m := $rule.OperationMatchers }}
+      - regex: '{{ $m.Regex }}'
+        replacements:
+        {{- range $r := $m.Replacements }}
+        - '{{ $r }}'
+        {{- end }}
+{{- if $m.QuickFilter }}
+        quick_filter: '{{ $m.QuickFilter }}'
+{{- end }}
+{{- if $m.Literal }}
+        literal: true
+{{- end }}
+      {{- end }}
+    {{- end }}
+{{- end }}
+{{- else }}
+  dash0operation: {}
+{{- end }}
+{{- if .IntelligentEdge.SpamFilterEnabled }}
+{{- if or .IntelligentEdge.SpamFilterCacheExpiration .IntelligentEdge.SpamFilterAllowNoSettingsExt }}
+  dash0filter:
+{{- if .IntelligentEdge.SpamFilterCacheExpiration }}
+    cache_expiration: {{ .IntelligentEdge.SpamFilterCacheExpiration }}
+{{- end }}
+{{- if .IntelligentEdge.SpamFilterAllowNoSettingsExt }}
+    allow_no_settings_ext: {{ .IntelligentEdge.SpamFilterAllowNoSettingsExt }}
+{{- end }}
+{{- else }}
+  dash0filter: {}
+{{- end }}
+{{- end }}
+{{- if .IntelligentEdge.SamplingEnabled }}
+  dash0sampling:
+    decision_maker_endpoint: {{ .IntelligentEdge.Endpoint }}
+    decision_maker_headers:
+      Authorization: Bearer ${env:DASH0_SAMPLING_AUTH_TOKEN}
+      Dash0-Dataset: {{ .IntelligentEdge.Dataset }}
+    decision_maker_insecure: {{ .IntelligentEdge.Insecure }}
+    default_dataset: {{ .IntelligentEdge.Dataset }}
+{{- if .IntelligentEdge.SamplingFallbackSampleRatio }}
+    fallback_sample_ratio: {{ .IntelligentEdge.SamplingFallbackSampleRatio }}
+{{- end }}
+{{- if .IntelligentEdge.SamplingDebug }}
+    debug: true
+{{- end }}
+    reservoir:
+      type: disk
+      data_dir: /var/lib/dash0/trace-reservoir
+      max_disk_bytes: {{ .IntelligentEdge.SamplingReservoirMaxDiskBytes }}
+      metric_level: {{ .IntelligentEdge.SamplingReservoirMetricLevel }}
+{{- end }}
+{{- end }}
 
   memory_limiter:
     check_interval: 1s
@@ -707,7 +1131,7 @@ exporters:
   debug: {}
   {{- end }}
 
-  {{- range $i, $exporter := .DefaultExporters }}
+  {{- range $i, $exporter := .Exporters.Default }}
   {{ $exporter.Name }}:
     endpoint: "{{ $exporter.Endpoint }}"
     {{- if $exporter.Insecure }}
@@ -726,9 +1150,25 @@ exporters:
     {{- if $exporter.Encoding }}
     encoding: "{{ $exporter.Encoding }}"
     {{- end }}
+    {{- if $exporter.Keepalive }}
+    keepalive:
+      {{- if $exporter.Keepalive.Time }}
+      time: "{{ $exporter.Keepalive.Time }}"
+      {{- end }}
+      {{- if $exporter.Keepalive.Timeout }}
+      timeout: "{{ $exporter.Keepalive.Timeout }}"
+      {{- end }}
+      {{- if $exporter.Keepalive.PermitWithoutStream }}
+      permit_without_stream: {{ $exporter.Keepalive.PermitWithoutStream }}
+      {{- end }}
+    {{- end }}
+    {{- if $exporter.BalancerName }}
+    balancer_name: "{{ $exporter.BalancerName }}"
+    {{- end }}
   {{- end }}
 
-  {{- range $ns, $exporters := .NamespacedExporters }}
+  {{- range $ns := .Exporters.AllNamespaceKeys }}
+  {{- $exporters := index $.Exporters.Namespaced $ns }}
   {{- range $i, $exporter := $exporters }}
   {{ $exporter.Name }}:
     endpoint: "{{ $exporter.Endpoint }}"
@@ -748,6 +1188,21 @@ exporters:
     {{- if $exporter.Encoding }}
     encoding: "{{ $exporter.Encoding }}"
     {{- end }}
+    {{- if $exporter.Keepalive }}
+    keepalive:
+      {{- if $exporter.Keepalive.Time }}
+      time: "{{ $exporter.Keepalive.Time }}"
+      {{- end }}
+      {{- if $exporter.Keepalive.Timeout }}
+      timeout: "{{ $exporter.Keepalive.Timeout }}"
+      {{- end }}
+      {{- if $exporter.Keepalive.PermitWithoutStream }}
+      permit_without_stream: {{ $exporter.Keepalive.PermitWithoutStream }}
+      {{- end }}
+    {{- end }}
+    {{- if $exporter.BalancerName }}
+    balancer_name: "{{ $exporter.BalancerName }}"
+    {{- end }}
   {{- end }}
   {{- end }}
 
@@ -757,6 +1212,9 @@ service:
   - file_storage/filelogreceiver_offsets
   {{- if .EnableProfExtension }}
   - pprof
+  {{- end }}
+  {{- if .IntelligentEdge.Enabled }}
+  - dash0settingsonedgeextension
   {{- end }}
 
   pipelines:
@@ -772,10 +1230,11 @@ service:
       processors:
         - memory_limiter
         - resourcedetection
-        - k8sattributes
+        - k8s_attributes
         {{- if .ClusterName }}
         - resource/clustername
         {{- end }}
+        - resource/dash0_operator_attributes
         {{- if .CustomFilters.HasTraceFilters }}
         - filter/traces/custom_telemetry_filter
         {{- end }}
@@ -784,16 +1243,64 @@ service:
         - transform/traces/custom_telemetry_transform
         {{- end }}
         - transform/resources
+        {{- if .IntelligentEdge.Enabled }}
+        - resource/ie_attributes
+        - dash0resource
+        - dash0operation
+        {{- if .IntelligentEdge.SpamFilterEnabled }}
+        - dash0filter
+        {{- end }}
+        {{- end }}
       exporters:
         {{- if $hasNamespacedExporters }}
         - routing/traces
+        {{- else if .IntelligentEdge.Enabled }}
+        {{- if .IntelligentEdge.SamplingEnabled }}
+        - forward/traces-to-sampling
+        {{- end }}
+        - dash0redmetrics
+        {{- if .IntelligentEdge.SignalToMetricsEnabled }}
+        - dash0signaltometrics
+        {{- end }}
+        {{- if not .IntelligentEdge.SamplingEnabled }}
+        - forward/traces-default-exporter
+        {{- end }}
         {{- else }}
         - forward/traces-default-exporter
         {{- end }}
+{{- if .IntelligentEdge.Enabled }}
+{{- if $hasNamespacedExporters }}
+
+    traces/ie-pre-sampling:
+      receivers:
+        - routing/traces
+      exporters:
+        {{- if .IntelligentEdge.SamplingEnabled }}
+        - forward/traces-to-sampling
+        {{- end }}
+        - dash0redmetrics
+        {{- if .IntelligentEdge.SignalToMetricsEnabled }}
+        - dash0signaltometrics
+        {{- end }}
+        {{- if not .IntelligentEdge.SamplingEnabled }}
+        - forward/traces-default-exporter
+        {{- end }}
+{{- end }}
+
+{{- if .IntelligentEdge.SamplingEnabled }}
+    traces/sampled:
+      receivers:
+        - forward/traces-to-sampling
+      processors:
+        - dash0sampling
+      exporters:
+        - forward/traces-default-exporter
+{{- end }}
+{{- end }}
 
     traces/export/default:
       receivers:
-        {{- if $hasNamespacedExporters }}
+        {{- if and $hasNamespacedExporters (not .IntelligentEdge.Enabled) }}
         - routing/traces
         {{- else }}
         - forward/traces-default-exporter
@@ -802,16 +1309,17 @@ service:
       {{- if (or .DevelopmentMode .DebugVerbosityDetailed) }}
         - debug
       {{- end }}
-      {{- range $i, $exporter := .DefaultExporters }}
+      {{- range $i, $exporter := .Exporters.Default }}
         - {{ $exporter.Name }}
       {{- end }}
 
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
     traces/export/ns/{{- $ns -}}:
       receivers:
         - routing/traces
       exporters:
-      {{- if (or $root.DevelopmentMode $root.DebugVerbosityDetailed) }}
+      {{- if (or $.DevelopmentMode $.DebugVerbosityDetailed) }}
         - debug
       {{- end }}
       {{- range $i, $exporter := $exporters }}
@@ -828,12 +1336,18 @@ service:
         {{- if .UseHostMetricsReceiver }}
         - hostmetrics
         {{- end }}
+        {{- if .IntelligentEdge.Enabled }}
+        - dash0redmetrics
+        {{- if .IntelligentEdge.SignalToMetricsEnabled }}
+        - dash0signaltometrics
+        {{- end }}
+        {{- end }}
       processors:
         - memory_limiter
       exporters:
         - forward/metrics-processors
 
-    {{- if $hasPrometheusScrapingEnabledForAtLeastOneNamespace }}
+    {{- if or $hasPrometheusScrapingEnabledForAtLeastOneNamespace (and .SelfMonitoringEnabled .PrometheusCrdSupportEnabled) }}
     metrics/prometheus-to-forwarder:
       receivers:
         - prometheus
@@ -849,10 +1363,11 @@ service:
         - forward/metrics-processors
       processors:
         - resourcedetection
-        - k8sattributes
+        - k8s_attributes
         {{- if .ClusterName }}
         - resource/clustername
         {{- end }}
+        - resource/dash0_operator_attributes
         {{- if .NamespaceOttlFilter }}
         - filter/metrics/only_monitored_namespaces
         {{- end }}
@@ -864,6 +1379,9 @@ service:
         - transform/metrics/custom_telemetry_transform
         {{- end }}
         - transform/resources
+        {{- if .IntelligentEdge.Enabled }}
+        - resource/ie_attributes
+        {{- end }}
       exporters:
         {{- if $hasNamespacedExporters }}
         - routing/metrics
@@ -882,16 +1400,17 @@ service:
         {{- if (or .DevelopmentMode .DebugVerbosityDetailed) }}
         - debug
         {{- end }}
-        {{- range $i, $exporter := .DefaultExporters }}
+        {{- range $i, $exporter := .Exporters.Default }}
         - {{ $exporter.Name }}
         {{- end }}
 
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
     metrics/export/ns/{{- $ns -}}:
       receivers:
         - routing/metrics
       exporters:
-        {{- if (or $root.DevelopmentMode $root.DebugVerbosityDetailed) }}
+        {{- if (or $.DevelopmentMode $.DebugVerbosityDetailed) }}
         - debug
         {{- end }}
         {{- range $i, $exporter := $exporters }}
@@ -904,13 +1423,26 @@ service:
         - otlp
       processors:
         - memory_limiter
+        {{- if and .SelfMonitoringEnabled .IntelligentEdge.Enabled .IntelligentEdge.BarkerEnabled }}
+        - filter/logs/drop_barker_otlp_selfmonitoring
+        {{- end }}
       exporters:
         - forward/logs-processors
 
     {{- if .NamespacesWithLogCollection }}
     logs/filelog-to-forwarder:
       receivers:
-        - filelog
+        - file_log
+      processors:
+        - memory_limiter
+      exporters:
+        - forward/logs-processors
+    {{- end }}
+
+    {{- if and .SelfMonitoringEnabled (or .PrometheusCrdSupportEnabled (and .IntelligentEdge.Enabled .IntelligentEdge.BarkerEnabled)) }}
+    logs/selfmonitoring-filelog-to-forwarder:
+      receivers:
+        - file_log/selfmonitoring
       processors:
         - memory_limiter
       exporters:
@@ -922,13 +1454,14 @@ service:
         - forward/logs-processors
       processors:
         - resourcedetection
-        - k8sattributes
+        - k8s_attributes
         {{- if .NamespacesWithLogCollection }}
         - transform/logs/filelog_service_attributes
         {{- end }}
         {{- if .ClusterName }}
         - resource/clustername
         {{- end }}
+        - resource/dash0_operator_attributes
         {{- if .CustomFilters.HasLogFilters }}
         - filter/logs/custom_telemetry_filter
         {{- end }}
@@ -937,11 +1470,21 @@ service:
         - transform/logs/custom_telemetry_transform
         {{- end }}
         - transform/resources
+        {{- if .IntelligentEdge.Enabled }}
+        - resource/ie_attributes
+        - dash0resource
+        {{- if .IntelligentEdge.SpamFilterEnabled }}
+        - dash0filter
+        {{- end }}
+        {{- end }}
       exporters:
         {{- if $hasNamespacedExporters }}
         - routing/logs
         {{- else }}
         - forward/logs-default-exporter
+        {{- end }}
+        {{- if and .IntelligentEdge.Enabled .IntelligentEdge.SignalToMetricsEnabled }}
+        - dash0signaltometrics
         {{- end }}
 
     logs/export/default:
@@ -955,16 +1498,17 @@ service:
         {{- if (or .DevelopmentMode .DebugVerbosityDetailed) }}
         - debug
         {{- end }}
-        {{- range $i, $exporter := .DefaultExporters }}
+        {{- range $i, $exporter := .Exporters.Default }}
         - {{ $exporter.Name }}
         {{- end }}
 
-    {{- range $ns, $exporters := .NamespacedExporters }}
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
     logs/export/ns/{{- $ns -}}:
       receivers:
         - routing/logs
       exporters:
-        {{- if (or $root.DevelopmentMode $root.DebugVerbosityDetailed) }}
+        {{- if (or $.DevelopmentMode $.DebugVerbosityDetailed) }}
         - debug
         {{- end }}
         {{- range $i, $exporter := $exporters }}
@@ -972,9 +1516,80 @@ service:
         {{- end }}
     {{- end }}
 
+    {{- if .ProfilingEnabled }}
+    profiles:
+      receivers:
+        - otlp
+      exporters:
+        - forward/profiles-processors
+
+    profiles/common-processors:
+      receivers:
+        - forward/profiles-processors
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - k8s_attributes/profiles
+        {{- if .ClusterName }}
+        - resource/clustername
+        {{- end }}
+        - resource/dash0_operator_attributes
+        {{- if .NamespaceOttlFilter }}
+        - filter/profiles/only_monitored_namespaces
+        {{- end }}
+        {{- if .CustomFilters.HasProfileFilters }}
+        - filter/profiles/custom_telemetry_filter
+        {{- end }}
+        {{- /* Note: the batch processor does not support profiles yet (upstream). */}}
+        {{- if .CustomTransforms.HasProfileTransforms }}
+        - transform/profiles/custom_telemetry_transform
+        {{- end }}
+        - transform/resources
+      exporters:
+        {{- if $hasNamespacedExporters }}
+        - routing/profiles
+        {{- else }}
+        - forward/profiles-default-exporter
+        {{- end }}
+
+    profiles/export/default:
+      receivers:
+        {{- if $hasNamespacedExporters }}
+        - routing/profiles
+        {{- else }}
+        - forward/profiles-default-exporter
+        {{- end}}
+      exporters:
+      {{- if (or .DevelopmentMode .DebugVerbosityDetailed) }}
+        - debug
+      {{- end }}
+      {{- range $i, $exporter := .Exporters.Default }}
+        - {{ $exporter.Name }}
+      {{- end }}
+
+    {{- range $ns := .Exporters.AllNamespaceKeys }}
+    {{- $exporters := index $.Exporters.Namespaced $ns }}
+    profiles/export/ns/{{- $ns -}}:
+      receivers:
+        - routing/profiles
+      exporters:
+      {{- if (or $.DevelopmentMode $.DebugVerbosityDetailed) }}
+        - debug
+      {{- end }}
+      {{- range $i, $exporter := $exporters }}
+        - {{ $exporter.Name }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
   {{- if .InternalTelemetryEnabled }}
   telemetry:
     resource:
+    {{- if .IntelligentEdge.Enabled }}
+      # IE collector image (v2.0.1940 at time of writing) ships OTel core v0.150.0, which only
+      # accepts the legacy flat-map schema for `service.telemetry.resource`. The declarative
+      # attributes block (below, in the else branch) was added in OTel core v0.151.0. Once the IE
+      # collector image bumps to v0.151.0+, drop this branch and keep only the declarative block.
       "k8s.cluster.uid": "{{- .PseudoClusterUid }}"
       {{- if .ClusterName }}
       "k8s.cluster.name": "{{- .ClusterName }}"
@@ -986,6 +1601,29 @@ service:
       "k8s.pod.uid": "${env:K8S_POD_UID}"
       "k8s.pod.name": "${env:K8S_POD_NAME}"
       "k8s.container.name": "opentelemetry-collector"
+    {{- else }}
+      attributes:
+        - name: k8s.cluster.uid
+          value: "{{ .PseudoClusterUid }}"
+        {{- if .ClusterName }}
+        - name: k8s.cluster.name
+          value: "{{ .ClusterName }}"
+        {{- end }}
+        - name: k8s.node.name
+          value: ${env:K8S_NODE_NAME}
+        - name: k8s.namespace.name
+          value: ${env:DASH0_OPERATOR_NAMESPACE}
+        - name: k8s.daemonset.uid
+          value: ${env:K8S_DAEMONSET_UID}
+        - name: k8s.daemonset.name
+          value: ${env:K8S_DAEMONSET_NAME}
+        - name: k8s.pod.uid
+          value: ${env:K8S_POD_UID}
+        - name: k8s.pod.name
+          value: ${env:K8S_POD_NAME}
+        - name: k8s.container.name
+          value: opentelemetry-collector
+    {{- end }}
 
   {{- if .SelfMonitoringMetricsConfig }}
   {{- .SelfMonitoringMetricsConfig }}

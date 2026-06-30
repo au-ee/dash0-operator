@@ -14,13 +14,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/collectors/otelcolresources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,7 +34,7 @@ var (
 
 var _ = Describe("The collector manager", Ordered, func() {
 	ctx := context.Background()
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	var createdObjectsCollectorManagerTest []client.Object
 
@@ -63,6 +63,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			clientset,
 			util.ExtraConfigDefaults,
 			false,
+			false,
 			oTelColResourceManager,
 		)
 	})
@@ -85,10 +86,12 @@ var _ = Describe("The collector manager", Ordered, func() {
 
 		It("should fail if no endpoint is provided", func() {
 			operatorConfig := LoadOperatorConfigurationResourceOrFail(ctx, k8sClient, Default)
-			operatorConfig.Spec.Export = &dash0common.Export{
-				Dash0: &dash0common.Dash0Configuration{
-					Authorization: dash0common.Authorization{
-						Token: &AuthorizationTokenTest,
+			operatorConfig.Spec.Exports = []dash0common.Export{
+				{
+					Dash0: &dash0common.Dash0Configuration{
+						Authorization: dash0common.Authorization{
+							Token: &AuthorizationTokenTest,
+						},
 					},
 				},
 			}
@@ -97,10 +100,12 @@ var _ = Describe("The collector manager", Ordered, func() {
 
 		It("should fail if neither authorization token nor secret ref are provided for Dash0 exporter", func() {
 			operatorConfig := LoadOperatorConfigurationResourceOrFail(ctx, k8sClient, Default)
-			operatorConfig.Spec.Export = &dash0common.Export{
-				Dash0: &dash0common.Dash0Configuration{
-					Endpoint:      EndpointDash0Test,
-					Authorization: dash0common.Authorization{},
+			operatorConfig.Spec.Exports = []dash0common.Export{
+				{
+					Dash0: &dash0common.Dash0Configuration{
+						Endpoint:      EndpointDash0Test,
+						Authorization: dash0common.Authorization{},
+					},
 				},
 			}
 			Expect(k8sClient.Update(ctx, operatorConfig)).To(HaveOccurred())
@@ -113,7 +118,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			_, err := collectorManager.oTelColResourceManager.DeleteResources(
 				ctx,
 				util.ExtraConfigDefaults,
-				&logger,
+				logger,
 			)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -149,11 +154,13 @@ var _ = Describe("The collector manager", Ordered, func() {
 				ctx,
 				k8sClient,
 				dash0v1beta1.Dash0MonitoringSpec{
-					Export: &dash0common.Export{
-						Dash0: &dash0common.Dash0Configuration{
-							Endpoint: EndpointDash0TestAlternative,
-							Authorization: dash0common.Authorization{
-								Token: &AuthorizationTokenTestAlternative,
+					Exports: []dash0common.Export{
+						{
+							Dash0: &dash0common.Dash0Configuration{
+								Endpoint: EndpointDash0TestAlternative,
+								Authorization: dash0common.Authorization{
+									Token: &AuthorizationTokenTestAlternative,
+								},
 							},
 						},
 					},
@@ -176,7 +183,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			)
@@ -261,7 +268,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			_, err := collectorManager.oTelColResourceManager.DeleteResources(
 				ctx,
 				util.ExtraConfigDefaults,
-				&logger,
+				logger,
 			)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -371,7 +378,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			Expect(hasBeenReconciled).To(BeTrue())
 			VerifyCollectorResources(ctx, k8sClient, operatorNamespace, EndpointDash0Test, AuthorizationDefaultEnvVar, AuthorizationTokenTest)
 
-			operatorConfiguration.Spec.TelemetryCollection.Enabled = ptr.To(false)
+			operatorConfiguration.Spec.TelemetryCollection.Enabled = new(false)
 			Expect(k8sClient.Update(ctx, operatorConfiguration)).To(Succeed())
 
 			hasBeenReconciled, err = collectorManager.ReconcileOpenTelemetryCollector(
@@ -453,7 +460,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			_, err := collectorManager.oTelColResourceManager.DeleteResources(
 				ctx,
 				util.ExtraConfigDefaults,
-				&logger,
+				logger,
 			)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -468,7 +475,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 			Expect(hasBeenReconciled).To(BeTrue())
 			VerifyCollectorResources(ctx, k8sClient, operatorNamespace, EndpointDash0Test, AuthorizationDefaultEnvVar, AuthorizationTokenTest)
 
-			collectorManager.UpdateExtraConfig(ctx, util.ExtraConfigDefaults, &logger)
+			collectorManager.UpdateExtraConfig(ctx, util.ExtraConfigDefaults, logger)
 			VerifyCollectorResources(ctx, k8sClient, operatorNamespace, EndpointDash0Test, AuthorizationDefaultEnvVar, AuthorizationTokenTest)
 		})
 
@@ -507,7 +514,7 @@ var _ = Describe("The collector manager", Ordered, func() {
 					Effect:   corev1.TaintEffectNoSchedule,
 				},
 			}
-			collectorManager.UpdateExtraConfig(ctx, changedConfig, &logger)
+			collectorManager.UpdateExtraConfig(ctx, changedConfig, logger)
 
 			ds_ := VerifyResourceExists(
 				ctx,

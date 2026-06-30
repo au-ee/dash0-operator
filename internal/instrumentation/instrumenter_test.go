@@ -7,15 +7,15 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/cluster"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -35,7 +35,7 @@ var (
 
 var _ = Describe("The instrumenter", Ordered, func() {
 	ctx := context.Background()
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	var createdObjectsInstrumenterTest []client.Object
 
 	var instrumenter *Instrumenter
@@ -57,9 +57,12 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			recorder,
 			util.NewClusterInstrumentationConfig(
 				TestImages,
+				PossibleCollectorUrlsTest,
 				OTelCollectorNodeLocalBaseUrlTest,
 				util.ExtraConfigDefaults,
+				cluster.ResolvedInstrumentationDeliveryInitContainer,
 				nil,
+				false,
 				false,
 			),
 		)
@@ -79,7 +82,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := config.CreateFn(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 
-			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 			VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
 			config.VerifyFn(config.GetFn(ctx, k8sClient, TestNamespaceName, name))
@@ -149,7 +152,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				job := CreateBasicJob(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, job)
 
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyFailedInstrumentationEvent(
 					ctx,
@@ -169,7 +172,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				pod := CreateBasicPod(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, pod)
 
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				// We do not instrument existing pods via the monitoring controller, since they cannot be restarted.
 				// We only instrument new pods via the webhook.
@@ -183,7 +186,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				pod := CreatePodOwnedByReplicaSet(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, pod)
 
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyUnmodifiedPod(GetPod(ctx, k8sClient, namespace, name))
@@ -195,7 +198,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				replicaSet := CreateReplicaSetOwnedByDeployment(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, replicaSet)
 
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyUnmodifiedReplicaSet(GetReplicaSet(ctx, k8sClient, namespace, name))
 			})
@@ -206,7 +209,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := config.CreateFn(ctx, k8sClient, namespace, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 
-			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 			VerifyNoEvents(ctx, clientset, namespace)
 			config.VerifyFn(config.GetFn(ctx, k8sClient, namespace, name))
@@ -254,7 +257,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				job := CreateJobWithOptOutLabel(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, job)
 
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyJobWithOptOutLabel(GetJob(ctx, k8sClient, namespace, name))
@@ -267,7 +270,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 			AddOptOutLabel(workload.GetObjectMeta())
 			UpdateWorkload(ctx, k8sClient, workload.Get())
-			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 			config.VerifyFn(config.GetFn(ctx, k8sClient, TestNamespaceName, name))
 			VerifySuccessfulUninstrumentationEvent(ctx, clientset, TestNamespaceName, name, testActor)
 		}, Entry("should remove Dash0 from an instrumented cron job when dash0.com/enable=false is added", WorkloadTestConfig{
@@ -315,7 +318,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload)
 				AddOptOutLabel(&workload.ObjectMeta)
 				UpdateWorkload(ctx, k8sClient, workload)
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 				VerifyModifiedJobAfterUnsuccessfulOptOut(GetJob(ctx, k8sClient, TestNamespaceName, name))
 				VerifyFailedUninstrumentationEvent(
 					ctx,
@@ -335,7 +338,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload)
 				AddOptOutLabel(&workload.ObjectMeta)
 				UpdateWorkload(ctx, k8sClient, workload)
-				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+				checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 				VerifyJobWithOptOutLabel(GetJob(ctx, k8sClient, TestNamespaceName, name))
 				VerifySuccessfulUninstrumentationEvent(
 					ctx,
@@ -374,7 +377,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, nameForWorkloadWithCustomOptIn, testActor)
@@ -405,7 +408,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -421,7 +424,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulUninstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -450,7 +453,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -466,7 +469,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulUninstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -499,7 +502,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -515,7 +518,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				ctx,
 				instrumenter,
 				dash0MonitoringResourceWithCustomLabelSelector,
-				&logger,
+				logger,
 			)
 
 			VerifySuccessfulUninstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -527,7 +530,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			name := UniqueName(config.WorkloadNamePrefix)
 			workload := config.CreateFn(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
-			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, &logger)
+			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenter, dash0MonitoringResource, logger)
 			config.VerifyFn(config.GetFn(ctx, k8sClient, TestNamespaceName, name))
 			VerifyNoEvents(ctx, clientset, TestNamespaceName)
 		}, Entry("should not touch a successfully instrumented cron job", WorkloadTestConfig{
@@ -580,7 +583,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := config.CreateFn(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 
-			uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+			uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 			VerifySuccessfulUninstrumentationEvent(ctx, clientset, namespace, name, testActor)
 			workload = config.GetFn(ctx, k8sClient, TestNamespaceName, name)
@@ -651,7 +654,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				job := CreateInstrumentedJob(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, job)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyFailedUninstrumentationEvent(
 					ctx,
@@ -671,7 +674,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				job := CreateJobForWhichAnInstrumentationAttemptHasFailed(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, job)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifySuccessfulUninstrumentationEvent(ctx, clientset, namespace, name, testActor)
 				VerifyUnmodifiedJob(GetJob(ctx, k8sClient, namespace, name))
@@ -683,7 +686,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				pod := CreateInstrumentedPod(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, pod)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyModifiedPod(GetPod(ctx, k8sClient, namespace, name), BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -702,7 +705,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				UpdateWorkload(ctx, k8sClient, pod)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, pod)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyModifiedPod(GetPod(ctx, k8sClient, namespace, name), BasicInstrumentedPodSpecExpectations(), IgnoreManagedFields)
@@ -714,7 +717,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				pod := CreatePodOwnedByReplicaSet(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, pod)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyUnmodifiedPod(GetPod(ctx, k8sClient, namespace, name))
@@ -726,7 +729,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				replicaSet := CreateReplicaSetOwnedByDeployment(ctx, k8sClient, namespace, name)
 				createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, replicaSet)
 
-				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+				uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 				VerifyNoEvents(ctx, clientset, namespace)
 				VerifyUnmodifiedReplicaSet(GetReplicaSet(ctx, k8sClient, namespace, name))
@@ -738,7 +741,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := config.CreateFn(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 
-			uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, &logger)
+			uninstrumentWorkloadsIfAvailable(ctx, instrumenter, dash0MonitoringResource, logger)
 
 			VerifyNoEvents(ctx, clientset, namespace)
 			workload = config.GetFn(ctx, k8sClient, namespace, name)
@@ -796,10 +799,13 @@ var _ = Describe("The instrumenter", Ordered, func() {
 				recorder,
 				util.NewClusterInstrumentationConfig(
 					TestImages,
+					PossibleCollectorUrlsTest,
 					OTelCollectorNodeLocalBaseUrlTest,
 					util.ExtraConfigDefaults,
+					cluster.ResolvedInstrumentationDeliveryInitContainer,
 					nil,
 					true,
+					false,
 				),
 			)
 
@@ -807,7 +813,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := CreateBasicDeployment(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload)
 
-			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenterWithDebug, dash0MonitoringResource, &logger)
+			checkSettingsAndInstrumentExistingWorkloads(ctx, instrumenterWithDebug, dash0MonitoringResource, logger)
 
 			instrumentedDeployment := GetDeployment(ctx, k8sClient, TestNamespaceName, name)
 			podSpec := instrumentedDeployment.Spec.Template.Spec
@@ -823,7 +829,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 		workload := config.CreateFn(ctx, k8sClient, namespace, name)
 		createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 
-		instrumenter.InstrumentAtStartup(ctx, &logger)
+		instrumenter.InstrumentAtStartup(ctx, logger)
 
 		VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
 		config.VerifyFn(config.GetFn(ctx, k8sClient, namespace, name))
@@ -871,7 +877,7 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			job := CreateBasicJob(ctx, k8sClient, namespace, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, job)
 
-			instrumenter.InstrumentAtStartup(ctx, &logger)
+			instrumenter.InstrumentAtStartup(ctx, logger)
 
 			VerifyFailedInstrumentationEvent(
 				ctx,
@@ -891,10 +897,10 @@ var _ = Describe("The instrumenter", Ordered, func() {
 		workload := config.CreateFn(ctx, k8sClient, TestNamespaceName, name)
 		createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload.Get())
 		workload.GetObjectMeta().Labels["dash0.com/operator-image"] = olderOperatorControllerImageLabel
-		workload.GetObjectMeta().Labels["dash0.com/init-container-image"] = olderInitContainerImageLabel
+		workload.GetObjectMeta().Labels["dash0.com/instrumentation-image"] = olderInitContainerImageLabel
 		UpdateWorkload(ctx, k8sClient, workload.Get())
 
-		instrumenter.InstrumentAtStartup(ctx, &logger)
+		instrumenter.InstrumentAtStartup(ctx, logger)
 
 		config.VerifyFn(config.GetFn(ctx, k8sClient, TestNamespaceName, name))
 		VerifySuccessfulInstrumentationEvent(ctx, clientset, namespace, name, testActor)
@@ -942,16 +948,16 @@ var _ = Describe("The instrumenter", Ordered, func() {
 			workload := CreateInstrumentedJob(ctx, k8sClient, TestNamespaceName, name)
 			createdObjectsInstrumenterTest = append(createdObjectsInstrumenterTest, workload)
 			workload.ObjectMeta.Labels["dash0.com/operator-image"] = "some-registry.com_1234_dash0hq_operator-controller_0.9.8"
-			workload.ObjectMeta.Labels["dash0.com/init-container-image"] = "some-registry.com_1234_dash0hq_instrumentation_2.3.4"
+			workload.ObjectMeta.Labels["dash0.com/instrumentation-image"] = "some-registry.com_1234_dash0hq_instrumentation_2.3.4"
 			UpdateWorkload(ctx, k8sClient, workload)
-			instrumenter.InstrumentAtStartup(ctx, &logger)
+			instrumenter.InstrumentAtStartup(ctx, logger)
 
 			// we do not attempt to update the instrumentation for jobs, since they are immutable
 			workload = GetJob(ctx, k8sClient, TestNamespaceName, name)
 			jobLabels := workload.ObjectMeta.Labels
 			Expect(jobLabels["dash0.com/instrumented"]).To(Equal("true"))
 			Expect(jobLabels["dash0.com/operator-image"]).To(Equal("some-registry.com_1234_dash0hq_operator-controller_0.9.8"))
-			Expect(jobLabels["dash0.com/init-container-image"]).To(Equal("some-registry.com_1234_dash0hq_instrumentation_2.3.4"))
+			Expect(jobLabels["dash0.com/instrumentation-image"]).To(Equal("some-registry.com_1234_dash0hq_instrumentation_2.3.4"))
 			VerifyNoEvents(ctx, clientset, namespace)
 		})
 	})
@@ -961,7 +967,7 @@ func checkSettingsAndInstrumentExistingWorkloads(
 	ctx context.Context,
 	instrumenter *Instrumenter,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	Expect(
 		instrumenter.CheckSettingsAndInstrumentExistingWorkloads(
@@ -975,7 +981,7 @@ func uninstrumentWorkloadsIfAvailable(
 	ctx context.Context,
 	instrumenter *Instrumenter,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	Expect(
 		instrumenter.UninstrumentWorkloadsIfAvailable(

@@ -192,16 +192,28 @@ type Dash0ViewRenderer string
 
 // Dash0ViewStatus defines the observed state of Dash0View
 type Dash0ViewStatus struct {
+	SynchronizationStatus  dash0common.Dash0ApiResourceSynchronizationStatus     `json:"synchronizationStatus"`
+	SynchronizedAt         metav1.Time                                           `json:"synchronizedAt"`
+	ValidationIssues       []string                                              `json:"validationIssues,omitempty"`
+	SynchronizationResults []Dash0ViewSynchronizationResultPerEndpointAndDataset `json:"synchronizationResults"`
+}
+
+// Dash0ViewSynchronizationResultPerEndpointAndDataset defines the synchronization result per endpoint and dataset
+type Dash0ViewSynchronizationResultPerEndpointAndDataset struct {
 	SynchronizationStatus dash0common.Dash0ApiResourceSynchronizationStatus `json:"synchronizationStatus"`
-	SynchronizedAt        metav1.Time                                       `json:"synchronizedAt"`
+	Dash0ApiEndpoint      string                                            `json:"dash0ApiEndpoint,omitempty"`
+	Dash0Dataset          string                                            `json:"dash0Dataset,omitempty"`
 	// +kubebuilder:validation:Optional
 	Dash0Id string `json:"dash0Id,omitempty"`
 	// +kubebuilder:validation:Optional
-	Dash0Origin string `json:"dash0Origin,omitempty"`
+	Dash0Origin          string `json:"dash0Origin,omitempty"`
+	SynchronizationError string `json:"synchronizationError,omitempty"`
+	// HttpStatusCode is the HTTP status code that the Dash0 API returned for the failed synchronization attempt, if the
+	// failure was caused by an unexpected HTTP response. It is 0 (absent) for successful synchronizations and for
+	// transport-level errors (network errors, timeouts) where no HTTP response was received. It is used to decide
+	// whether a failed synchronization should be retried.
 	// +kubebuilder:validation:Optional
-	Dash0Dataset         string   `json:"dash0Dataset,omitempty"`
-	SynchronizationError string   `json:"synchronizationError,omitempty"`
-	ValidationIssues     []string `json:"validationIssues,omitempty"`
+	HttpStatusCode int `json:"httpStatusCode,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -211,8 +223,4 @@ type Dash0ViewList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Dash0View `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&Dash0View{}, &Dash0ViewList{})
 }

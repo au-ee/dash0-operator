@@ -21,7 +21,6 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -33,15 +32,20 @@ const (
 	targetAllocatorCertsVolumeDir  = "/etc/certs/ta-server"
 
 	// label values
-	appKubernetesIoNameValue      = targetAllocator
-	appKubernetesIoInstanceValue  = "dash0-operator"
-	appKubernetesIoManagedByValue = "dash0-operator"
+	AppKubernetesIoNameValue      = targetAllocator
+	AppKubernetesIoInstanceValue  = "dash0-operator"
+	AppKubernetesIoManagedByValue = "dash0-operator"
+	gkeAutopilotAllowlistKey      = "cloud.google.com/matching-allowlist"
+	gkeAutopilotAllowlistValue    = "dash0-target-allocator-v1.0.3"
+
+	defaultUser  int64 = 65532
+	defaultGroup int64 = 0
 )
 
 var (
 	deploymentMatchLabels = map[string]string{
-		util.AppKubernetesIoNameLabel:     appKubernetesIoNameValue,
-		util.AppKubernetesIoInstanceLabel: appKubernetesIoInstanceValue,
+		util.AppKubernetesIoNameLabel:     AppKubernetesIoNameValue,
+		util.AppKubernetesIoInstanceLabel: AppKubernetesIoInstanceValue,
 	}
 )
 
@@ -56,6 +60,8 @@ type targetAllocatorConfig struct {
 
 	CollectorComponent string
 	Images             util.Images
+
+	IsGkeAutopilot bool
 }
 
 // This type just exists to ensure all created objects go through addCommonMetadata.
@@ -124,7 +130,7 @@ func assembleDesiredState(
 ) ([]clientObject, error) {
 	// sort namespaces so we don't re-trigger reconciliation because of unstable ordering
 	slices.Sort(namespacesWithPrometheusScraping)
-	var desiredState []clientObject
+	desiredState := make([]clientObject, 0, 6)
 	cm, err := assembleConfigMap(config, namespacesWithPrometheusScraping, extraConfig.TargetAllocatorMtlsEnabled, forDeletion)
 	if err != nil {
 		return desiredState, err
@@ -197,7 +203,6 @@ func assembleServiceAccount(c *targetAllocatorConfig) *corev1.ServiceAccount {
 			Namespace: c.OperatorNamespace,
 			Labels:    labels(),
 		},
-		AutomountServiceAccountToken: ptr.To(false),
 	}
 }
 
@@ -327,7 +332,6 @@ func assembleService(c *targetAllocatorConfig, extraConfig util.ExtraConfig) *co
 
 func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap, extraConfig util.ExtraConfig) (*appsv1.Deployment, error) {
 	replicas := int32(1)
-	defaultMode := int32(0444)
 	cmSha, err := getSHAfromConfigmap(taConfigMap)
 	if err != nil {
 		return nil, err
@@ -349,11 +353,6 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 			Name:      "config-volume",
 			MountPath: "/conf/",
 		},
-		{
-			Name:      "serviceaccount-token",
-			MountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
-			ReadOnly:  true,
-		},
 	}
 
 	if extraConfig.TargetAllocatorMtlsEnabled {
@@ -373,6 +372,17 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 		Image:        c.Images.TargetAllocatorImage,
 		Ports:        ports,
 		VolumeMounts: volumeMounts,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: new(false),
+			ReadOnlyRootFilesystem:   new(false),
+			RunAsNonRoot:             new(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
 		Env: []corev1.EnvVar{
 			{
 				Name:  util.EnvVarGoMemLimit,
@@ -381,6 +391,10 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 			{
 				Name:  "OTELCOL_NAMESPACE",
 				Value: c.OperatorNamespace,
+			},
+			{
+				Name:  "OTEL_SERVICE_NAME",
+				Value: targetAllocator,
 			},
 		},
 		LivenessProbe: &corev1.Probe{
@@ -421,47 +435,6 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 				},
 			},
 		},
-		{
-			Name: "serviceaccount-token",
-			VolumeSource: corev1.VolumeSource{
-				Projected: &corev1.ProjectedVolumeSource{
-					DefaultMode: &defaultMode,
-					Sources: []corev1.VolumeProjection{
-						{
-							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-								Path: "token",
-							},
-						},
-						{
-							ConfigMap: &corev1.ConfigMapProjection{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: "kube-root-ca.crt",
-								},
-								Items: []corev1.KeyToPath{
-									{
-										Key:  "ca.crt",
-										Path: "ca.crt",
-									},
-								},
-							},
-						},
-						{
-							DownwardAPI: &corev1.DownwardAPIProjection{
-								Items: []corev1.DownwardAPIVolumeFile{
-									{
-										Path: "namespace",
-										FieldRef: &corev1.ObjectFieldSelector{
-											APIVersion: "v1",
-											FieldPath:  "metadata.namespace",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
 	}
 
 	if extraConfig.TargetAllocatorMtlsEnabled {
@@ -476,11 +449,18 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 	}
 
 	taPodSpec := corev1.PodSpec{
-		ServiceAccountName:           ServiceAccountName(c.NamePrefix),
-		AutomountServiceAccountToken: ptr.To(false),
-		Tolerations:                  extraConfig.TargetAllocatorTolerations,
+		ServiceAccountName: ServiceAccountName(c.NamePrefix),
+		Tolerations:        extraConfig.TargetAllocatorTolerations,
 		Containers: []corev1.Container{
 			taContainer,
+		},
+		SecurityContext: &corev1.PodSecurityContext{
+			RunAsNonRoot: new(true),
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+			RunAsUser:  new(defaultUser),
+			RunAsGroup: new(defaultGroup),
 		},
 		Volumes: podVolumes,
 	}
@@ -491,14 +471,20 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 		}
 	}
 
+	templateLabels := labels()
+	if c.IsGkeAutopilot {
+		templateLabels[gkeAutopilotAllowlistKey] = gkeAutopilotAllowlistValue
+	}
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
 			Kind:       "Deployment",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      DeploymentName(c.NamePrefix),
-			Namespace: c.OperatorNamespace,
+			Name:        DeploymentName(c.NamePrefix),
+			Namespace:   c.OperatorNamespace,
+			Labels:      util.MergeMaps(labels(), extraConfig.TargetAllocatorLabels),
+			Annotations: util.MergeMaps(nil, extraConfig.TargetAllocatorAnnotations),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -507,8 +493,8 @@ func assembleDeployment(c *targetAllocatorConfig, taConfigMap *corev1.ConfigMap,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels(),
-					Annotations: podTemplateAnnotations,
+					Labels:      util.MergeMaps(templateLabels, extraConfig.TargetAllocatorPodLabels),
+					Annotations: util.MergeMaps(podTemplateAnnotations, extraConfig.TargetAllocatorPodAnnotations),
 				},
 				Spec: taPodSpec,
 			},
@@ -564,15 +550,15 @@ func addCommonMetadata(object client.Object) clientObject {
 
 func labels() map[string]string {
 	lbls := map[string]string{
-		util.AppKubernetesIoNameLabel:      appKubernetesIoNameValue,
-		util.AppKubernetesIoInstanceLabel:  appKubernetesIoInstanceValue,
-		util.AppKubernetesIoManagedByLabel: appKubernetesIoManagedByValue,
+		util.AppKubernetesIoNameLabel:      AppKubernetesIoNameValue,
+		util.AppKubernetesIoInstanceLabel:  AppKubernetesIoInstanceValue,
+		util.AppKubernetesIoManagedByLabel: AppKubernetesIoManagedByValue,
 	}
 	return lbls
 }
 
 func getSHAfromConfigmap(configmap *corev1.ConfigMap) (string, error) {
-	values := []string{}
+	values := make([]string, 0, len(configmap.Data)+len(configmap.BinaryData))
 	for k, v := range configmap.Data {
 		values = append(values, k+"="+v)
 	}

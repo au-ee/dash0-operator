@@ -8,11 +8,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -20,7 +19,7 @@ import (
 var _ = Describe("extra config map", func() {
 
 	ctx := context.Background()
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	type applyDefaultsTest struct {
 		input    *ResourceRequirementsWithGoMemLimit
@@ -429,6 +428,8 @@ var _ = Describe("extra config map", func() {
 					Expect(extraConfig.TargetAllocatorContainerResources.GoMemLimit).To(BeEmpty())
 					Expect(extraConfig.TargetAllocatorTolerations).To(HaveLen(0))
 					Expect(extraConfig.TargetAllocatorNodeAffinity).To(BeNil())
+
+					Expect(extraConfig.MonitoringTemplateRaw).To(BeNil())
 				})
 
 				It("should parse the config map content with all values set", func() {
@@ -606,6 +607,10 @@ targetAllocatorNodeAffinity:
         values:
         - value-07
         - value-08
+monitoringTemplate:
+  spec:
+    instrumentWorkloads:
+      mode: all
 `)
 					Expect(err).ToNot(HaveOccurred())
 
@@ -782,6 +787,8 @@ targetAllocatorNodeAffinity:
 					Expect(targetAllocatorAffinityPref[0].Preference.MatchExpressions[0].Operator).To(Equal(corev1.NodeSelectorOpIn))
 					Expect(targetAllocatorAffinityPref[0].Preference.MatchExpressions[0].Values).To(HaveLen(1))
 					Expect(targetAllocatorAffinityPref[0].Preference.MatchExpressions[0].Values[0]).To(Equal("value-09"))
+
+					Expect(extraConfig.MonitoringTemplateRaw).ToNot(BeNil())
 				})
 
 				It("should merge partial config and defaults", func() {
@@ -1136,7 +1143,7 @@ collectorDaemonSetConfigurationReloaderContainerResources:
 
 		It("without clients", func() {
 			watcher = NewExtraConfigWatcher()
-			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), &logger))
+			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), logger))
 
 			_, err := tmpFile.WriteString(`
 collectorFilelogOffsetStorageVolume:
@@ -1157,7 +1164,7 @@ collectorFilelogOffsetStorageVolume:
 			clients := []*DummyExtraConfigClient{
 				client1, client2,
 			}
-			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), &logger))
+			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), logger))
 
 			for _, c := range clients {
 				Expect(c.updatedConfig).To(BeNil())
@@ -1192,7 +1199,7 @@ collectorFilelogOffsetStorageVolume:
 			watcher = NewExtraConfigWatcher()
 			client := &DummyExtraConfigClient{}
 			watcher.AddClient(client)
-			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), &logger))
+			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), logger))
 
 			// Make three file updates in quick succession, the code to read and parse the new config map should only be
 			// called once, after the last update.
@@ -1241,7 +1248,7 @@ collectorFilelogOffsetStorageVolume:
 			watcher = NewExtraConfigWatcher()
 			client := &DummyExtraConfigClient{}
 			watcher.AddClient(client)
-			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), &logger))
+			Expect(watcher.watchConfigurationDirectory(tmpDir, tmpFile.Name(), logger))
 
 			// deliberately write invalid yaml to the file
 			_, err := tmpFile.WriteString(`
@@ -1262,7 +1269,7 @@ type DummyExtraConfigClient struct {
 	updatedConfig          *ExtraConfig
 }
 
-func (c *DummyExtraConfigClient) UpdateExtraConfig(_ context.Context, updatedConfig ExtraConfig, _ *logr.Logger) {
+func (c *DummyExtraConfigClient) UpdateExtraConfig(_ context.Context, updatedConfig ExtraConfig, _ logd.Logger) {
 	c.updateExtraConfigCalls += 1
 	c.updatedConfig = &updatedConfig
 }

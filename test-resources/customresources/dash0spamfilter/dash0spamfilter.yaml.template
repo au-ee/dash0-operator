@@ -1,0 +1,13 @@
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SpamFilter
+metadata:
+  name: drop-test-namespace-logs
+  labels:
+    dash0.com/dataset: $DASH0_DATASET
+spec:
+  contexts:
+    - log
+  filter:
+    - key: "k8s.namespace.name"
+      operator: "is"
+      value: "$TARGET_NAMESPACE"

@@ -19,10 +19,16 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+type helmSearchResult struct {
+	Version string `json:"version"`
+}
+
 const (
-	localHelmChart            = "helm-chart/dash0-operator"
-	operatorHelmReleaseName   = "e2e-tests-operator-hr"
-	defaultWebhookServiceName = "dash0-operator-webhook-service"
+	localHelmChart          = "helm-chart/dash0-operator"
+	operatorHelmReleaseName = "e2e-tests-operator-hr"
+
+	publishedChart    = "dash0-operator/dash0-operator"
+	publishedChartUrl = "https://dash0hq.github.io/dash0-operator"
 )
 
 var (
@@ -31,15 +37,21 @@ var (
 	operatorNamespace    = "e2e-operator-namespace"
 )
 
-func isLocalHelmChart() bool {
-	return operatorHelmChart == localHelmChart
+func determineOperatorHelmChart() {
+	operatorHelmChart = getEnvOrDefault("OPERATOR_HELM_CHART", operatorHelmChart)
+	operatorHelmChartUrl = getEnvOrDefault("OPERATOR_HELM_CHART_URL", operatorHelmChartUrl)
+}
+
+func isLocalHelmChart(chart string) bool {
+	return chart == localHelmChart
 }
 
 func deployOperatorWithDefaultAutoOperationConfiguration(
 	operatorNamespace string,
 	operatorHelmChart string,
 	operatorHelmChartUrl string,
-	images Images,
+	operatorHelmChartVersion string,
+	images *Images,
 	selfMonitoringEnabled bool,
 	additionalHelmParameters map[string]string,
 ) {
@@ -47,6 +59,7 @@ func deployOperatorWithDefaultAutoOperationConfiguration(
 		operatorNamespace,
 		operatorHelmChart,
 		operatorHelmChartUrl,
+		operatorHelmChartVersion,
 		images,
 		&startup.OperatorConfigurationValues{
 			Endpoint:              defaultEndpoint,
@@ -56,6 +69,7 @@ func deployOperatorWithDefaultAutoOperationConfiguration(
 			KubernetesInfrastructureMetricsCollectionEnabled: true,
 			CollectPodLabelsAndAnnotationsEnabled:            true,
 			PrometheusCrdSupportEnabled:                      false,
+			TelemetryCollectionEnabled:                       true,
 		},
 		additionalHelmParameters,
 	)
@@ -67,13 +81,15 @@ func deployOperatorWithoutAutoOperationConfiguration(
 	operatorNamespace string,
 	operatorHelmChart string,
 	operatorHelmChartUrl string,
-	images Images,
+	operatorHelmChartVersion string,
+	images *Images,
 	additionalHelmParameters map[string]string,
 ) {
 	err := deployOperator(
 		operatorNamespace,
 		operatorHelmChart,
 		operatorHelmChartUrl,
+		operatorHelmChartVersion,
 		images,
 		nil,
 		additionalHelmParameters,
@@ -85,26 +101,152 @@ func deployOperator(
 	operatorNamespace string,
 	operatorHelmChart string,
 	operatorHelmChartUrl string,
-	images Images,
+	operatorHelmChartVersion string,
+	images *Images,
 	operatorConfigurationValues *startup.OperatorConfigurationValues,
 	additionalHelmParameters map[string]string,
 ) error {
-	ensureDash0OperatorHelmRepoIsInstalled(operatorHelmChart, operatorHelmChartUrl)
+	return executeOperatorHelmChart(
+		"install",
+		operatorNamespace,
+		operatorHelmChart,
+		operatorHelmChartUrl,
+		operatorHelmChartVersion,
+		images,
+		operatorConfigurationValues,
+		additionalHelmParameters,
+	)
+}
+
+// deployPreviousOperatorRelease deploys the "previous" chart release from the published Helm chart and returns the
+// version it has deployed. The term "previous" has a slightly different meaning, depending on whether the test suite as
+// a whole is running with the local Helm chart or the published Helm chart.
+//   - When running the test suite with the local Helm chart, it will install the most recent release. For the
+//     "operator upgrade" test suite, this verifies that users running the currently published release can upgrade
+//     to the next release, which will be built from the current state of local source code.
+//   - When running the test suite with the published Helm chart, it will install the release before the most recent
+//     release. For the "operator upgrade" test suite, this verifies that users running the previous release can upgrade
+//     to the current release.
+//
+// The version of the installed release is returned as a string.
+func deployPreviousOperatorRelease() string {
+	version := ""
+	// check whether the test suite generally runs with the local Helm chart the published Helm chart
+	if isLocalHelmChart(operatorHelmChart) {
+		// The test suite is running against a local Helm chart. The "previous release" is the most recently
+		// published chart happens to be.
+		version = readLatestPublishedChartVersion(publishedChart, publishedChartUrl)
+	} else {
+		// The test suite is already running against the published chart. We need to install the version before the most
+		// recently published version.
+		version = readPreviousPublishedChartVersion(publishedChart, publishedChartUrl)
+	}
+
+	By("installing version " + version + " of the operator Helm chart")
+	deployOperatorWithDefaultAutoOperationConfiguration(
+		operatorNamespace,
+		publishedChart,
+		publishedChartUrl,
+		version,
+		nil, // no image overrides, use the images from the published Helm chart
+		true,
+		nil,
+	)
+	return version
+}
+
+func readLatestPublishedChartVersion(chart string, chartUrl string) string {
+	return readHelmChartVersion(chart, chartUrl, 0)
+}
+
+func readPreviousPublishedChartVersion(chart string, chartUrl string) string {
+	return readHelmChartVersion(chart, chartUrl, 1)
+}
+
+func readHelmChartVersion(chart string, chartUrl string, index int64) string {
+	// "helm search repo" searches local repositories; and "helm search repo $chart --versions --output json" will
+	// return process exit code 0 and simply output "[]" if the repository is not installed locally. We need to make
+	// sure the dash0-operator repository has been installed locally.
+	ensureDash0OperatorHelmRepoIsInstalledAndUpToDate(chart, chartUrl)
+	output, err := run(exec.Command("helm", "search", "repo", chart, "--versions", "--output", "json"))
+	Expect(err).ToNot(HaveOccurred())
+	var results []helmSearchResult
+	Expect(json.Unmarshal([]byte(output), &results)).To(
+		Succeed(),
+		"cannot parse helm search repo output for %s\n%s",
+		chart,
+		output,
+	)
+	Expect(len(results)).To(
+		BeNumerically(">=", index+1),
+		"expected at least %d published version(s) of %s to be available, but found only %d; full output of helm "+
+			"repository search command: %s",
+		index+1,
+		chart,
+		len(results),
+		output,
+	)
+
+	// helm search repo returns versions sorted by semver descending; index 0 is the latest, index 1 is the previous.
+	version := results[index].Version
+	e2ePrint("found helm chart version %s.\n", version)
+	Expect(version).ToNot(BeEmpty())
+	Expect(version).To(MatchRegexp("\\d+\\.\\d+\\.\\d+"))
+	return version
+}
+
+func upgradeOperator(
+	operatorNamespace string,
+	operatorHelmChart string,
+	operatorHelmChartUrl string,
+	operatorHelmChartVersion string,
+	images *Images,
+	operatorConfigurationValues *startup.OperatorConfigurationValues,
+	additionalHelmParameters map[string]string,
+) error {
+	return executeOperatorHelmChart(
+		"upgrade",
+		operatorNamespace,
+		operatorHelmChart,
+		operatorHelmChartUrl,
+		operatorHelmChartVersion,
+		images,
+		operatorConfigurationValues,
+		additionalHelmParameters,
+	)
+}
+
+func executeOperatorHelmChart(
+	helmCommand string,
+	operatorNamespace string,
+	operatorHelmChart string,
+	operatorHelmChartUrl string,
+	operatorHelmChartVersion string,
+	images *Images,
+	operatorConfigurationValues *startup.OperatorConfigurationValues,
+	additionalHelmParameters map[string]string,
+) error {
+	ensureDash0OperatorHelmRepoIsInstalledAndUpToDate(operatorHelmChart, operatorHelmChartUrl)
 
 	By(
 		fmt.Sprintf(
-			"deploying the operator controller to namespace %s",
+			"running helm %s for the operator helm chart, deploying to namespace %s",
+			helmCommand,
 			operatorNamespace,
 		))
 	arguments := []string{
-		"install",
+		helmCommand,
 		"--wait",
 		"--namespace",
 		operatorNamespace,
-		"--create-namespace",
-		"--set", "operator.developmentMode=true",
 	}
-	arguments = addHelmParametersForImages(arguments, images)
+	if helmCommand == "install" {
+		arguments = append(arguments, "--create-namespace")
+	}
+	arguments = append(arguments, "--set", "operator.developmentMode=true")
+	if images != nil {
+		arguments = addHelmParametersForImages(arguments, *images)
+	}
 
 	if operatorConfigurationValues != nil {
 		arguments = setHelmParameter(arguments, "operator.dash0Export.enabled", "true")
@@ -124,23 +266,34 @@ func deployOperator(
 		arguments = setHelmParameter(arguments, "operator.clusterName", e2eKubernetesContext)
 		arguments = setHelmParameter(arguments, "operator.selfMonitoringEnabled",
 			operatorConfigurationValues.SelfMonitoringEnabled)
+		arguments = setHelmParameter(arguments, "operator.telemetryCollectionEnabled",
+			operatorConfigurationValues.TelemetryCollectionEnabled)
+		if operatorConfigurationValues.ProfilingEnabled {
+			arguments = setHelmParameter(arguments, "operator.profilingEnabled", "true")
+		}
 	}
 
 	if additionalHelmParameters != nil {
 		arguments = setAdditionalHelmParameters(arguments, additionalHelmParameters)
 	}
-
 	arguments = append(arguments, operatorHelmReleaseName)
 	arguments = append(arguments, operatorHelmChart)
+	if operatorHelmChartVersion != "" {
+		arguments = append(arguments, "--version", operatorHelmChartVersion)
+	}
 
 	output, err := run(exec.Command("helm", arguments...))
 	if err != nil {
 		return err
 	}
 
-	e2ePrint("output of helm install:\n%s\n", output)
+	e2ePrint("output of helm %s:\n%s\n", helmCommand, output)
 
-	if operatorConfigurationValues != nil {
+	if (operatorConfigurationValues != nil && operatorConfigurationValues.TelemetryCollectionEnabled) ||
+		helmCommand == "upgrade" {
+		// If an operatorConfigurationValues has been provided with telemetry collection enabled, collectors will be
+		// deployed, and we should wait until they are ready. If this is a helm upgrade, the collectors should already
+		// be running anyway.
 		waitForCollectorToStart(operatorNamespace, operatorHelmChart)
 	}
 
@@ -153,10 +306,10 @@ func addHelmParametersForImages(arguments []string, images Images) []string {
 	arguments = setIfNotEmpty(arguments, "operator.image.digest", images.operator.digest)
 	arguments = setIfNotEmpty(arguments, "operator.image.pullPolicy", images.operator.pullPolicy)
 
-	arguments = setIfNotEmpty(arguments, "operator.initContainerImage.repository", images.instrumentation.repository)
-	arguments = setIfNotEmpty(arguments, "operator.initContainerImage.tag", images.instrumentation.tag)
-	arguments = setIfNotEmpty(arguments, "operator.initContainerImage.digest", images.instrumentation.digest)
-	arguments = setIfNotEmpty(arguments, "operator.initContainerImage.pullPolicy", images.instrumentation.pullPolicy)
+	arguments = setIfNotEmpty(arguments, "operator.instrumentationImage.repository", images.instrumentation.repository)
+	arguments = setIfNotEmpty(arguments, "operator.instrumentationImage.tag", images.instrumentation.tag)
+	arguments = setIfNotEmpty(arguments, "operator.instrumentationImage.digest", images.instrumentation.digest)
+	arguments = setIfNotEmpty(arguments, "operator.instrumentationImage.pullPolicy", images.instrumentation.pullPolicy)
 
 	arguments = setIfNotEmpty(arguments, "operator.collectorImage.repository", images.collector.repository)
 	arguments = setIfNotEmpty(arguments, "operator.collectorImage.tag", images.collector.tag)
@@ -193,6 +346,25 @@ func addHelmParametersForImages(arguments []string, images Images) []string {
 	arguments = setIfNotEmpty(arguments, "operator.targetAllocatorImage.digest", images.targetAllocator.digest)
 	arguments = setIfNotEmpty(arguments, "operator.targetAllocatorImage.pullPolicy", images.targetAllocator.pullPolicy)
 
+	arguments = setIfNotEmpty(arguments, "operator.intelligentEdgeCollectorImage.repository",
+		images.intelligentEdgeCollector.repository)
+	arguments = setIfNotEmpty(arguments, "operator.intelligentEdgeCollectorImage.tag",
+		images.intelligentEdgeCollector.tag)
+	arguments = setIfNotEmpty(arguments, "operator.intelligentEdgeCollectorImage.digest",
+		images.intelligentEdgeCollector.digest)
+	arguments = setIfNotEmpty(arguments, "operator.intelligentEdgeCollectorImage.pullPolicy",
+		images.intelligentEdgeCollector.pullPolicy)
+
+	arguments = setIfNotEmpty(arguments, "operator.barkerImage.repository", images.barker.repository)
+	arguments = setIfNotEmpty(arguments, "operator.barkerImage.tag", images.barker.tag)
+	arguments = setIfNotEmpty(arguments, "operator.barkerImage.digest", images.barker.digest)
+	arguments = setIfNotEmpty(arguments, "operator.barkerImage.pullPolicy", images.barker.pullPolicy)
+
+	arguments = setIfNotEmpty(arguments, "operator.agent0ConnectorImage.repository", images.agent0Connector.repository)
+	arguments = setIfNotEmpty(arguments, "operator.agent0ConnectorImage.tag", images.agent0Connector.tag)
+	arguments = setIfNotEmpty(arguments, "operator.agent0ConnectorImage.digest", images.agent0Connector.digest)
+	arguments = setIfNotEmpty(arguments, "operator.agent0ConnectorImage.pullPolicy", images.agent0Connector.pullPolicy)
+
 	return arguments
 }
 
@@ -216,34 +388,36 @@ func setHelmParameter(arguments []string, key string, value interface{}) []strin
 	return arguments
 }
 
-func ensureDash0OperatorHelmRepoIsInstalled(
-	operatorHelmChart string,
-	operatorHelmChartUrl string,
+func ensureDash0OperatorHelmRepoIsInstalledAndUpToDate(
+	chart string,
+	chartUrl string,
 ) {
-	if isLocalHelmChart() && operatorHelmChartUrl == "" {
-		// installing from local Helm chart sources, no action required
+	isLocal := isLocalHelmChart(chart)
+	if isLocal && chartUrl == "" {
+		// local Helm chart sources, no further action required
 		return
-	} else if isLocalHelmChart() && operatorHelmChartUrl != "" {
+	} else if isLocal {
 		Fail("Invalid test setup: When setting a URL for the Helm chart (OPERATOR_HELM_CHART_URL), you also need to " +
 			"provide a custom name (OPERATOR_HELM_CHART).")
-	} else if !isLocalHelmChart() && operatorHelmChartUrl == "" {
+	} else if chartUrl == "" {
 		Fail("Invalid test setup: When setting a non-standard name for the operator Helm chart " +
 			"(OPERATOR_HELM_CHART), you also need to provide a URL from where to install it (OPERATOR_HELM_CHART_URL).")
-	} else if operatorHelmChartUrl != "" && !strings.Contains(operatorHelmChart, "/") {
+	} else if !strings.Contains(chart, "/") {
 		Fail("Invalid test setup: When using a Helm chart URL (OPERATOR_HELM_CHART_URL), the provided Helm chart " +
 			"name (OPERATOR_HELM_CHART) needs to have the format ${repository}/${chart_name}.")
 	}
-	repositoryName := operatorHelmChart[:strings.LastIndex(operatorHelmChart, "/")]
+
+	repositoryName := chart[:strings.LastIndex(chart, "/")]
 	By(fmt.Sprintf("checking whether the operator Helm chart repo %s (%s) has been installed",
-		repositoryName, operatorHelmChartUrl))
+		repositoryName, chartUrl))
 	repoList, err := run(exec.Command("helm", "repo", "list"))
-	Expect(err).NotTo(HaveOccurred())
+	Expect(err).To(Or(Not(HaveOccurred()), MatchError(ContainSubstring("no repositories to show"))))
 	if !regexp.MustCompile(
-		fmt.Sprintf("%s\\s+%s", repositoryName, operatorHelmChartUrl)).MatchString(repoList) {
+		fmt.Sprintf("%s\\s+%s", repositoryName, chartUrl)).MatchString(repoList) {
 		e2ePrint(
 			"The helm repo %s (%s) has not been found, adding it now.\n",
 			repositoryName,
-			operatorHelmChartUrl,
+			chartUrl,
 		)
 		Expect(runAndIgnoreOutput(
 			exec.Command(
@@ -251,7 +425,7 @@ func ensureDash0OperatorHelmRepoIsInstalled(
 				"repo",
 				"add",
 				repositoryName,
-				operatorHelmChartUrl,
+				chartUrl,
 				"--force-update",
 			))).To(Succeed())
 		Expect(runAndIgnoreOutput(exec.Command("helm", "repo", "update"))).To(Succeed())
@@ -259,7 +433,7 @@ func ensureDash0OperatorHelmRepoIsInstalled(
 		e2ePrint(
 			"The helm repo %s (%s) is already installed, updating it now.\n",
 			repositoryName,
-			operatorHelmChartUrl,
+			chartUrl,
 		)
 		Expect(runAndIgnoreOutput(
 			exec.Command(
@@ -307,34 +481,6 @@ func verifyDash0OperatorReleaseIsNotInstalled(g Gomega, operatorNamespace string
 		fmt.Sprintf("namespace/%s", operatorNamespace),
 		"--timeout=60s",
 	))).To(Succeed())
-}
-
-func upgradeOperator(
-	operatorNamespace string,
-	operatorHelmChart string,
-	operatorHelmChartUrl string,
-	images Images,
-) {
-	ensureDash0OperatorHelmRepoIsInstalled(operatorHelmChart, operatorHelmChartUrl)
-
-	By("upgrading the operator controller")
-	arguments := []string{
-		"upgrade",
-		"--wait",
-		"--namespace",
-		operatorNamespace,
-		"--set", "operator.developmentMode=true",
-	}
-	arguments = addHelmParametersForImages(arguments, images)
-
-	arguments = append(arguments, operatorHelmReleaseName)
-	arguments = append(arguments, operatorHelmChart)
-
-	output, err := run(exec.Command("helm", arguments...))
-	Expect(err).NotTo(HaveOccurred())
-	e2ePrint("output of helm upgrade:\n%s\n", output)
-
-	waitForCollectorToStart(operatorNamespace, operatorHelmChart)
 }
 
 func verifyOperatorManagerPodMemoryUsageIsReasonable() {

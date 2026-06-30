@@ -28,6 +28,7 @@ import (
 	"github.com/dash0hq/dash0-operator/internal/targetallocator"
 	"github.com/dash0hq/dash0-operator/internal/targetallocator/taresources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/cluster"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -100,9 +101,12 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorder("dash0-monitoring-controller"),
 		util.NewClusterInstrumentationConfig(
 			TestImages,
+			PossibleCollectorUrlsTest,
 			OTelCollectorNodeLocalBaseUrlTest,
 			util.ExtraConfigDefaults,
+			cluster.ResolvedInstrumentationDeliveryInitContainer,
 			nil,
+			false,
 			false,
 		),
 	)
@@ -121,6 +125,7 @@ var _ = BeforeSuite(func() {
 		k8sClient,
 		clientset,
 		util.ExtraConfigDefaults,
+		false,
 		false,
 		oTelColResourceManager,
 	)
@@ -145,10 +150,12 @@ var _ = BeforeSuite(func() {
 	reconciler = controller.NewMonitoringReconciler(
 		k8sClient,
 		clientset,
+		nil,
 		instrumenter,
 		collectorManager,
 		targetAllocatorManager,
 		&DanglingEventsTimeoutsTest,
+		OperatorNamespace,
 	)
 })
 

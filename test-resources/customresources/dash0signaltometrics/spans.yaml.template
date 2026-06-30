@@ -1,0 +1,20 @@
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SignalToMetrics
+metadata:
+  name: nodejs-test-endpoint-latency
+  labels:
+    dash0.com/dataset: $DASH0_DATASET
+spec:
+  enabled: true
+  display:
+    name: Node.js test endpoint latency
+  match:
+    signal: spans
+    filters:
+      - key: http.route
+        operator: is
+        value: /dash0-k8s-operator-test
+  output:
+    name: nodejs.test_endpoint.duration
+    description: Latency distribution of requests to the Node.js test endpoint
+    interval: 30s

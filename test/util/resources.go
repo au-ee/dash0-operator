@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
@@ -43,10 +42,10 @@ var (
 			Value: "/__otel_auto_instrumentation",
 		}},
 		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Privileged:               ptr.To(false),
-			ReadOnlyRootFilesystem:   ptr.To(true),
-			RunAsNonRoot:             ptr.To(false),
+			AllowPrivilegeEscalation: new(false),
+			Privileged:               new(false),
+			ReadOnlyRootFilesystem:   new(true),
+			RunAsNonRoot:             new(false),
 			RunAsUser:                &ArbitraryNumer,
 			RunAsGroup:               &ArbitraryNumer,
 		},
@@ -351,7 +350,7 @@ func CreateInstrumentedJob(
 
 func JobForWhichAnInstrumentationAttemptHasFailed(namespace string, name string) *batchv1.Job {
 	workload := BasicJob(namespace, name)
-	addInstrumentationLabels(&workload.ObjectMeta, false)
+	addInstrumentationLabelsAndAnnotations(&workload.ObjectMeta, false)
 	return workload
 }
 
@@ -985,7 +984,7 @@ func InstrumentedDeploymentWithMoreBellsAndWhistles(namespace string, name strin
 
 func simulateInstrumentedResource(podTemplateSpec *corev1.PodTemplateSpec, meta *metav1.ObjectMeta) {
 	simulateInstrumentedPodSpec(&podTemplateSpec.Spec, meta)
-	addInstrumentationLabels(&podTemplateSpec.ObjectMeta, true)
+	addInstrumentationLabelsAndAnnotations(&podTemplateSpec.ObjectMeta, true)
 	addPodAnnotations(&podTemplateSpec.ObjectMeta)
 	AddManagedFields(meta)
 }
@@ -1026,12 +1025,16 @@ func simulateInstrumentedPodSpec(podSpec *corev1.PodSpec, meta *metav1.ObjectMet
 			Value: common.ProtocolHttpProtobuf,
 		},
 		{
+			Name:  "OTEL_LOGS_EXPORTER",
+			Value: "none",
+		},
+		{
 			Name:  "LD_PRELOAD",
 			Value: "/__otel_auto_instrumentation/injector/libotelinject.so",
 		},
 		{
 			Name:  "OTEL_INJECTOR_CONFIG_FILE",
-			Value: "/__otel_auto_instrumentation/injector/otelinject.conf",
+			Value: "/__otel_auto_instrumentation/injector/injector.conf",
 		},
 		{
 			Name: "OTEL_INJECTOR_K8S_NAMESPACE_NAME",
@@ -1063,7 +1066,7 @@ func simulateInstrumentedPodSpec(podSpec *corev1.PodSpec, meta *metav1.ObjectMet
 		},
 	}
 
-	addInstrumentationLabels(meta, true)
+	addInstrumentationLabelsAndAnnotations(meta, true)
 }
 
 func GetCronJob(
@@ -1181,11 +1184,12 @@ func GetStatefulSet(
 	return workload
 }
 
-func addInstrumentationLabels(meta *metav1.ObjectMeta, successful bool) {
+func addInstrumentationLabelsAndAnnotations(meta *metav1.ObjectMeta, successful bool) {
 	AddLabel(meta, "dash0.com/instrumented", strconv.FormatBool(successful))
 	AddLabel(meta, "dash0.com/operator-image", "some-registry.com_1234_dash0hq_operator-controller_1.2.3")
-	AddLabel(meta, "dash0.com/init-container-image", "some-registry.com_1234_dash0hq_instrumentation_4.5.6")
+	AddLabel(meta, "dash0.com/instrumentation-image", "some-registry.com_1234_dash0hq_instrumentation_4.5.6")
 	AddLabel(meta, "dash0.com/instrumented-by", "someone")
+	AddAnnotation(meta, "dash0.com/instrumentation-delivery", "init-container")
 }
 
 func addPodAnnotations(meta *metav1.ObjectMeta) {
@@ -1226,11 +1230,11 @@ func AddManagedFields(meta *metav1.ObjectMeta) {
 	meta.ManagedFields = append(meta.ManagedFields, metav1.ManagedFieldsEntry{
 		Manager:    util.FieldManager,
 		Operation:  metav1.ManagedFieldsOperationUpdate,
-		Time:       ptr.To(metav1.Now()),
+		Time:       new(metav1.Now()),
 		FieldsType: "FieldsV1",
 		FieldsV1: &metav1.FieldsV1{
 			//nolint:lll
-			Raw: []byte(`{\"f:metadata\":{\"f:labels\":{\".\":{},\"f:dash0.com/init-container-image\":{},\"f:dash0.com/instrumented\":{},\"f:dash0.com/instrumented-by\":{},\"f:dash0.com/operator-image\":{}}},\"f:spec\":{\"f:template\":{\"f:metadata\":{\"f:labels\":{\"f:dash0.com/init-container-image\":{},\"f:dash0.com/instrumented\":{},\"f:dash0.com/instrumented-by\":{},\"f:dash0.com/operator-image\":{}}},\"f:spec\":{\"f:containers\":{\"k:{\\\"name\\\":\\\"test-container-0\\\"}\":{\"f:env\":{\".\":{},\"k:{\\\"name\\\":\\\"DASH0_NODE_IP\\\"}\":{\".\":{},\"f:name\":{},\"f:valueFrom\":{\".\":{},\"f:fieldRef\":{}}},\"k:{\\\"name\\\":\\\"DASH0_OTEL_COLLECTOR_BASE_URL\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}},\"k:{\\\"name\\\":\\\"OTEL_EXPORTER_OTLP_ENDPOINT\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}},\"k:{\\\"name\\\":\\\"LD_PRELOAD\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}}},\"f:volumeMounts\":{\".\":{},\"k:{\\\"mountPath\\\":\\\"/__dash0__\\\"}\":{\".\":{},\"f:mountPath\":{},\"f:name\":{}}}}},\"f:initContainers\":{\".\":{},\"k:{\\\"name\\\":\\\"dash0-instrumentation\\\"}\":{\".\":{},\"f:env\":{\".\":{},\"k:{\\\"name\\\":\\\"DASH0_INSTRUMENTATION_FOLDER_DESTINATION\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}}},\"f:image\":{},\"f:imagePullPolicy\":{},\"f:name\":{},\"f:resources\":{},\"f:securityContext\":{\".\":{},\"f:allowPrivilegeEscalation\":{},\"f:privileged\":{},\"f:readOnlyRootFilesystem\":{},\"f:runAsGroup\":{},\"f:runAsUser\":{}},\"f:terminationMessagePath\":{},\"f:terminationMessagePolicy\":{},\"f:volumeMounts\":{\".\":{},\"k:{\\\"mountPath\\\":\\\"/__otel_auto_instrumentation\\\"}\":{\".\":{},\"f:mountPath\":{},\"f:name\":{}}}}},\"f:volumes\":{\".\":{},\"k:{\\\"name\\\":\\\"dash0-instrumentation\\\"}\":{\".\":{},\"f:emptyDir\":{\".\":{},\"f:sizeLimit\":{}},\"f:name\":{}}}}}}}`),
+			Raw: []byte(`{\"f:metadata\":{\"f:labels\":{\".\":{},\"f:dash0.com/instrumentation-image\":{},\"f:dash0.com/instrumented\":{},\"f:dash0.com/instrumented-by\":{},\"f:dash0.com/operator-image\":{}}},\"f:spec\":{\"f:template\":{\"f:metadata\":{\"f:labels\":{\"f:dash0.com/instrumentation-image\":{},\"f:dash0.com/instrumented\":{},\"f:dash0.com/instrumented-by\":{},\"f:dash0.com/operator-image\":{}}},\"f:spec\":{\"f:containers\":{\"k:{\\\"name\\\":\\\"test-container-0\\\"}\":{\"f:env\":{\".\":{},\"k:{\\\"name\\\":\\\"DASH0_NODE_IP\\\"}\":{\".\":{},\"f:name\":{},\"f:valueFrom\":{\".\":{},\"f:fieldRef\":{}}},\"k:{\\\"name\\\":\\\"DASH0_OTEL_COLLECTOR_BASE_URL\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}},\"k:{\\\"name\\\":\\\"OTEL_EXPORTER_OTLP_ENDPOINT\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}},\"k:{\\\"name\\\":\\\"LD_PRELOAD\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}}},\"f:volumeMounts\":{\".\":{},\"k:{\\\"mountPath\\\":\\\"/__dash0__\\\"}\":{\".\":{},\"f:mountPath\":{},\"f:name\":{}}}}},\"f:initContainers\":{\".\":{},\"k:{\\\"name\\\":\\\"dash0-instrumentation\\\"}\":{\".\":{},\"f:env\":{\".\":{},\"k:{\\\"name\\\":\\\"DASH0_INSTRUMENTATION_FOLDER_DESTINATION\\\"}\":{\".\":{},\"f:name\":{},\"f:value\":{}}},\"f:image\":{},\"f:imagePullPolicy\":{},\"f:name\":{},\"f:resources\":{},\"f:securityContext\":{\".\":{},\"f:allowPrivilegeEscalation\":{},\"f:privileged\":{},\"f:readOnlyRootFilesystem\":{},\"f:runAsGroup\":{},\"f:runAsUser\":{}},\"f:terminationMessagePath\":{},\"f:terminationMessagePolicy\":{},\"f:volumeMounts\":{\".\":{},\"k:{\\\"mountPath\\\":\\\"/__otel_auto_instrumentation\\\"}\":{\".\":{},\"f:mountPath\":{},\"f:name\":{}}}}},\"f:volumes\":{\".\":{},\"k:{\\\"name\\\":\\\"dash0-instrumentation\\\"}\":{\".\":{},\"f:emptyDir\":{\".\":{},\"f:sizeLimit\":{}},\"f:name\":{}}}}}}}`),
 		},
 	})
 }
@@ -1354,13 +1358,13 @@ func WebhookServiceEndpointSlice(withPort bool, withReadyCondition bool) discove
 
 	if withPort {
 		endpointSlice.Ports = []discoveryv1.EndpointPort{{
-			Port: ptr.To(int32(9443)),
+			Port: new(int32(9443)),
 		}}
 	}
 
 	if withReadyCondition {
 		endpointSlice.Endpoints[0].Conditions = discoveryv1.EndpointConditions{
-			Ready: ptr.To(true),
+			Ready: new(true),
 		}
 	}
 

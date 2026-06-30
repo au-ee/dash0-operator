@@ -4,6 +4,8 @@
 package v1alpha1
 
 import (
+	"encoding/json"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -12,6 +14,9 @@ import (
 
 	dash0operator "github.com/dash0hq/dash0-operator/api/operator"
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 // Dash0OperatorConfiguration is the schema for the Dash0OperatorConfiguration API
@@ -23,6 +28,7 @@ import (
 // +kubebuilder:printcolumn:name="Collect Telemetry",type="boolean",JSONPath=".spec.telemetryCollection.enabled"
 // +kubebuilder:printcolumn:name="Collect Metrics",type="boolean",JSONPath=".spec.kubernetesInfrastructureMetricsCollection.enabled"
 // +kubebuilder:printcolumn:name="Collect Pod Meta",type="boolean",JSONPath=".spec.collectPodLabelsAndAnnotations.enabled"
+// +kubebuilder:printcolumn:name="Collect Namespace Meta",type="boolean",JSONPath=".spec.collectNamespaceLabelsAndAnnotations.enabled"
 // +kubebuilder:printcolumn:name="Available",type="string",JSONPath=`.status.conditions[?(@.type == "Available")].status`
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type Dash0OperatorConfiguration struct {
@@ -35,9 +41,12 @@ type Dash0OperatorConfiguration struct {
 
 // Dash0OperatorConfigurationSpec describes cluster-wide configuration settings for the Dash0 operator.
 type Dash0OperatorConfigurationSpec struct {
+	// Deprecated: Use `exports` instead. If both `export` and `exports` are specified, `export` will be ignored.
+	// The mutating webhook will automatically migrate `export` to `exports` if only `export` is specified.
+	//
 	// The configuration of the default observability backend to which telemetry data will be sent by the operator, as
 	// well as the backend that will receive the operator's self-monitoring data. This property is mandatory.
-	// This can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters (i.e.
+	// This can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters (i.e.,
 	// Dash0 plus gRPC plus HTTP). This allows sending the same data to two or three targets simultaneously. At least
 	// one exporter has to be defined.
 	//
@@ -46,12 +55,25 @@ type Dash0OperatorConfigurationSpec struct {
 	// encoding is not supported for self-monitoring telemetry.
 	Export *dash0common.Export `json:"export,omitempty"`
 
+	// The configuration of the default observability backends to which telemetry data will be sent by the operator, as
+	// well as the backend that will receive the operator's self-monitoring data. This property is mandatory.
+	// These can either be Dash0 or another OTLP-compatible backend. Every Export entry can contain up to three distinct
+	// exporters (i.e., Dash0 plus gRPC plus HTTP).
+	//
+	// The telemetry data will be sent to all backends of all Export entries. At least one exporter has to be defined.
+	//
+	// Please note that self-monitoring data is only sent to a single backend of the first defined Export.
+	// If there are multiple backends in the Export, the Dash0 export is taking precedence over gRPC and HTTP, and gRPC taking
+	// precedence over HTTP if multiple exports are defined. Furthermore, HTTP export with JSON encoding is not supported
+	// for self-monitoring telemetry.
+	Exports []dash0common.Export `json:"exports,omitempty"`
+
 	// Global opt-out for self-monitoring for this operator
 	//
 	// +kubebuilder:default={enabled: true}
 	SelfMonitoring SelfMonitoring `json:"selfMonitoring,omitempty"`
 
-	// Settings for collecting Kubernetes infrastructure metrics. This setting is optional, by default the operator will
+	// Settings for collecting Kubernetes infrastructure metrics. This setting is optional, by default, the operator will
 	// collect Kubernetes infrastructure metrics; unless `telemetryCollection.enabled` is set to `false`, then
 	// collecting Kubernetes infrastructure metrics is off by default as well. It is a validation error to set
 	// `telemetryCollection.enabled=false` and `kubernetesInfrastructureMetricsCollection.enabled=true` at the same time.
@@ -73,14 +95,20 @@ type Dash0OperatorConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	KubernetesInfrastructureMetricsCollectionEnabled *bool `json:"kubernetesInfrastructureMetricsCollectionEnabled,omitempty"`
 
-	// Settings for collecting pod labels and annotations in the target namespace. This setting is optional, by default
-	// the operator will collect pod labels and annotations as resource attributes in the target namespace; unless
-	// `telemetryCollection.enabled` is set to `false`, then collecting pod labels and annotations is off by default as
-	// well. It is a validation error to set `telemetryCollection.enabled=false` and
-	// `collectPodLabelsAndAnnotations.enabled=true` at the same time.
+	// Settings for collecting pod labels and annotations. This setting is optional, by default the operator will
+	// collect pod labels and annotations as resource attributes in all namespaces; unless `telemetryCollection.enabled`
+	// is set to `false`, then collecting pod labels and annotations is off by default as well. It is a validation error
+	// to set `telemetryCollection.enabled=false` and `collectPodLabelsAndAnnotations.enabled=true` at the same time.
 	//
 	// +kubebuilder:validation:Optional
 	CollectPodLabelsAndAnnotations CollectPodLabelsAndAnnotations `json:"collectPodLabelsAndAnnotations,omitempty"`
+
+	// Settings for collecting namespace labels and annotations. This setting is optional, by default the operator will
+	// not collect namespace labels and annotations as resource attributes. It is a validation error to set
+	// `telemetryCollection.enabled=false` and `collectNamespaceLabelsAndAnnotations.enabled=true` at the same time.
+	//
+	// +kubebuilder:validation:Optional
+	CollectNamespaceLabelsAndAnnotations CollectNamespaceLabelsAndAnnotations `json:"collectNamespaceLabelsAndAnnotations,omitempty"`
 
 	// Settings for discovering scrape targets via Prometheus CRDs (PodMonitor, ServiceMonitor, ScrapeConfig).
 	// This setting is optional and opt-in, by default the operator will not consider Prometheus CRDs when configuring
@@ -97,11 +125,36 @@ type Dash0OperatorConfigurationSpec struct {
 	// +kubebuilder:validation:Optional
 	ClusterName string `json:"clusterName,omitempty"`
 
+	// InstrumentWorkloads contains cluster-wide settings that govern how the operator auto-instruments workloads.
+	//
+	// Note: There are also instrumentWorkloads settings in the Dash0 monitoring resource, for per-namespace settings for
+	// workload instrumentation.
+	//
+	// +kubebuilder:default={instrumentationDelivery: init-container}
+	InstrumentWorkloads InstrumentWorkloads `json:"instrumentWorkloads,omitempty"`
+
 	// An opt-out switch for all telemetry collection, and to avoid having the operator deploy OpenTelemetry collectors
 	// to the cluster. This setting is optional, it defaults to true.
 	//
 	// +kubebuilder:default={enabled: true}
 	TelemetryCollection TelemetryCollection `json:"telemetryCollection,omitempty"`
+
+	// Settings for automatically monitoring namespaces. This feature is off by default and needs to be enabled
+	// explicitly.
+	//
+	// +kubebuilder:default={enabled: false, labelSelector: "dash0.com/enable!=false"}
+	AutoMonitorNamespaces AutoMonitorNamespaces `json:"autoMonitorNamespaces,omitempty"`
+
+	// MonitoringTemplate describes the Dash0Monitoring resources that will be created for namespaces in case
+	// automatic namespace monitoring is enabled.
+	//
+	// +kubebuilder:validation:Optional
+	MonitoringTemplate *MonitoringTemplate `json:"monitoringTemplate,omitempty"`
+
+	// Profiling describes the profiling configuration for the operator.
+	//
+	// +kubebuilder:validation:Optional
+	Profiling *Profiling `json:"profiling,omitempty"`
 }
 
 // SelfMonitoring describes how the operator will report telemetry about its working to the backend.
@@ -121,7 +174,7 @@ type KubernetesInfrastructureMetricsCollection struct {
 	// time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type PrometheusCrdSupport struct {
@@ -131,12 +184,55 @@ type PrometheusCrdSupport struct {
 	// the same time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// InstrumentationDelivery selects how the Dash0 instrumentation files (the OpenTelemetry injector and the
+// auto-instrumentation agents) are made available to instrumented workload containers.
+//
+// +kubebuilder:validation:Enum=auto;image-volume;init-container
+type InstrumentationDelivery string
+
+const (
+	// InstrumentationDeliveryAuto lets the operator decide which delivery mechanism to use, based on the Kubernetes
+	// version. If the cluster runs Kubernetes 1.36 or later, the operator uses image volumes; otherwise it falls back to
+	// the init container approach.
+	InstrumentationDeliveryAuto InstrumentationDelivery = "auto"
+
+	// InstrumentationDeliveryImageVolume forces the operator to use the image volume delivery mechanisms on Kubernetes
+	// versions 1.31 - 1.35. The setting is ignored on Kubernetes versions older than 1.31.
+	InstrumentationDeliveryImageVolume InstrumentationDelivery = "image-volume"
+
+	// InstrumentationDeliveryInitContainer forces the operator to use the init container plus emptyDir volume delivery
+	// approach, even on Kubernetes 1.36 or newer.
+	InstrumentationDeliveryInitContainer InstrumentationDelivery = "init-container"
+)
+
+// InstrumentWorkloads contains cluster-wide settings that govern how the operator instruments workloads.
+type InstrumentWorkloads struct {
+	// InstrumentationDelivery controls how the Dash0 instrumentation files are made available to instrumented
+	// workload containers. Allowed values:
+	//   - "auto": use image volumes if the Kubernetes version is 1.36 or later, otherwise use the init container approach.
+	//   - "image-volume": always use a Kubernetes image volume sourced from the Dash0 instrumentation image. If the
+	//     Kubernetes version is older than 1.31, the operator logs a warning and falls back to the init container
+	//     approach. Note that on Kubernetes 1.34 and earlier, image volumes need to be enabled at cluster
+	//     creation time, since the feature gate is disabled by default in versions older than 1.35.
+	//   - "init-container" (default): always use the traditional init container plus emptyDir volume approach, regardless
+	//     of the Kubernetes version.
+	//
+	// Note: Changing the instrumentationDelivery setting in the operator configuration resource while the operator is
+	// running will not trigger a bulk re-instrumentation of all existing workloads, even for namespaces that are set to
+	// instrumentWorkloadsMode=all. Once a workload has been successfully instrumented, there is no benefit in
+	// re-instrumenting it with a different delivery mechanism. The new setting will be applied when instrumenting
+	// newly deployed workloads, or when a workload is updated/re-deployed.
+	//
+	// +kubebuilder:default=init-container
+	InstrumentationDelivery InstrumentationDelivery `json:"instrumentationDelivery,omitempty"`
 }
 
 type CollectPodLabelsAndAnnotations struct {
-	// Opt-out for log collecting all pod labels and annotations as resource . If set to `false`, the operator will not
-	// collect Kubernetes labels and annotations as resource attributes.
+	// Opt-out for collecting all pod labels and annotations as resource attributes. If set to `false`, the operator
+	// will not collect Kubernetes labels and annotations as resource attributes.
 	//
 	// This setting is optional, it defaults to `true`, that is, if this setting is omitted, the value `true` is assumed
 	// and the operator will collect pod labels and annotations as resource attributes; unless
@@ -145,14 +241,27 @@ type CollectPodLabelsAndAnnotations struct {
 	// `collectPodLabelsAndAnnotations.enabled=true` at the same time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+type CollectNamespaceLabelsAndAnnotations struct {
+	// Opt-in for collecting all namespace labels and annotations as resource attributes. If set to `true`, the operator
+	// will collect Kubernetes namespace labels and annotations as resource attributes.
+	//
+	// This setting is optional, it defaults to `false`, that is, if this setting is omitted, the value `false` is
+	// assumed and the operator will not collect namespace labels and annotations as resource attributes. It is a
+	// validation error to set `telemetryCollection.enabled=false` and
+	// `collectNamespaceLabelsAndAnnotations.enabled=true` at the same time.
+	//
+	// +kubebuilder:validation:Optional
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type TelemetryCollection struct {
 	// If disabled, the operator will not collect any telemetry, in particular it will not deploy any OpenTelemetry
 	// collectors to the cluster. This is useful if you want to do infrastructure-as-code (dashboards, check rules) with
 	// the operator, but do not want it to deploy the OpenTelemetry collector. This setting is optional, it defaults to
-	// `true` (i.e. by default telemetry collection is enabled).
+	// `true` (i.e., by default telemetry collection is enabled).
 	//
 	// Note that setting this to false does not disable the operator's self-monitoring telemetry, use the setting
 	// selfMonitoring.enabled to disable self-monitoring if required (self-monitoring does not require an OpenTelemetry
@@ -162,9 +271,88 @@ type TelemetryCollection struct {
 	Enabled *bool `json:"enabled"`
 }
 
+type AutoMonitorNamespaces struct {
+
+	// Controls whether monitoring is set up for namespaces automatically. By default, a Dash0Monitoring resource has to
+	// be added to each namespace that you want to monitor. With automatic namespace monitoring, you can let the Dash0
+	// operator automate this. This is useful if you want to monitor all or almost all namespaces in your cluster. It is
+	// also useful if you create new namespaces frequently and want to have them monitored right away, without additional
+	// setup. It is best suited if almost all namespace should be monitored in the same fashion.
+	//
+	// If enabled, the operator will:
+	// * automatically add monitoring to all existing namespaces at startup, and
+	// * automatically add monitoring to new namespaces, as they are created.
+	//
+	// Even when enabled, individual namespaces can opt out of automatic monitoring via label selectors
+	// (see spec.autoMonitorNamespaces.labelSelector).
+	//
+	// Namespaces which are subject to automatic namespace monitoring will be monitored according to the settings of
+	// spec.monitoringTemplate.
+	//
+	// +kubebuilder:default=false
+	Enabled *bool `json:"enabled"`
+
+	// An optional configurable label selector for controlling which namespaces are automatically monitored. Namespaces
+	// which match this label selector will be monitored automatically (if spec.autoMonitorNamespaces.enabled is also
+	// set). Namespaces which do not match this label selector will not be monitored, regardless of the value of
+	// spec.autoMonitorNamespaces.enabled.
+	//
+	// This attribute is ignored if spec.autoMonitorNamespaces.enabled has not been set to true explicitly.
+	//
+	// By default, this label selector has the value "dash0.com/enable!=false" - that is, the following namespaces will
+	// be monitored (assuming spec.autoMonitorNamespaces.enabled is true):
+	// - namespaces which do not have the label dash0.com/enable at all, and
+	// - namespaces which have the label dash0.com/enable with a value other than "false".
+	//
+	// Namespaces which are subject to automatic namespace monitoring will be monitored according to the settings of
+	// spec.monitoringTemplate.
+	//
+	// +kubebuilder:default=dash0.com/enable!=false
+	LabelSelector string `json:"labelSelector,omitempty"`
+}
+
+func (a AutoMonitorNamespaces) IsEnabled() bool {
+	return pointers.ReadBoolPointerWithDefault(a.Enabled, false)
+}
+
+// MonitoringTemplate describes the Dash0Monitoring resources that will be created for namespaces in case
+// automatic namespace monitoring is enabled.
+type MonitoringTemplate struct {
+	// +kubebuilder:pruning:PreserveUnknownFields
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// Specification of the desired settings for monitoring namespaces, i.e., the details of monitoring Kubernetes
+	// namespaces with Dash0
+	// +kubebuilder:validation:Optional
+	Spec dash0v1beta1.Dash0MonitoringSpec `json:"spec,omitempty"`
+}
+
+// Profiling describes whether the operator should configure its OpenTelemetry collectors to accept, process
+// and export profiling data. When enabled, the daemonset collector will include additional connectors, routing, and
+// pipeline definitions for the profiles signal type.
+type Profiling struct {
+	// If enabled, the operator will set up the pipelines to receive, process and forward profiling data over OTLP.
+	// This setting is optional, it defaults to `false`.
+	// +kubebuilder:validation:Optional
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 // Dash0OperatorConfigurationStatus defines the observed state of the Dash0 operator configuration resource.
 type Dash0OperatorConfigurationStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+
+	// PreviousAutoMonitorNamespacesLabelSelector records the label selector that was active when the operator
+	// configuration resource was reconciled the last time by the auto-namespace-monitoring controller. If it differs from
+	// the current spec.autoMonitorNamespaces.labelSelector, the namespace watch will be recreated with the new selector.
+	//
+	// +kubebuilder:validation:Optional
+	PreviousAutoMonitorNamespacesLabelSelector string `json:"previousAutoMonitorNamespacesLabelSelector,omitempty"`
+
+	// PreviousMonitoringTemplate records the monitoring template that was active when the operator configuration
+	// resource was reconciled the last time by the auto-namespace-monitoring controller.
+	//
+	// +kubebuilder:validation:Optional
+	PreviousMonitoringTemplate *MonitoringTemplate `json:"previousMonitoringTemplate,omitempty"`
 }
 
 func (d *Dash0OperatorConfiguration) IsMarkedForDeletion() bool {
@@ -204,7 +392,8 @@ func (d *Dash0OperatorConfiguration) SetAvailableConditionToUnknown() {
 			Status:  metav1.ConditionUnknown,
 			Reason:  "ReconcileStarted",
 			Message: "Dash0 has started resource reconciliation for the cluster-wide operator configuration.",
-		})
+		},
+	)
 	meta.SetStatusCondition(
 		&d.Status.Conditions,
 		metav1.Condition{
@@ -212,7 +401,8 @@ func (d *Dash0OperatorConfiguration) SetAvailableConditionToUnknown() {
 			Status:  metav1.ConditionTrue,
 			Reason:  "ReconcileStarted",
 			Message: "Dash0 operator configuration resource reconciliation is in progress.",
-		})
+		},
+	)
 }
 
 func (d *Dash0OperatorConfiguration) EnsureResourceIsMarkedAsAvailable() {
@@ -226,7 +416,8 @@ func (d *Dash0OperatorConfiguration) EnsureResourceIsMarkedAsAvailable() {
 			Status:  metav1.ConditionTrue,
 			Reason:  "ReconcileFinished",
 			Message: "Dash0 operator configuration is available in this cluster now.",
-		})
+		},
+	)
 	meta.RemoveStatusCondition(&d.Status.Conditions, string(dash0common.ConditionTypeDegraded))
 }
 
@@ -251,7 +442,8 @@ func (d *Dash0OperatorConfiguration) EnsureResourceIsMarkedAsDegraded(
 			Status:  metav1.ConditionFalse,
 			Reason:  reason,
 			Message: message,
-		})
+		},
+	)
 	meta.SetStatusCondition(
 		&d.Status.Conditions,
 		metav1.Condition{
@@ -259,30 +451,74 @@ func (d *Dash0OperatorConfiguration) EnsureResourceIsMarkedAsDegraded(
 			Status:  metav1.ConditionTrue,
 			Reason:  reason,
 			Message: message,
-		})
+		},
+	)
+}
+
+// EffectiveExports returns Exports if set, otherwise wraps the deprecated Export field into a single-element slice.
+// This ensures code that reads exports works for resources that have not yet been migrated by the mutating webhook.
+func (d *Dash0OperatorConfiguration) EffectiveExports() []dash0common.Export {
+	if len(d.Spec.Exports) > 0 {
+		return d.Spec.Exports
+	}
+	//nolint:staticcheck
+	if d.Spec.Export != nil {
+		//nolint:staticcheck
+		return []dash0common.Export{*d.Spec.Export}
+	}
+	return nil
+}
+
+func (d *Dash0OperatorConfiguration) HasExportsConfigured() bool {
+	return d != nil && len(d.EffectiveExports()) > 0
+}
+
+func (d *Dash0OperatorConfiguration) ExportsCount() int {
+	if !d.HasExportsConfigured() {
+		return 0
+	} else {
+		return dash0common.CountExports(d.EffectiveExports())
+	}
+}
+
+func (d *Dash0OperatorConfiguration) HasDash0ExportConfigured() bool {
+	return len(d.GetDash0Exports()) > 0
+}
+
+func (d *Dash0OperatorConfiguration) GetFirstDash0Export() *dash0common.Export {
+	exports := d.EffectiveExports()
+	for i := range exports {
+		if exports[i].HasDash0ExportConfigured() {
+			return &exports[i]
+		}
+	}
+	return nil
+}
+
+func (d *Dash0OperatorConfiguration) GetDash0Exports() []dash0common.Dash0Configuration {
+	var dash0Configs []dash0common.Dash0Configuration
+	exports := d.EffectiveExports()
+	for i := range exports {
+		if exports[i].HasDash0ExportConfigured() {
+			dash0Configs = append(dash0Configs, *exports[i].Dash0)
+		}
+	}
+	return dash0Configs
 }
 
 func (d *Dash0OperatorConfiguration) HasDash0ApiAccessConfigured() bool {
-	return d.Spec.Export != nil &&
-		d.Spec.Export.Dash0 != nil &&
-		d.Spec.Export.Dash0.ApiEndpoint != "" &&
-		(d.Spec.Export.Dash0.Authorization.Token != nil || d.Spec.Export.Dash0.Authorization.SecretRef != nil)
+	return len(d.GetDash0ExportsWithApiAccess()) > 0
 }
 
-func (d *Dash0OperatorConfiguration) GetDash0AuthorizationIfConfigured() *dash0common.Authorization {
-	if d.Spec.Export == nil {
-		return nil
+func (d *Dash0OperatorConfiguration) GetDash0ExportsWithApiAccess() []dash0common.Dash0Configuration {
+	var res []dash0common.Dash0Configuration
+	for _, export := range d.EffectiveExports() {
+		// intentionally not doing any further filtering here, as validation will happen later where errors are properly logged
+		if export.Dash0 != nil {
+			res = append(res, *export.Dash0)
+		}
 	}
-	if d.Spec.Export.Dash0 == nil {
-		return nil
-	}
-
-	authorization := d.Spec.Export.Dash0.Authorization
-	if (authorization.Token != nil && *authorization.Token != "") ||
-		(authorization.SecretRef != nil && authorization.SecretRef.Name != "" && authorization.SecretRef.Key != "") {
-		return &authorization
-	}
-	return nil
+	return res
 }
 
 func (d *Dash0OperatorConfiguration) GetNaturalLanguageResourceTypeName() string {
@@ -343,6 +579,32 @@ func (d *Dash0OperatorConfiguration) At(list client.ObjectList, index int) dash0
 	return &list.(*Dash0OperatorConfigurationList).Items[index]
 }
 
+func (d *Dash0OperatorConfiguration) LogResourceAsEvent(logger logd.Logger) {
+	redactedOperatorConfiguration := d.cloneAndRedact()
+	if operatorConfigurationResourceMarshalled, err := json.Marshal(redactedOperatorConfiguration); err != nil {
+		logger.Error(err, "cannot marshal Dash0OperatorConfiguration resource for dash0.operator_configuration event")
+	} else {
+		logger.Info(
+			// per https://opentelemetry.io/docs/specs/semconv/general/events, events should not use the log body
+			"",
+			"otel.event.name", "dash0.operator_configuration_resource",
+			"dash0.monitoring.operator_configuration_resource.snapshot", string(operatorConfigurationResourceMarshalled),
+			"dash0.monitoring.operator_configuration_resource.namespace", d.GetNamespace(),
+			"dash0.monitoring.operator_configuration_resource.name", d.GetName(),
+		)
+	}
+}
+
+func (d *Dash0OperatorConfiguration) cloneAndRedact() Dash0OperatorConfiguration {
+	redactedResource := Dash0OperatorConfiguration{}
+	d.DeepCopyInto(&redactedResource)
+	redactedResource.ManagedFields = nil
+	for _, export := range redactedResource.EffectiveExports() {
+		export.Redact()
+	}
+	return redactedResource
+}
+
 //+kubebuilder:object:root=true
 
 // Dash0OperatorConfigurationList contains a list of Dash0OperatorConfiguration resources.
@@ -350,8 +612,4 @@ type Dash0OperatorConfigurationList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Dash0OperatorConfiguration `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&Dash0OperatorConfiguration{}, &Dash0OperatorConfigurationList{})
 }

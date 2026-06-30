@@ -5,10 +5,10 @@ package webhooks
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
+	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -88,7 +88,7 @@ var _ = Describe("The validation webhook for the operator configuration resource
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			})
@@ -107,7 +107,7 @@ var _ = Describe("The validation webhook for the operator configuration resource
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
@@ -132,12 +132,12 @@ var _ = Describe("The validation webhook for the operator configuration resource
 			&dash0v1alpha1.Dash0OperatorConfiguration{
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: Dash0ExportWithEndpointAndToken(),
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 					KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
@@ -156,10 +156,10 @@ var _ = Describe("The validation webhook for the operator configuration resource
 			&dash0v1alpha1.Dash0OperatorConfiguration{
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: Dash0ExportWithEndpointAndToken(),
-					KubernetesInfrastructureMetricsCollectionEnabled: ptr.To(true),
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					KubernetesInfrastructureMetricsCollectionEnabled: new(true),
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
@@ -179,12 +179,12 @@ var _ = Describe("The validation webhook for the operator configuration resource
 			&dash0v1alpha1.Dash0OperatorConfiguration{
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: Dash0ExportWithEndpointAndToken(),
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 					CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
@@ -196,6 +196,30 @@ var _ = Describe("The validation webhook for the operator configuration resource
 				"collectPodLabelsAndAnnotations.enabled=false.")))
 	})
 
+	It("should reject a new operator configuration resource with telemetry collection disabled but namespace label collection explicitly enabled", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+						Enabled: new(true),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(false),
+					},
+				},
+			})
+		Expect(err).To(MatchError(ContainSubstring(
+			"admission webhook \"validate-operator-configuration.dash0.com\" denied the request: The provided " +
+				"Dash0 operator configuration resource has namespace label and annotation collection explicitly " +
+				"enabled, although telemetry collection is disabled. This is an invalid combination. Please either " +
+				"set telemetryCollection.enabled=true or " +
+				"collectNamespaceLabelsAndAnnotations.enabled=false.")))
+	})
+
 	It("should reject a new operator configuration resource with telemetry collection disabled but Prometheus CRD support explicitly enabled", func() {
 		_, err := CreateOperatorConfigurationResource(
 			ctx,
@@ -203,16 +227,36 @@ var _ = Describe("The validation webhook for the operator configuration resource
 			&dash0v1alpha1.Dash0OperatorConfiguration{
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: Dash0ExportWithEndpointAndToken(),
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
 		Expect(err).To(MatchError(ContainSubstring(ErrorMessageOperatorConfigurationPrometheusCrdSupportInvalid)))
+	})
+
+	It("should reject a new operator configuration resource with telemetry collection disabled but profiling explicitly enabled", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					Profiling: &dash0v1alpha1.Profiling{
+						Enabled: new(true),
+					},
+					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+						Enabled: new(false),
+					},
+				},
+			})
+		Expect(err).To(MatchError(ContainSubstring(
+			"profiling explicitly enabled, although telemetry collection is disabled")))
 	})
 
 	It("should reject a new operator configuration resource with a GRPC export having both insecure and insecureSkipVerify set to true", func() {
@@ -222,11 +266,13 @@ var _ = Describe("The validation webhook for the operator configuration resource
 			&dash0v1alpha1.Dash0OperatorConfiguration{
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: &dash0common.Export{
-						Grpc: &dash0common.GrpcConfiguration{
-							Endpoint:           EndpointGrpcTest,
-							Insecure:           ptr.To(true),
-							InsecureSkipVerify: ptr.To(true),
+					Exports: []dash0common.Export{
+						{
+							Grpc: &dash0common.GrpcConfiguration{
+								Endpoint:           EndpointGrpcTest,
+								Insecure:           new(true),
+								InsecureSkipVerify: new(true),
+							},
 						},
 					},
 				},
@@ -242,23 +288,158 @@ var _ = Describe("The validation webhook for the operator configuration resource
 				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
 				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			})
 		Expect(err).ToNot(HaveOccurred())
 
-		operatorConfiguration.Spec.SelfMonitoring.Enabled = ptr.To(true)
-		operatorConfiguration.Spec.Export = &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint: EndpointDash0Test,
-				Authorization: dash0common.Authorization{
-					Token: &AuthorizationTokenTest,
+		operatorConfiguration.Spec.SelfMonitoring.Enabled = new(true)
+		operatorConfiguration.Spec.Exports = []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint: EndpointDash0Test,
+					Authorization: dash0common.Authorization{
+						Token: &AuthorizationTokenTest,
+					},
 				},
 			},
 		}
 
 		err = k8sClient.Update(ctx, operatorConfiguration)
 		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should allow a new operator configuration resource with only exports set", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(false),
+					},
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+				},
+			})
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should allow a new operator configuration resource with only export set (mutating webhook migrates it)", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
+						Enabled: new(false),
+					},
+					Export: Dash0ExportWithEndpointAndToken(),
+				},
+			})
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should reject a monitoring template with exports", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					MonitoringTemplate: &dash0v1alpha1.MonitoringTemplate{
+						Spec: dash0v1beta1.Dash0MonitoringSpec{
+							Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+							InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+								Mode: dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+							},
+							LogCollection:      dash0common.LogCollection{Enabled: new(true)},
+							EventCollection:    dash0common.EventCollection{Enabled: new(true)},
+							PrometheusScraping: dash0common.PrometheusScraping{Enabled: new(true)},
+						},
+					},
+				},
+			})
+		Expect(err).To(MatchError(ContainSubstring(
+			"admission webhook \"validate-operator-configuration.dash0.com\" denied the request: The provided Dash0 " +
+				"operator configuration resource has a monitoring template with `exports`. Please use the `exports` field in " +
+				"the operator configuration and remove the `exports` from the monitoringTemplate.spec.")))
+	})
+
+	It("should reject a monitoring template with legacy export", func() {
+		_, err := CreateOperatorConfigurationResource(
+			ctx,
+			k8sClient,
+			&dash0v1alpha1.Dash0OperatorConfiguration{
+				ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+				Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					MonitoringTemplate: &dash0v1alpha1.MonitoringTemplate{
+						Spec: dash0v1beta1.Dash0MonitoringSpec{
+							Export: Dash0ExportWithEndpointAndToken(),
+							InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+								Mode: dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+							},
+							LogCollection:      dash0common.LogCollection{Enabled: new(true)},
+							EventCollection:    dash0common.EventCollection{Enabled: new(true)},
+							PrometheusScraping: dash0common.PrometheusScraping{Enabled: new(true)},
+						},
+					},
+				},
+			})
+		Expect(err).To(MatchError(ContainSubstring(
+			"admission webhook \"validate-operator-configuration.dash0.com\" denied the request: The provided Dash0 " +
+				"operator configuration resource has a monitoring template with `export`. Please use the `exports` field in " +
+				"the operator configuration and remove the `export` from the monitoringTemplate.spec.")))
+	})
+
+	Context("with telemetry collection disabled via Helm", Ordered, func() {
+		BeforeAll(func() {
+			operatorConfigurationValidationWebhookHandler.telemetryCollectionEnabledViaHelm = false
+		})
+
+		AfterAll(func() {
+			operatorConfigurationValidationWebhookHandler.telemetryCollectionEnabledViaHelm = true
+		})
+
+		It("should reject enabling telemetry collection via the operator configuration resource", func() {
+			_, err := CreateOperatorConfigurationResource(
+				ctx,
+				k8sClient,
+				&dash0v1alpha1.Dash0OperatorConfiguration{
+					ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+					Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+						TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+							Enabled: new(true),
+						},
+					},
+				})
+			Expect(err).To(MatchError(ContainSubstring(
+				"admission webhook \"validate-operator-configuration.dash0.com\" denied the request: Telemetry collection " +
+					"has been disabled via the Helm chart (operator.telemetryCollectionEnabled: false), but the provided Dash0 " +
+					"operator configuration resource has telemetryCollection.enabled=true. Telemetry collection cannot be " +
+					"enabled via the operator configuration resource when it has been disabled via the Helm chart. Instead, " +
+					"run helm upgrade --install to set operator.telemetryCollectionEnabled: true via the Helm chart.")))
+		})
+
+		It("should allow updates when operator configuration resource has telemetry collection disabled", func() {
+			_, err := CreateOperatorConfigurationResource(
+				ctx,
+				k8sClient,
+				&dash0v1alpha1.Dash0OperatorConfiguration{
+					ObjectMeta: OperatorConfigurationResourceDefaultObjectMeta,
+					Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+						TelemetryCollection: dash0v1alpha1.TelemetryCollection{
+							Enabled: new(false),
+						},
+					},
+				})
+			Expect(err).ToNot(HaveOccurred())
+		})
 	})
 })

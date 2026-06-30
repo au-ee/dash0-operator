@@ -11,6 +11,7 @@ type ConditionType string
 const (
 	ConditionTypeAvailable ConditionType = "Available"
 	ConditionTypeDegraded  ConditionType = "Degraded"
+	redactedValue                        = "<redacted>"
 )
 
 // Export describes the observability backend to which telemetry data will be sent. This can either be Dash0 or another
@@ -65,6 +66,12 @@ type Dash0Configuration struct {
 	//
 	// +kubebuilder:validation:Optional
 	ApiEndpoint string `json:"apiEndpoint,omitempty"`
+
+	// The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+	// This setting is optional and there should usually be no need to configure it.
+	//
+	// +kubebuilder:validation:Optional
+	Keepalive *KeepaliveClientConfig `json:"keepalive,omitempty"`
 }
 
 // Authorization contains the authorization settings for Dash0.
@@ -145,6 +152,18 @@ type GrpcConfiguration struct {
 	//
 	// +kubebuilder:validation:Optional
 	InsecureSkipVerify *bool `json:"insecureSkipVerify,omitempty"`
+
+	// The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+	// This setting is optional and there should usually be no need to configure it.
+	//
+	// +kubebuilder:validation:Optional
+	Keepalive *KeepaliveClientConfig `json:"keepalive,omitempty"`
+
+	// The name of the load balancer to use. Can be either round_robin or pick_first. Optional; when omitted, the
+	// collector's default (round_robin) is used.
+	//
+	// +kubebuilder:validation:Optional
+	BalancerName BalancerName `json:"balancer_name,omitempty"`
 }
 
 // OtlpEncoding describes the encoding of the OTLP data when sent via HTTP.
@@ -162,4 +181,86 @@ type Header struct {
 	Name string `json:"name"`
 	// +kubebuilder:validation:Required
 	Value string `json:"value"`
+}
+
+// KeepaliveClientConfig exposes the keepalive.ClientParameters for gRPC clients.
+type KeepaliveClientConfig struct {
+	// Period after which a keepalive ping is sent on the transport.
+	// +kubebuilder:validation:Optional
+	Time *string `json:"time,omitempty"`
+
+	// Time to wait for a keepalive ping acknowledgement.
+	// +kubebuilder:validation:Optional
+	Timeout *string `json:"timeout,omitempty"`
+
+	// Allow keepalive pings when there are no active streams.
+	// +kubebuilder:validation:Optional
+	PermitWithoutStream *bool `json:"permit_without_stream,omitempty"`
+}
+
+// BalancerName describes the load balancer used by the OTLP gRPC exporter.
+// See https://github.com/grpc/grpc-go/blob/master/examples/features/load_balancing/README.md
+//
+// +kubebuilder:validation:Enum=round_robin;pick_first
+type BalancerName string
+
+const (
+	RoundRobin BalancerName = "round_robin"
+	PickFirst  BalancerName = "pick_first"
+)
+
+func (e *Export) HasDash0ExportConfigured() bool {
+	return e != nil && e.Dash0 != nil
+}
+
+func (e *Export) HasDash0ApiAccessConfigured() bool {
+	return e.HasDash0ExportConfigured() &&
+		e.Dash0.ApiEndpoint != "" &&
+		(e.Dash0.Authorization.Token != nil || e.Dash0.Authorization.SecretRef != nil)
+}
+
+// CountExports counts the total number of different exports (dash0, grpc, http) in the given slice of Export elements.
+func CountExports(exports []Export) int {
+	count := 0
+	for _, export := range exports {
+		if export.Dash0 != nil {
+			count++
+		}
+		if export.Grpc != nil {
+			count++
+		}
+		if export.Http != nil {
+			count++
+		}
+	}
+	return count
+}
+
+// ToExports is a small helper function to convert a single Export into Exports with a single element.
+func (e *Export) ToExports() []Export {
+	if e == nil {
+		return nil
+	}
+	return []Export{
+		*e,
+	}
+}
+
+// Redact removes the authorization token and header values from the export. The export is modified in place, make sure
+// to only call it on exports that are not intended to be used for actual exporting later.
+func (e *Export) Redact() {
+	if e.Dash0 != nil && e.Dash0.Authorization.Token != nil && len(*e.Dash0.Authorization.Token) > 0 {
+		e.Dash0.Authorization.Token = new(redactedValue)
+	}
+	if e.Http != nil {
+		// Any header value can potentially be a secret, so we redact all values.
+		for i := range e.Http.Headers {
+			e.Http.Headers[i].Value = redactedValue
+		}
+	}
+	if e.Grpc != nil {
+		for i := range e.Grpc.Headers {
+			e.Grpc.Headers[i].Value = redactedValue
+		}
+	}
 }

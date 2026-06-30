@@ -10,14 +10,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sigs.k8s.io/yaml"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
-	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -48,6 +47,13 @@ type normalizeTransformSpecTestCase struct {
 	expected               *dash0common.NormalizedTransformSpec
 }
 
+type migrateExportToExportsTestConfig struct {
+	operation admissionv1.Operation
+	oldSpec   *dash0v1beta1.Dash0MonitoringSpec
+	spec      dash0v1beta1.Dash0MonitoringSpec
+	wanted    dash0v1beta1.Dash0MonitoringSpec
+}
+
 const (
 	errorModeKey  = "error_mode"
 	contextKey    = "context"
@@ -56,7 +62,7 @@ const (
 )
 
 var _ = Describe("The mutation webhook for the monitoring resource", func() {
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	Describe("when mutating the operator configuration resource", func() {
 
@@ -65,7 +71,7 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 			patchRequired := monitoringMutatingWebhookHandler.overrideLogCollectionDefault(
 				toAdmissionRequest(testCase.namespace, spec),
 				&spec,
-				&logger,
+				logger,
 			)
 			Expect(patchRequired).To(Equal(testCase.expectPatch))
 			if testCase.expectPatch {
@@ -85,47 +91,47 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 				namespace:              OperatorNamespace,
 				monitoringResourceSpec: dash0v1beta1.Dash0MonitoringSpec{},
 				expectPatch:            true,
-				expectedValue:          ptr.To(false),
+				expectedValue:          new(false),
 			}),
 			Entry("with log collection disabled in an arbitrary namespace", disableLogCollectionTestCase{
 				namespace: "some-namespace",
 				monitoringResourceSpec: dash0v1beta1.Dash0MonitoringSpec{
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				expectPatch:   false,
-				expectedValue: ptr.To(false),
+				expectedValue: new(false),
 			}),
 			Entry("with log collection disabled in the operator namespace", disableLogCollectionTestCase{
 				namespace: OperatorNamespace,
 				monitoringResourceSpec: dash0v1beta1.Dash0MonitoringSpec{
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				expectPatch:   false,
-				expectedValue: ptr.To(false),
+				expectedValue: new(false),
 			}),
 			Entry("with log collection enabled in an arbitrary namespace", disableLogCollectionTestCase{
 				namespace: "some-namespace",
 				monitoringResourceSpec: dash0v1beta1.Dash0MonitoringSpec{
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				expectPatch:   false,
-				expectedValue: ptr.To(true),
+				expectedValue: new(true),
 			}),
 			Entry("with log collection enabled in the operator namespace", disableLogCollectionTestCase{
 				namespace: OperatorNamespace,
 				monitoringResourceSpec: dash0v1beta1.Dash0MonitoringSpec{
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				expectPatch:   true,
-				expectedValue: ptr.To(false),
+				expectedValue: new(false),
 			}),
 		)
 
@@ -146,13 +152,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeAll,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 					},
 				}),
@@ -168,13 +174,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeAll,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 					},
 				}),
@@ -185,13 +191,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeNone,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 					},
 					wanted: dash0v1beta1.Dash0MonitoringSpec{
@@ -199,13 +205,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeNone,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 					},
 				}),
@@ -217,7 +223,7 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 				toAdmissionRequest(TestNamespaceName, spec),
 				&dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				&spec,
@@ -232,13 +238,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeNone,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 					},
 				}),
@@ -254,13 +260,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeNone,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(false),
+							Enabled: new(false),
 						},
 					},
 				}),
@@ -272,13 +278,13 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeAll,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 					},
 					wanted: dash0v1beta1.Dash0MonitoringSpec{
@@ -286,20 +292,20 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 							Mode: dash0common.InstrumentWorkloadsModeAll,
 						},
 						LogCollection: dash0common.LogCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						EventCollection: dash0common.EventCollection{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 						PrometheusScraping: dash0common.PrometheusScraping{
-							Enabled: ptr.To(true),
+							Enabled: new(true),
 						},
 					},
 				}),
 		)
 
 		DescribeTable("should normalize the transform spec", func(testCase normalizeTransformSpecTestCase) {
-			var unmarshalledYaml map[string]interface{}
+			var unmarshalledYaml map[string]any
 			Expect(yaml.Unmarshal([]byte(testCase.monitoringResourceSpec), &unmarshalledYaml)).To(Succeed())
 			rawSpecJson, err := json.Marshal(unmarshalledYaml)
 			Expect(err).ToNot(HaveOccurred())
@@ -315,7 +321,7 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 
 			Expect(response.Allowed).To(BeTrue())
 
-			var normalizedTransformsPatch interface{}
+			var normalizedTransformsPatch any
 			for _, patch := range response.Patches {
 				if patch.Operation == "add" && patch.Path == "/spec/__dash0_internal__normalizedTransform" {
 					normalizedTransformsPatch = patch.Value
@@ -328,7 +334,7 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 			}
 
 			Expect(normalizedTransformsPatch).ToNot(BeNil())
-			patchAsMap, ok := normalizedTransformsPatch.(map[string]interface{})
+			patchAsMap, ok := normalizedTransformsPatch.(map[string]any)
 			Expect(ok).To(BeTrue())
 
 			expected := *testCase.expected
@@ -336,6 +342,7 @@ var _ = Describe("The mutation webhook for the monitoring resource", func() {
 			verifyNormalizedTransformGroupsForOneSignal(expected.Traces, patchAsMap, "trace_statements")
 			verifyNormalizedTransformGroupsForOneSignal(expected.Metrics, patchAsMap, "metric_statements")
 			verifyNormalizedTransformGroupsForOneSignal(expected.Logs, patchAsMap, "log_statements")
+			verifyNormalizedTransformGroupsForOneSignal(expected.Profiles, patchAsMap, "profile_statements")
 
 		},
 			Entry("without a transform spec", normalizeTransformSpecTestCase{
@@ -382,6 +389,9 @@ spec:
     log_statements:
     - 'log statement 1'
     - 'log statement 2'
+    profile_statements:
+    - 'profile statement 1'
+    - 'profile statement 2'
 `,
 				expected: &dash0common.NormalizedTransformSpec{
 					Traces: []dash0common.NormalizedTransformGroup{
@@ -395,6 +405,10 @@ spec:
 					Logs: []dash0common.NormalizedTransformGroup{
 						{Statements: []string{"log statement 1"}},
 						{Statements: []string{"log statement 2"}},
+					},
+					Profiles: []dash0common.NormalizedTransformGroup{
+						{Statements: []string{"profile statement 1"}},
+						{Statements: []string{"profile statement 2"}},
 					},
 				},
 			}),
@@ -424,13 +438,13 @@ spec:
 				expected: &dash0common.NormalizedTransformSpec{
 					Traces: []dash0common.NormalizedTransformGroup{
 						{
-							Context:    ptr.To("trace context 1"),
+							Context:    new("trace context 1"),
 							ErrorMode:  ptr.To(dash0common.FilterTransformErrorModeSilent),
 							Conditions: []string{"trace condition 1.1", "trace condition 1.2"},
 							Statements: []string{"trace statement 1.1", "trace statement 1.2"},
 						},
 						{
-							Context:    ptr.To("trace context 2"),
+							Context:    new("trace context 2"),
 							ErrorMode:  ptr.To(dash0common.FilterTransformErrorModePropagate),
 							Conditions: []string{"trace condition 2.1", "trace condition 2.2"},
 							Statements: []string{"trace statement 2.1", "trace statement 2.2"},
@@ -453,6 +467,22 @@ spec:
 						{
 							Statements: []string{"trace statement 1.1", "trace statement 1.2"},
 						},
+					},
+				},
+			}),
+
+			Entry("a transform spec with flat string profile statements", normalizeTransformSpecTestCase{
+				monitoringResourceSpec: `
+spec:
+  transform:
+    profile_statements:
+    - 'profile statement 1'
+    - 'profile statement 2'
+`,
+				expected: &dash0common.NormalizedTransformSpec{
+					Profiles: []dash0common.NormalizedTransformGroup{
+						{Statements: []string{"profile statement 1"}},
+						{Statements: []string{"profile statement 2"}},
 					},
 				},
 			}),
@@ -488,6 +518,9 @@ spec:
       statements:
       - 'log statement 3.1'
       - 'log statement 3.2'
+    profile_statements:
+    - 'profile statement 1'
+    - 'profile statement 2'
 `,
 				expected: &dash0common.NormalizedTransformSpec{
 					Traces: []dash0common.NormalizedTransformGroup{
@@ -514,8 +547,113 @@ spec:
 							Statements: []string{"log statement 3.1", "log statement 3.2"},
 						},
 					},
+					Profiles: []dash0common.NormalizedTransformGroup{
+						{Statements: []string{"profile statement 1"}},
+						{Statements: []string{"profile statement 2"}},
+					},
 				},
 			}),
+		)
+
+		DescribeTable("should handle export to exports migration",
+			func(testConfig migrateExportToExportsTestConfig) {
+				spec := testConfig.spec
+				var req admission.Request
+				if testConfig.operation != "" {
+					req = toAdmissionRequestWithOldObject(
+						TestNamespaceName,
+						spec,
+						testConfig.operation,
+						testConfig.oldSpec,
+					)
+				} else {
+					req = toAdmissionRequest(TestNamespaceName, spec)
+				}
+				_, errorResponse := monitoringMutatingWebhookHandler.normalizeMonitoringResourceSpec(
+					req,
+					&dash0v1alpha1.Dash0OperatorConfigurationSpec{},
+					&spec,
+					logger,
+				)
+				Expect(errorResponse).To(BeNil())
+				// Only check export/exports fields; other defaults are tested elsewhere.
+				Expect(spec.Export).To(Equal(testConfig.wanted.Export))
+				Expect(spec.Exports).To(Equal(testConfig.wanted.Exports))
+			},
+			Entry("should migrate deprecated export to exports when only export is set",
+				migrateExportToExportsTestConfig{
+					spec: dash0v1beta1.Dash0MonitoringSpec{
+						Export: Dash0ExportWithEndpointAndToken(),
+					},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  nil,
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+				}),
+			Entry("should not modify exports when only exports is set",
+				migrateExportToExportsTestConfig{
+					spec: dash0v1beta1.Dash0MonitoringSpec{
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  nil,
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+				}),
+			Entry("CREATE: should clear export and keep exports when both are set",
+				migrateExportToExportsTestConfig{
+					spec: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  Dash0ExportWithEndpointAndToken(),
+						Exports: []dash0common.Export{*GrpcExportTest()},
+					},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  nil,
+						Exports: []dash0common.Export{*GrpcExportTest()},
+					},
+				}),
+			Entry("UPDATE: should use export when exports is unchanged from stored resource (three-way merge carry-over)",
+				migrateExportToExportsTestConfig{
+					operation: admissionv1.Update,
+					oldSpec: &dash0v1beta1.Dash0MonitoringSpec{
+						// This is what was stored after the previous webhook migration.
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+					spec: dash0v1beta1.Dash0MonitoringSpec{
+						// export has the user's new intended value
+						Export: GrpcExportTest(),
+						// exports is the same as oldSpec.Exports — carried over by three-way merge
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export: nil,
+						// The webhook should use the value from export, not the stale exports.
+						Exports: []dash0common.Export{*GrpcExportTest()},
+					},
+				}),
+			Entry("UPDATE: should keep exports when exports has been changed by the user",
+				migrateExportToExportsTestConfig{
+					operation: admissionv1.Update,
+					oldSpec: &dash0v1beta1.Dash0MonitoringSpec{
+						Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
+					},
+					spec: dash0v1beta1.Dash0MonitoringSpec{
+						Export: HttpExportTest(),
+						// exports differs from oldSpec — user intentionally changed it
+						Exports: []dash0common.Export{*GrpcExportTest()},
+					},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  nil,
+						Exports: []dash0common.Export{*GrpcExportTest()},
+					},
+				}),
+			Entry("should not change anything when neither export nor exports is set",
+				migrateExportToExportsTestConfig{
+					spec: dash0v1beta1.Dash0MonitoringSpec{},
+					wanted: dash0v1beta1.Dash0MonitoringSpec{
+						Export:  nil,
+						Exports: nil,
+					},
+				}),
 		)
 	})
 
@@ -532,9 +670,9 @@ spec:
 				ctx,
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
-					Export: Dash0ExportWithEndpointAndToken(),
+					Exports: []dash0common.Export{*Dash0ExportWithEndpointAndToken()},
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(testConfig.telemetryCollectionEnabled),
+						Enabled: new(testConfig.telemetryCollectionEnabled),
 					},
 				},
 			)
@@ -554,20 +692,20 @@ spec:
 				spec:                       dash0v1beta1.Dash0MonitoringSpec{},
 				wanted: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
-						LabelSelector: util.DefaultAutoInstrumentationLabelSelector,
+						LabelSelector: dash0common.DefaultAutoInstrumentationLabelSelector,
 						Mode:          dash0common.InstrumentWorkloadsModeAll,
 					},
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					EventCollection: dash0common.EventCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					PrometheusScraping: dash0common.PrometheusScraping{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
-					SynchronizePersesDashboards: ptr.To(true),
-					SynchronizePrometheusRules:  ptr.To(true),
+					SynchronizePersesDashboards: new(true),
+					SynchronizePrometheusRules:  new(true),
 				},
 			}),
 			Entry("disable all the things if telemetry collection is disabled", monitoringResourceMutationTestConfig{
@@ -575,20 +713,20 @@ spec:
 				spec:                       dash0v1beta1.Dash0MonitoringSpec{},
 				wanted: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
-						LabelSelector: util.DefaultAutoInstrumentationLabelSelector,
+						LabelSelector: dash0common.DefaultAutoInstrumentationLabelSelector,
 						Mode:          dash0common.InstrumentWorkloadsModeNone,
 					},
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					EventCollection: dash0common.EventCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					PrometheusScraping: dash0common.PrometheusScraping{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
-					SynchronizePersesDashboards: ptr.To(true),
-					SynchronizePrometheusRules:  ptr.To(true),
+					SynchronizePersesDashboards: new(true),
+					SynchronizePrometheusRules:  new(true),
 				},
 			}),
 		)
@@ -597,11 +735,13 @@ spec:
 			_, err := CreateMonitoringResourceWithPotentialError(ctx, k8sClient, &dash0v1beta1.Dash0Monitoring{
 				ObjectMeta: MonitoringResourceDefaultObjectMeta,
 				Spec: dash0v1beta1.Dash0MonitoringSpec{
-					Export: &dash0common.Export{
-						Dash0: &dash0common.Dash0Configuration{
-							Endpoint: EndpointDash0Test,
-							Authorization: dash0common.Authorization{
-								Token: &AuthorizationTokenTest,
+					Exports: []dash0common.Export{
+						{
+							Dash0: &dash0common.Dash0Configuration{
+								Endpoint: EndpointDash0Test,
+								Authorization: dash0common.Authorization{
+									Token: &AuthorizationTokenTest,
+								},
 							},
 						},
 					},
@@ -673,19 +813,54 @@ func toAdmissionRequest(namespace string, spec dash0v1beta1.Dash0MonitoringSpec)
 	}
 }
 
+func toAdmissionRequestWithOldObject(
+	namespace string,
+	spec dash0v1beta1.Dash0MonitoringSpec,
+	operation admissionv1.Operation,
+	oldSpec *dash0v1beta1.Dash0MonitoringSpec,
+) admission.Request {
+	rawJson, err := json.Marshal(dash0v1beta1.Dash0Monitoring{
+		Spec: spec,
+	})
+	Expect(err).ToNot(HaveOccurred())
+
+	req := admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			Name:      MonitoringResourceName,
+			Namespace: namespace,
+			Operation: operation,
+			Object: runtime.RawExtension{
+				Raw: rawJson,
+			},
+		},
+	}
+
+	if oldSpec != nil {
+		oldRawJson, err := json.Marshal(dash0v1beta1.Dash0Monitoring{
+			Spec: *oldSpec,
+		})
+		Expect(err).ToNot(HaveOccurred())
+		req.AdmissionRequest.OldObject = runtime.RawExtension{
+			Raw: oldRawJson,
+		}
+	}
+
+	return req
+}
+
 func verifyNormalizedTransformGroupsForOneSignal(
 	expectedGroups []dash0common.NormalizedTransformGroup,
-	patchAsMap map[string]interface{},
+	patchAsMap map[string]any,
 	fieldName string,
 ) {
 	if expectedGroups == nil {
 		Expect(patchAsMap[fieldName]).To(BeNil())
 	} else {
-		traceStatements, ok := patchAsMap[fieldName].([]interface{})
+		traceStatements, ok := patchAsMap[fieldName].([]any)
 		Expect(ok).To(BeTrue())
 		Expect(traceStatements).To(HaveLen(len(expectedGroups)))
 		for i, expectedTransformGroup := range expectedGroups {
-			actualTransformGroup := traceStatements[i].(map[string]interface{})
+			actualTransformGroup := traceStatements[i].(map[string]any)
 			verifyString(expectedTransformGroup.Context, actualTransformGroup, contextKey)
 			verifyErrorMode(expectedTransformGroup.ErrorMode, actualTransformGroup)
 			verifyListOfStrings(expectedTransformGroup.Statements, actualTransformGroup, statementsKey)
@@ -694,7 +869,7 @@ func verifyNormalizedTransformGroupsForOneSignal(
 	}
 }
 
-func verifyString(expectedString *string, actualTransformGroup map[string]interface{}, key string) {
+func verifyString(expectedString *string, actualTransformGroup map[string]any, key string) {
 	if expectedString == nil {
 		Expect(actualTransformGroup[key]).To(BeNil())
 	} else {
@@ -703,7 +878,7 @@ func verifyString(expectedString *string, actualTransformGroup map[string]interf
 	}
 }
 
-func verifyErrorMode(expectedErrorMode *dash0common.FilterTransformErrorMode, actualTransformGroup map[string]interface{}) {
+func verifyErrorMode(expectedErrorMode *dash0common.FilterTransformErrorMode, actualTransformGroup map[string]any) {
 	if expectedErrorMode == nil {
 		Expect(actualTransformGroup[errorModeKey]).To(BeNil())
 	} else {
@@ -712,11 +887,11 @@ func verifyErrorMode(expectedErrorMode *dash0common.FilterTransformErrorMode, ac
 	}
 }
 
-func verifyListOfStrings(expectedStrings []string, actualTransformGroup map[string]interface{}, key string) {
+func verifyListOfStrings(expectedStrings []string, actualTransformGroup map[string]any, key string) {
 	if expectedStrings == nil {
 		Expect(actualTransformGroup[key]).To(BeNil())
 	} else {
-		actualValues := actualTransformGroup[key].([]interface{})
+		actualValues := actualTransformGroup[key].([]any)
 		Expect(actualValues).To(HaveLen(len(expectedStrings)))
 		for j, expectedStatement := range expectedStrings {
 			Expect(actualValues[j]).To(Equal(expectedStatement))

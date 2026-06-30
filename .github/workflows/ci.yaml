@@ -53,9 +53,9 @@ jobs:
     if: always() && needs.check_for_successful_builds_for_same_commit.outputs.should_skip != 'true'
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
-      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -68,7 +68,7 @@ jobs:
         run: |
           shellcheck --version
 
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '24.x'
           cache: 'npm'
@@ -116,7 +116,7 @@ jobs:
   # meant for production use.
   build_and_push_images:
     name: Build Images
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     needs:
       - verify
       - instrumentation_image_tests
@@ -125,10 +125,14 @@ jobs:
       (needs.verify.result == 'skipped' || needs.verify.result == 'success') &&
       (needs.instrumentation_image_tests.result == 'skipped' || needs.instrumentation_image_tests.result == 'success')
 
-    timeout-minutes: 30
+    # Building all container images across architectures via qemu can take _really_ long, especially if the build cache
+    # is empty.
+    timeout-minutes: 120
+
+
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
 
@@ -177,6 +181,8 @@ jobs:
         uses: ./.github/actions/build-image
         with:
           githubToken: ${{ secrets.GITHUB_TOKEN }}
+          slackBotToken: ${{ secrets.SLACK_BOT_TOKEN }}
+          slackChannelId: ${{ secrets.SLACK_CHANNEL_ID }}
           imageName: filelog-offset-sync
           imageTitle: Dash0 Kubernetes Filelog Offset Sync
           imageDescription: the filelog offset sync for the Dash0 operator for Kubernetes
@@ -195,6 +201,17 @@ jobs:
           context: images
           file: images/filelogoffsetvolumeownership/Dockerfile
 
+      - name: build volume ownership image
+        uses: ./.github/actions/build-image
+        with:
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          imageName: volume-ownership
+          imageTitle: Dash0 Kubernetes Volume Ownership
+          imageDescription: the volume ownership init container for the Dash0 operator for Kubernetes
+          imageUrl: https://github.com/dash0hq/dash0-operator/tree/main
+          context: images
+          file: images/volumeownership/Dockerfile
+
       - name: build target-allocator image
         uses: ./.github/actions/build-image
         with:
@@ -205,6 +222,27 @@ jobs:
           imageUrl: https://github.com/au-ee/dash0-operator/tree/main/images/target-allocator
           context: images/target-allocator
 
+      - name: build agent0-connector image
+        uses: ./.github/actions/build-image
+        with:
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          imageName: agent0-connector
+          imageTitle: Dash0 Agent0 Connector
+          imageDescription: the agent0-connector component for the Dash0 operator for Kubernetes
+          imageUrl: https://github.com/dash0hq/dash0-operator/tree/main/images/agent0-connector
+          context: images
+          file: images/agent0-connector/Dockerfile
+
+  e2e_tests:
+    name: End-to-end Tests
+    needs:
+      - build_and_push_images
+    if: ${{ always() && github.ref == 'refs/heads/main' && needs.build_and_push_images.result == 'success' }}
+    uses: ./.github/workflows/e2e.yaml
+    secrets:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
   publish_helm_chart_dry_run:
     name: Publish Helm Chart (Dry Run)
     runs-on: ubuntu-latest
@@ -213,7 +251,7 @@ jobs:
     if: ${{ always() && ! contains(github.ref, 'refs/tags/') && github.actor != 'dependabot[bot]' && needs.build_and_push_images.result == 'success' }}
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: publish helm chart (dry run)
         run: |
@@ -248,7 +286,7 @@ jobs:
       - build_and_push_images
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: publish helm chart
         run: |
@@ -256,3 +294,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           echo "publishing helm chart version ${{ github.ref_name }}"
           helm-chart/bin/publish.sh ${{ github.ref_name }}
+
+  # After publishing a release, sync the Helm chart docs to the documentation on https://www.dash0.com/docs.
+  sync_docs_to_website:
+    name: Synchronize Helm chart docs to dash0.com/docs
+    needs:
+      - publish_helm_chart
+    if: ${{ always() && contains(github.ref, 'refs/tags/') && needs.publish_helm_chart.result == 'success' }}
+    uses: ./.github/workflows/sync-docs-to-website.yaml
+    secrets:
+      DASH0_DOCS_REPO_GITHUB_PAT: ${{ secrets.DASH0_DOCS_REPO_GITHUB_PAT }}
+      SYNC_DOCUMENTATION_TARGET_REPOSITORY: ${{ secrets.SYNC_DOCUMENTATION_TARGET_REPOSITORY }}
+      SYNC_DOCUMENTATION_TARGET_DIRECTORY: ${{ secrets.SYNC_DOCUMENTATION_TARGET_DIRECTORY }}

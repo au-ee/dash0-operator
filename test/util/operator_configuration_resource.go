@@ -10,7 +10,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
@@ -21,11 +20,6 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-const (
-	OperatorWebhookServiceName        = "dash0-operator-webhook-service"
-	OperatorConfigurationResourceName = "dash0-operator-configuration-test"
-)
-
 var (
 	OperatorConfigurationResourceDefaultObjectMeta = metav1.ObjectMeta{
 		Name: OperatorConfigurationResourceName,
@@ -33,130 +27,160 @@ var (
 
 	OperatorConfigurationResourceWithoutExport = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
 	}
 
 	OperatorConfigurationResourceDash0ExportWithoutApiEndpointWithToken = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint: EndpointDash0Test,
-				Authorization: dash0common.Authorization{
-					Token: &AuthorizationTokenTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint: EndpointDash0Test,
+					Authorization: dash0common.Authorization{
+						Token: &AuthorizationTokenTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
 	OperatorConfigurationResourceDash0ExportWithoutApiEndpointWithSecretRef = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint: EndpointDash0Test,
-				Authorization: dash0common.Authorization{
-					SecretRef: &SecretRefTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint: EndpointDash0Test,
+					Authorization: dash0common.Authorization{
+						SecretRef: &SecretRefTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
 	OperatorConfigurationResourceDash0ExportWithApiEndpointWithToken = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint:    EndpointDash0Test,
-				ApiEndpoint: ApiEndpointTest,
-				Authorization: dash0common.Authorization{
-					Token: &AuthorizationTokenTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint:    EndpointDash0Test,
+					ApiEndpoint: ApiEndpointTest,
+					Authorization: dash0common.Authorization{
+						Token: &AuthorizationTokenTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
 	OperatorConfigurationResourceDash0ExportWithApiEndpointWithSecretRef = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint:    EndpointDash0Test,
-				ApiEndpoint: ApiEndpointTest,
-				Authorization: dash0common.Authorization{
-					SecretRef: &SecretRefTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint:    EndpointDash0Test,
+					ApiEndpoint: ApiEndpointTest,
+					Authorization: dash0common.Authorization{
+						SecretRef: &SecretRefTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
 	OperatorConfigurationResourceWithoutSelfMonitoringWithToken = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(false),
+			Enabled: new(false),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint:    EndpointDash0Test,
-				ApiEndpoint: ApiEndpointTest,
-				Authorization: dash0common.Authorization{
-					Token: &AuthorizationTokenTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint:    EndpointDash0Test,
+					ApiEndpoint: ApiEndpointTest,
+					Authorization: dash0common.Authorization{
+						Token: &AuthorizationTokenTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
 	OperatorConfigurationResourceWithSelfMonitoringWithToken = dash0v1alpha1.Dash0OperatorConfigurationSpec{
 		SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
-		Export: &dash0common.Export{
-			Dash0: &dash0common.Dash0Configuration{
-				Endpoint: EndpointDash0Test,
-				Authorization: dash0common.Authorization{
-					Token: &AuthorizationTokenTest,
+		Exports: []dash0common.Export{
+			{
+				Dash0: &dash0common.Dash0Configuration{
+					Endpoint: EndpointDash0Test,
+					Authorization: dash0common.Authorization{
+						Token: &AuthorizationTokenTest,
+					},
 				},
 			},
 		},
 		KubernetesInfrastructureMetricsCollection: dash0v1alpha1.KubernetesInfrastructureMetricsCollection{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
 		},
 		CollectPodLabelsAndAnnotations: dash0v1alpha1.CollectPodLabelsAndAnnotations{
-			Enabled: ptr.To(true),
+			Enabled: new(true),
+		},
+		CollectNamespaceLabelsAndAnnotations: dash0v1alpha1.CollectNamespaceLabelsAndAnnotations{
+			Enabled: new(true),
 		},
 	}
 
@@ -225,13 +249,15 @@ func CreateOperatorConfigurationResourceWithName(
 			},
 			Spec: dash0v1alpha1.Dash0OperatorConfigurationSpec{
 				SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-					Enabled: ptr.To(false),
+					Enabled: new(false),
 				},
-				Export: &dash0common.Export{
-					Dash0: &dash0common.Dash0Configuration{
-						Endpoint: EndpointDash0Test,
-						Authorization: dash0common.Authorization{
-							Token: &AuthorizationTokenTest,
+				Exports: []dash0common.Export{
+					{
+						Dash0: &dash0common.Dash0Configuration{
+							Endpoint: EndpointDash0Test,
+							Authorization: dash0common.Authorization{
+								Token: &AuthorizationTokenTest,
+							},
 						},
 					},
 				},

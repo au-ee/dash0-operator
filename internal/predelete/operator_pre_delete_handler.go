@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -19,6 +18,7 @@ import (
 
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 const (
@@ -27,7 +27,7 @@ const (
 
 type OperatorPreDeleteHandler struct {
 	client  client.WithWatch
-	logger  *logr.Logger
+	logger  logd.Logger
 	timeout time.Duration
 }
 
@@ -37,7 +37,7 @@ func NewOperatorPreDeleteHandler() (*OperatorPreDeleteHandler, error) {
 }
 
 func NewOperatorPreDeleteHandlerFromConfig(config *rest.Config) (*OperatorPreDeleteHandler, error) {
-	logger := ctrl.Log.WithName("dash0-uninstrument-all")
+	logger := logd.NewLogger(ctrl.Log.WithName("dash0-uninstrument-all"))
 	s := runtime.NewScheme()
 	if err := dash0v1alpha1.AddToScheme(s); err != nil {
 		return nil, err
@@ -54,7 +54,7 @@ func NewOperatorPreDeleteHandlerFromConfig(config *rest.Config) (*OperatorPreDel
 
 	return &OperatorPreDeleteHandler{
 		client:  k8sClient,
-		logger:  &logger,
+		logger:  logger,
 		timeout: defaultTimeout,
 	}, nil
 }
@@ -166,7 +166,7 @@ func (h *OperatorPreDeleteHandler) waitForAllDash0MonitoringResourcesToBeFinaliz
 	}
 
 	if timeoutHasOccured {
-		h.logger.Info(
+		h.logger.Warn(
 			fmt.Sprintf("The deletion of all Dash0 monitoring resource(s) across all namespaces has not completed "+
 				"successfully within the timeout of %d seconds. %d of %d resources have been deleted.",
 				int(h.timeout/time.Second),

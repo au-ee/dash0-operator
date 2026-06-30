@@ -23,6 +23,9 @@ type Images struct {
 	fileLogOffsetSync            ImageSpec
 	fileLogOffsetVolumeOwnership ImageSpec
 	targetAllocator              ImageSpec
+	intelligentEdgeCollector     ImageSpec
+	barker                       ImageSpec
+	agent0Connector              ImageSpec
 }
 
 const (
@@ -33,9 +36,11 @@ const (
 	filelogOffsetSyncImageName            = "filelog-offset-sync"
 	filelogOffsetVolumeOwnershipImageName = "filelog-offset-volume-ownership"
 	targetAllocatorImageName              = "target-allocator"
+	intelligentEdgeCollectorImageName     = "intelligent-edge-collector"
+	barkerImageName                       = "barker"
+	agent0ConnectorImageName              = "agent0-connector"
 
-	tagLatest  = "latest"
-	tagMainDev = "main-dev"
+	tagLatest = "latest"
 
 	productionImageRepositoryPrefix = "ghcr.io/au-ee/"
 	defaultImageRepositoryPrefix    = ""
@@ -44,53 +49,12 @@ const (
 )
 
 var (
-	emptyImages = Images{
-		operator: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		instrumentation: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		collector: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		configurationReloader: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		fileLogOffsetSync: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		fileLogOffsetVolumeOwnership: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-		targetAllocator: ImageSpec{
-			repository: "",
-			tag:        "",
-			pullPolicy: "",
-		},
-	}
-
 	images Images
 )
 
 func determineContainerImages() {
-	operatorHelmChart = getEnvOrDefault("OPERATOR_HELM_CHART", operatorHelmChart)
-	operatorHelmChartUrl = getEnvOrDefault("OPERATOR_HELM_CHART_URL", operatorHelmChartUrl)
-
-	if !isLocalHelmChart() {
-		images = emptyImages
+	if !isLocalHelmChart(operatorHelmChart) {
+		images = Images{}
 		e2ePrint("Using a non-local Helm chart (%s). Image settings will come from the chart. "+
 			"Ignoring IMAGE_REPOSITORY_PREFIX, IMAGE_TAG, PULL_POLICY, and per-image environment variables.\n",
 			operatorHelmChart)
@@ -100,63 +64,79 @@ func determineContainerImages() {
 	repositoryPrefix := getEnvOrDefault("IMAGE_REPOSITORY_PREFIX", defaultImageRepositoryPrefix)
 	imageTag := getEnvOrDefault("IMAGE_TAG", defaultImageTag)
 	pullPolicy := getEnvOrDefault("PULL_POLICY", defaultPullPolicy)
+	images = createContainerImages(repositoryPrefix, imageTag, pullPolicy)
+}
 
-	images.operator =
-		determineContainerImage(
+func createContainerImagesForHelmChartVersion(version string) Images {
+	return createContainerImages(productionImageRepositoryPrefix, version, "")
+}
+
+func createContainerImages(repositoryPrefix string, imageTag string, pullPolicy string) Images {
+	return Images{
+		operator: determineContainerImage(
 			"CONTROLLER",
 			repositoryPrefix,
 			operatorControllerImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.instrumentation =
-		determineContainerImage(
+		),
+		instrumentation: determineContainerImage(
 			"INSTRUMENTATION",
 			repositoryPrefix,
 			instrumentationImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.collector =
-		determineContainerImage(
+		),
+		collector: determineContainerImage(
 			"COLLECTOR",
 			repositoryPrefix,
 			collectorImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.configurationReloader =
-		determineContainerImage(
+		),
+		configurationReloader: determineContainerImage(
 			"CONFIGURATION_RELOADER",
 			repositoryPrefix,
 			configurationReloaderImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.fileLogOffsetSync =
-		determineContainerImage(
+		),
+		fileLogOffsetSync: determineContainerImage(
 			"FILELOG_OFFSET_SYNC",
 			repositoryPrefix,
 			filelogOffsetSyncImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.fileLogOffsetVolumeOwnership =
-		determineContainerImage(
+		),
+		fileLogOffsetVolumeOwnership: determineContainerImage(
 			"FILELOG_OFFSET_VOLUME_OWNERSHIP",
 			repositoryPrefix,
 			filelogOffsetVolumeOwnershipImageName,
 			imageTag,
 			pullPolicy,
-		)
-	images.targetAllocator =
-		determineContainerImage(
+		),
+		targetAllocator: determineContainerImage(
 			"TARGET_ALLOCATOR",
 			repositoryPrefix,
 			targetAllocatorImageName,
 			imageTag,
 			pullPolicy,
-		)
+		),
+		// Intelligent edge collector and barker are owned by a different team in a different
+		// repository and not built from this repo. Their images are pinned in the Helm chart's
+		// values.yaml. Leave repository/tag/digest/pullPolicy empty unless the caller explicitly
+		// overrides them via env vars; the empty fields are skipped by setIfNotEmpty in operator.go,
+		// so the chart's pinned values flow through.
+		intelligentEdgeCollector: determineExternalContainerImage("INTELLIGENT_EDGE_COLLECTOR"),
+		barker:                   determineExternalContainerImage("BARKER"),
+		agent0Connector: determineContainerImage(
+			"AGENT0_CONNECTOR",
+			repositoryPrefix,
+			agent0ConnectorImageName,
+			imageTag,
+			pullPolicy,
+		),
+	}
 }
 
 func determineContainerImage(
@@ -175,65 +155,23 @@ func determineContainerImage(
 	}
 }
 
+// determineExternalContainerImage reads only env-var overrides for an image whose default
+// repository/tag is provided by the Helm chart (i.e. images we don't build in this repo).
+// Unset fields stay empty and are skipped by setIfNotEmpty in operator.go, so the chart's
+// pinned values are used at helm install time. Set any of the env vars to override.
+func determineExternalContainerImage(envVarPrefix string) ImageSpec {
+	return ImageSpec{
+		repository: os.Getenv(fmt.Sprintf("%s_IMAGE_REPOSITORY", envVarPrefix)),
+		tag:        os.Getenv(fmt.Sprintf("%s_IMAGE_TAG", envVarPrefix)),
+		digest:     os.Getenv(fmt.Sprintf("%s_IMAGE_DIGEST", envVarPrefix)),
+		pullPolicy: os.Getenv(fmt.Sprintf("%s_IMAGE_PULL_POLICY", envVarPrefix)),
+	}
+}
+
 func getEnvOrDefault(name string, defaultValue string) string {
 	value, isSet := os.LookupEnv(name)
 	if isSet {
 		return value
 	}
 	return defaultValue
-}
-
-func deriveAlternativeImagesForUpdateTest(images Images) Images {
-	return Images{
-		operator: deriveAlternativeImageForUpdateTest(
-			images.operator,
-			operatorControllerImageName,
-		),
-		instrumentation: deriveAlternativeImageForUpdateTest(
-			images.instrumentation,
-			instrumentationImageName,
-		),
-		collector: deriveAlternativeImageForUpdateTest(
-			images.collector,
-			collectorImageName,
-		),
-		configurationReloader: deriveAlternativeImageForUpdateTest(
-			images.configurationReloader,
-			configurationReloaderImageName,
-		),
-		fileLogOffsetSync: deriveAlternativeImageForUpdateTest(
-			images.fileLogOffsetSync,
-			filelogOffsetSyncImageName,
-		),
-		fileLogOffsetVolumeOwnership: deriveAlternativeImageForUpdateTest(
-			images.fileLogOffsetVolumeOwnership,
-			filelogOffsetVolumeOwnershipImageName,
-		),
-		targetAllocator: deriveAlternativeImageForUpdateTest(
-			images.targetAllocator,
-			targetAllocatorImageName,
-		),
-	}
-}
-
-func deriveAlternativeImageForUpdateTest(image ImageSpec, imageName string) ImageSpec {
-	productionImage := productionImageRepositoryPrefix + imageName
-	// For the "should update instrumentation modifications at startup" test case, we need to come up with an
-	// alternative fully qualified image name, one that is different from the image name that is being used for the
-	// regular "helm install" invocations in this e2e test suite run.
-	if image.repository != productionImage || image.tag != tagLatest {
-		// Use "ghcr.io/au-ee/$image:latest", if that is different from the original image.
-		// (The "latest" tag is built with every release, although it is not used in the Helm chart.)
-		return ImageSpec{
-			repository: productionImage,
-			tag:        tagLatest,
-		}
-	} else {
-		// Otherwise, as a fallback, use "ghcr.io/au-ee/$image:main-dev".
-		// (The "main-dev" tag is built for every commit pushed to the main branch.)
-		return ImageSpec{
-			repository: productionImage,
-			tag:        tagMainDev,
-		}
-	}
 }

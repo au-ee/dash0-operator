@@ -5,126 +5,14 @@ cluster roles should match snapshot:
     metadata:
       labels:
         app.kubernetes.io/component: controller
-        app.kubernetes.io/instance: manager-role
+        app.kubernetes.io/instance: cluster-role-base
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/name: dash0-operator
         app.kubernetes.io/part-of: dash0-operator
         app.kubernetes.io/version: 0.0.0
         helm.sh/chart: dash0-operator-0.0.0
-      name: dash0-operator-manager-role
+      name: dash0-operator-manager-base
     rules:
-      - apiGroups:
-          - apiextensions.k8s.io
-        resources:
-          - customresourcedefinitions
-        verbs:
-          - get
-          - list
-          - watch
-      - apiGroups:
-          - apps
-        resources:
-          - daemonsets
-          - deployments
-          - replicasets
-          - statefulsets
-        verbs:
-          - get
-          - list
-          - patch
-          - update
-          - watch
-      - apiGroups:
-          - batch
-        resources:
-          - cronjobs
-          - jobs
-        verbs:
-          - get
-          - list
-          - patch
-          - update
-          - watch
-      - apiGroups:
-          - discovery.k8s.io
-        resources:
-          - endpointslices
-        verbs:
-          - list
-      - apiGroups:
-          - events.k8s.io
-        resources:
-          - events
-        verbs:
-          - create
-          - list
-          - patch
-          - update
-      - apiGroups:
-          - ""
-        resources:
-          - namespaces
-        verbs:
-          - get
-      - apiGroups:
-          - ""
-        resources:
-          - pods
-        verbs:
-          - delete
-          - get
-          - list
-      - apiGroups:
-          - ""
-        resources:
-          - secrets
-        verbs:
-          - get
-          - list
-          - watch
-      - apiGroups:
-          - perses.dev
-        resources:
-          - persesdashboards
-        verbs:
-          - get
-          - list
-          - watch
-      - apiGroups:
-          - monitoring.coreos.com
-        resources:
-          - prometheusrules
-        verbs:
-          - get
-          - list
-          - watch
-      - apiGroups:
-          - operator.dash0.com
-        resources:
-          - dash0monitorings
-        verbs:
-          - create
-          - delete
-          - deletecollection
-          - get
-          - list
-          - patch
-          - update
-          - watch
-      - apiGroups:
-          - operator.dash0.com
-        resources:
-          - dash0monitorings/finalizers
-        verbs:
-          - update
-      - apiGroups:
-          - operator.dash0.com
-        resources:
-          - dash0monitorings/status
-        verbs:
-          - get
-          - patch
-          - update
       - apiGroups:
           - operator.dash0.com
         resources:
@@ -155,6 +43,110 @@ cluster roles should match snapshot:
       - apiGroups:
           - operator.dash0.com
         resources:
+          - dash0monitorings
+        verbs:
+          - create
+          - delete
+          - deletecollection
+          - get
+          - list
+          - patch
+          - update
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0monitorings/finalizers
+        verbs:
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0monitorings/status
+        verbs:
+          - get
+          - patch
+          - update
+      - apiGroups:
+          - events.k8s.io
+        resources:
+          - events
+        verbs:
+          - create
+          - list
+          - patch
+          - update
+      - apiGroups:
+          - ""
+        resources:
+          - namespaces
+        verbs:
+          - get
+      - apiGroups:
+          - ""
+        resources:
+          - events
+        verbs:
+          - list
+          - patch
+          - update
+      - apiGroups:
+          - ""
+        resources:
+          - nodes
+        verbs:
+          - get
+          - list
+  2: |
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/instance: cluster-role-iac
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: dash0-operator
+        app.kubernetes.io/part-of: dash0-operator
+        app.kubernetes.io/version: 0.0.0
+        helm.sh/chart: dash0-operator-0.0.0
+      name: dash0-operator-manager-iac
+    rules:
+      - apiGroups:
+          - apiextensions.k8s.io
+        resources:
+          - customresourcedefinitions
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - apiextensions.k8s.io
+        resourceNames:
+          - persesdashboards.perses.dev
+        resources:
+          - customresourcedefinitions
+        verbs:
+          - patch
+          - update
+      - apiGroups:
+          - perses.dev
+        resources:
+          - persesdashboards
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - monitoring.coreos.com
+        resources:
+          - prometheusrules
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
           - dash0syntheticchecks
         verbs:
           - get
@@ -164,6 +156,22 @@ cluster roles should match snapshot:
           - operator.dash0.com
         resources:
           - dash0syntheticchecks/status
+        verbs:
+          - get
+          - patch
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0signaltometrics
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0signaltometrics/status
         verbs:
           - get
           - patch
@@ -184,6 +192,95 @@ cluster roles should match snapshot:
           - get
           - patch
           - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0notificationchannels
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0notificationchannels/status
+        verbs:
+          - get
+          - patch
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0spamfilters
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0spamfilters/status
+        verbs:
+          - get
+          - patch
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0intelligentedges
+        verbs:
+          - create
+          - delete
+          - deletecollection
+          - get
+          - list
+          - patch
+          - update
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0intelligentedges/finalizers
+        verbs:
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0intelligentedges/status
+        verbs:
+          - get
+          - patch
+          - update
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0samplingrules
+        verbs:
+          - get
+          - list
+          - watch
+      - apiGroups:
+          - operator.dash0.com
+        resources:
+          - dash0samplingrules/status
+        verbs:
+          - get
+          - patch
+          - update
+  3: |
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/instance: cluster-role-collector
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/name: dash0-operator
+        app.kubernetes.io/part-of: dash0-operator
+        app.kubernetes.io/version: 0.0.0
+        helm.sh/chart: dash0-operator-0.0.0
+      name: dash0-operator-manager-collector
+    rules:
       - apiGroups:
           - ""
         resources:
@@ -374,51 +471,61 @@ cluster roles should match snapshot:
           - get
           - list
           - watch
+      - apiGroups:
+          - ""
+        resources:
+          - secrets
+        verbs:
+          - get
+          - list
+          - watch
       - nonResourceURLs:
           - /metrics
         verbs:
           - get
-  2: |
+  4: |
     apiVersion: rbac.authorization.k8s.io/v1
     kind: ClusterRole
     metadata:
       labels:
         app.kubernetes.io/component: controller
-        app.kubernetes.io/instance: metrics-role
+        app.kubernetes.io/instance: cluster-role-instrument
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/name: dash0-operator
         app.kubernetes.io/part-of: dash0-operator
         app.kubernetes.io/version: 0.0.0
         helm.sh/chart: dash0-operator-0.0.0
-      name: dash0-operator-metrics-reader
+      name: dash0-operator-manager-instrument
     rules:
-      - nonResourceURLs:
-          - /metrics
+      - apiGroups:
+          - apps
+        resources:
+          - daemonsets
+          - deployments
+          - replicasets
+          - statefulsets
         verbs:
           - get
-  3: |
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRole
-    metadata:
-      labels:
-        app.kubernetes.io/component: controller
-        app.kubernetes.io/instance: proxy-role
-        app.kubernetes.io/managed-by: Helm
-        app.kubernetes.io/name: dash0-operator
-        app.kubernetes.io/part-of: dash0-operator
-        app.kubernetes.io/version: 0.0.0
-        helm.sh/chart: dash0-operator-0.0.0
-      name: dash0-operator-proxy-role
-    rules:
+          - list
+          - patch
+          - update
+          - watch
       - apiGroups:
-          - authentication.k8s.io
+          - batch
         resources:
-          - tokenreviews
+          - cronjobs
+          - jobs
         verbs:
-          - create
+          - get
+          - list
+          - patch
+          - update
+          - watch
       - apiGroups:
-          - authorization.k8s.io
+          - ""
         resources:
-          - subjectaccessreviews
+          - pods
         verbs:
-          - create
+          - delete
+          - get
+          - list

@@ -10,7 +10,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +25,7 @@ import (
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/resources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 	"github.com/dash0hq/dash0-operator/internal/workloads"
 )
 
@@ -93,7 +93,7 @@ func NewInstrumenter(
 	}
 }
 
-func (i *Instrumenter) UpdateExtraConfig(_ context.Context, extraConfig util.ExtraConfig, _ *logr.Logger) {
+func (i *Instrumenter) UpdateExtraConfig(_ context.Context, extraConfig util.ExtraConfig, _ logd.Logger) {
 	i.ClusterInstrumentationConfig.ExtraConfig.Store(&extraConfig)
 }
 
@@ -107,22 +107,22 @@ func (i *Instrumenter) UpdateExtraConfig(_ context.Context, extraConfig util.Ext
 // namespaces.
 func (i *Instrumenter) InstrumentAtStartup(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	logger.Info("Applying/updating instrumentation at manager startup.")
-	allDash0MonitoringResouresInCluster := &dash0v1beta1.Dash0MonitoringList{}
+	allDash0MonitoringResourcesInCluster := &dash0v1beta1.Dash0MonitoringList{}
 	if err := i.List(
 		ctx,
-		allDash0MonitoringResouresInCluster,
+		allDash0MonitoringResourcesInCluster,
 		&client.ListOptions{},
 	); err != nil {
 		logger.Error(err, "Failed to list all Dash0 monitoring resources at manager startup.")
 		return
 	}
 
-	logger.Info(fmt.Sprintf("Applying/updating instrumentation at manager startup: Found %d Dash0 monitoring resources.", len(allDash0MonitoringResouresInCluster.Items)))
+	logger.Info(fmt.Sprintf("Applying/updating instrumentation at manager startup: Found %d Dash0 monitoring resources.", len(allDash0MonitoringResourcesInCluster.Items)))
 
-	for _, dash0MonitoringResource := range allDash0MonitoringResouresInCluster.Items {
+	for _, dash0MonitoringResource := range allDash0MonitoringResourcesInCluster.Items {
 		logger.Info(
 			fmt.Sprintf(
 				"Applying/updating instrumentation at manager startup: Processing workloads in Dash0-enabled namespace %s",
@@ -159,9 +159,9 @@ func (i *Instrumenter) InstrumentAtStartup(
 			&dash0MonitoringResource,
 			logger,
 		); err != nil {
-			logger.Error(
+			logger.ErrorAsWarnTelemetryCollectionIssue(
 				err,
-				"Failed to apply/update instrumentation instrumentation at startup in one namespace.",
+				"Failed to apply/update instrumentation at startup in one namespace.",
 				"namespace",
 				dash0MonitoringResource.Namespace,
 				"name",
@@ -187,7 +187,7 @@ func (i *Instrumenter) InstrumentAtStartup(
 func (i *Instrumenter) CheckSettingsAndInstrumentExistingWorkloads(
 	ctx context.Context,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	instrumentWorkloadsMode := dash0MonitoringResource.ReadInstrumentWorkloadsMode()
 	if instrumentWorkloadsMode == dash0common.InstrumentWorkloadsModeNone {
@@ -207,7 +207,7 @@ func (i *Instrumenter) CheckSettingsAndInstrumentExistingWorkloads(
 
 	logger.Info("Now instrumenting existing workloads in namespace so they send telemetry to Dash0.")
 	if err := i.instrumentAllWorkloads(ctx, dash0MonitoringResource, logger); err != nil {
-		logger.Error(err, "Instrumenting existing workloads failed.")
+		logger.ErrorAsWarnTelemetryCollectionIssue(err, "Instrumenting existing workloads failed.")
 		return err
 	}
 
@@ -217,7 +217,7 @@ func (i *Instrumenter) CheckSettingsAndInstrumentExistingWorkloads(
 func (i *Instrumenter) instrumentAllWorkloads(
 	ctx context.Context,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	namespace := dash0MonitoringResource.Namespace
 
@@ -244,8 +244,8 @@ func (i *Instrumenter) instrumentAllWorkloads(
 func (i *Instrumenter) findAndInstrumentCronJobs(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -267,8 +267,8 @@ func (i *Instrumenter) findAndInstrumentCronJobs(
 func (i *Instrumenter) instrumentCronJob(
 	ctx context.Context,
 	cronJob *batchv1.CronJob,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.instrumentWorkload(
 		ctx,
@@ -282,8 +282,8 @@ func (i *Instrumenter) instrumentCronJob(
 func (i *Instrumenter) findAndInstrumentyDaemonSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -305,8 +305,8 @@ func (i *Instrumenter) findAndInstrumentyDaemonSets(
 func (i *Instrumenter) instrumentDaemonSet(
 	ctx context.Context,
 	daemonSet *appsv1.DaemonSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.instrumentWorkload(
 		ctx,
@@ -321,8 +321,8 @@ func (i *Instrumenter) instrumentDaemonSet(
 func (i *Instrumenter) findAndInstrumentDeployments(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -344,8 +344,8 @@ func (i *Instrumenter) findAndInstrumentDeployments(
 func (i *Instrumenter) instrumentDeployment(
 	ctx context.Context,
 	deployment *appsv1.Deployment,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.instrumentWorkload(
 		ctx, &deploymentWorkload{
@@ -359,8 +359,8 @@ func (i *Instrumenter) instrumentDeployment(
 func (i *Instrumenter) findAndAddLabelsToImmutableJobsOnInstrumentation(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -382,8 +382,8 @@ func (i *Instrumenter) findAndAddLabelsToImmutableJobsOnInstrumentation(
 func (i *Instrumenter) handleJobOnInstrumentation(
 	ctx context.Context,
 	job *batchv1.Job,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	logger := reconcileLogger.WithValues(
 		workkloadTypeLabel,
@@ -437,6 +437,7 @@ func (i *Instrumenter) handleJobOnInstrumentation(
 		requiredAction = util.ModificationModeInstrumentation
 	}
 
+	logger.Debug("determined required action for immutable job", "required action", requiredAction, "modifyLabels", modifyLabels)
 	modificationResult := workloads.NewNotModifiedReasonUnknownResult()
 	retryErr := util.Retry("handling immutable job", func() error {
 		if !modifyLabels {
@@ -456,7 +457,7 @@ func (i *Instrumenter) handleJobOnInstrumentation(
 				newWorkloadModifier(
 					i.ClusterInstrumentationConfig,
 					namespaceInstrumentationConfig,
-					&logger,
+					logger,
 				).
 					AddLabelsToImmutableJob(job)
 		case util.ModificationModeUninstrumentation:
@@ -464,7 +465,7 @@ func (i *Instrumenter) handleJobOnInstrumentation(
 				newWorkloadModifier(
 					i.ClusterInstrumentationConfig,
 					namespaceInstrumentationConfig,
-					&logger,
+					logger,
 				).
 					RemoveLabelsFromImmutableJob(job)
 		}
@@ -474,14 +475,14 @@ func (i *Instrumenter) handleJobOnInstrumentation(
 		} else {
 			return nil
 		}
-	}, &logger)
+	}, logger)
 
 	postProcess := i.postProcessInstrumentation
 	if requiredAction == util.ModificationModeUninstrumentation {
 		postProcess = i.postProcessUninstrumentation
 	}
 	if retryErr != nil {
-		postProcess(job, workloads.NewNotModifiedDueToErrorResult(), retryErr, &logger)
+		postProcess(job, workloads.NewNotModifiedDueToErrorResult(), retryErr, logger)
 	} else if createImmutableWorkloadsError {
 		// One way or another we are in a situation were we would have wanted to instrument/uninstrument the job, but
 		// could not. Passing an ImmutableWorkloadError to postProcess will make sure we write a corresponding log
@@ -490,17 +491,17 @@ func (i *Instrumenter) handleJobOnInstrumentation(
 			workloadType:     "job",
 			workloadName:     fmt.Sprintf("%s/%s", job.GetNamespace(), job.GetName()),
 			modificationMode: requiredAction,
-		}, &logger)
+		}, logger)
 	} else {
-		postProcess(job, modificationResult, nil, &logger)
+		postProcess(job, modificationResult, nil, logger)
 	}
 }
 
 func (i *Instrumenter) findAndInstrumentReplicaSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -522,8 +523,8 @@ func (i *Instrumenter) findAndInstrumentReplicaSets(
 func (i *Instrumenter) instrumentReplicaSet(
 	ctx context.Context,
 	replicaSet *appsv1.ReplicaSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	hasBeenUpdated := i.instrumentWorkload(
 		ctx,
@@ -542,8 +543,8 @@ func (i *Instrumenter) instrumentReplicaSet(
 func (i *Instrumenter) findAndInstrumentStatefulSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -565,8 +566,8 @@ func (i *Instrumenter) findAndInstrumentStatefulSets(
 func (i *Instrumenter) instrumentStatefulSet(
 	ctx context.Context,
 	statefulSet *appsv1.StatefulSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.instrumentWorkload(
 		ctx, &statefulSetWorkload{
@@ -580,8 +581,8 @@ func (i *Instrumenter) instrumentStatefulSet(
 func (i *Instrumenter) instrumentWorkload(
 	ctx context.Context,
 	workload instrumentableWorkload,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) bool {
 	workloadMeta := workload.getObjectMeta()
 	containers := workload.getPodSpec().Containers
@@ -607,7 +608,7 @@ func (i *Instrumenter) instrumentWorkload(
 		// The webhook will skip modifying this workload on the i.Update below anyway, since this workload is marked
 		// as opt-out. Therefore, adding the ignore-once label is not required.
 		addIgnoreOnceLabel = false
-	} else if workloads.InstrumentationIsUpToDate(workloadMeta, containers, i.ClusterInstrumentationConfig.Images, namespaceInstrumentationConfig) {
+	} else if workloads.InstrumentationIsUpToDate(workloadMeta, containers, i.ClusterInstrumentationConfig, namespaceInstrumentationConfig) {
 		// No change necessary, this workload has already been instrumented and an opt-out label (which would need to
 		// trigger uninstrumentation) has not been added since it has been instrumented.
 		logger.Info("not updating the existing instrumentation for this workload, it has already been successfully " +
@@ -626,6 +627,7 @@ func (i *Instrumenter) instrumentWorkload(
 		requiredAction = util.ModificationModeInstrumentation
 	}
 
+	logger.Debug("determined required action for workload", "required action", requiredAction)
 	modificationResult := workloads.NewNotModifiedReasonUnknownResult()
 	retryErr := util.Retry(fmt.Sprintf("instrumenting %s", kind), func() error {
 		if err := i.Get(ctx, client.ObjectKey{
@@ -646,13 +648,13 @@ func (i *Instrumenter) instrumentWorkload(
 			modificationResult = workload.instrument(
 				i.ClusterInstrumentationConfig,
 				namespaceInstrumentationConfig,
-				&logger,
+				logger,
 			)
 		case util.ModificationModeUninstrumentation:
 			modificationResult = workload.revert(
 				i.ClusterInstrumentationConfig,
 				namespaceInstrumentationConfig,
-				&logger,
+				logger,
 			)
 		}
 
@@ -664,13 +666,13 @@ func (i *Instrumenter) instrumentWorkload(
 		} else {
 			return nil
 		}
-	}, &logger)
+	}, logger)
 
 	switch requiredAction {
 	case util.ModificationModeInstrumentation:
-		return i.postProcessInstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, &logger)
+		return i.postProcessInstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, logger)
 	case util.ModificationModeUninstrumentation:
-		return i.postProcessUninstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, &logger)
+		return i.postProcessUninstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, logger)
 	}
 	return false
 }
@@ -679,20 +681,22 @@ func (i *Instrumenter) postProcessInstrumentation(
 	resource runtime.Object,
 	modificationResult workloads.ModificationResult,
 	retryErr error,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) bool {
 	if retryErr != nil {
 		e := &ImmutableWorkloadError{}
 		if errors.As(retryErr, e) {
 			logger.Info(e.Error())
 		} else {
-			logger.Error(retryErr, "Dash0 instrumentation by controller has not been successful.")
+			logger.ErrorAsWarnTelemetryCollectionIssue(retryErr, "Dash0 instrumentation by controller has not been successful.")
 		}
 		util.QueueFailedInstrumentationEvent(i.Recorder, resource, actor, retryErr)
 		return false
 	} else if !modificationResult.HasBeenModified {
-		if !modificationResult.SkipLogging {
+		if !modificationResult.LogAtDebugOnly {
 			logger.Info(modificationResult.RenderReasonMessage(actor))
+		} else {
+			logger.Debug(modificationResult.RenderReasonMessage(actor))
 		}
 		util.QueueNoInstrumentationNecessaryEvent(i.Recorder, resource, modificationResult.RenderReasonMessage(actor))
 		return false
@@ -741,17 +745,18 @@ func (i *Instrumenter) DelayAfterEachNamespaceMillis() time.Duration {
 func (i *Instrumenter) UninstrumentWorkloadsIfAvailable(
 	ctx context.Context,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	if dash0MonitoringResource.IsAvailable() {
 		logger.Info("Reverting Dash0's modifications to workloads that have been instrumented to make them send telemetry to Dash0.")
 		if err := i.uninstrumentAllWorkloads(ctx, dash0MonitoringResource, logger); err != nil {
-			logger.Error(err, "Uninstrumenting existing workloads failed.")
+			logger.ErrorAsWarnTelemetryCollectionIssue(err, "Uninstrumenting existing workloads failed.")
 			return err
 		}
 	} else {
-		logger.Info("Removing the Dash0 monitoring resource and running finalizers, but Dash0 is not marked as available." +
-			" Dash0 instrumentation will not be removed from workloads.")
+		logger.WarnTelemetryCollectionIssue(
+			"Removing the Dash0 monitoring resource and running finalizers, but the Dash0 monitoring resource is not " +
+				"marked as available. Instrumentation will not be removed from workloads.")
 	}
 	return nil
 }
@@ -759,7 +764,7 @@ func (i *Instrumenter) UninstrumentWorkloadsIfAvailable(
 func (i *Instrumenter) uninstrumentAllWorkloads(
 	ctx context.Context,
 	dash0MonitoringResource *dash0v1beta1.Dash0Monitoring,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	namespace := dash0MonitoringResource.Namespace
 
@@ -786,8 +791,8 @@ func (i *Instrumenter) uninstrumentAllWorkloads(
 func (i *Instrumenter) findAndUninstrumentCronJobs(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -808,8 +813,8 @@ func (i *Instrumenter) findAndUninstrumentCronJobs(
 func (i *Instrumenter) uninstrumentCronJob(
 	ctx context.Context,
 	cronJob *batchv1.CronJob,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.revertWorkloadInstrumentation(
 		ctx,
@@ -824,8 +829,8 @@ func (i *Instrumenter) uninstrumentCronJob(
 func (i *Instrumenter) findAndUninstrumentDaemonSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -846,8 +851,8 @@ func (i *Instrumenter) findAndUninstrumentDaemonSets(
 func (i *Instrumenter) uninstrumentDaemonSet(
 	ctx context.Context,
 	daemonSet *appsv1.DaemonSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.revertWorkloadInstrumentation(
 		ctx,
@@ -862,8 +867,8 @@ func (i *Instrumenter) uninstrumentDaemonSet(
 func (i *Instrumenter) findAndUninstrumentDeployments(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -884,8 +889,8 @@ func (i *Instrumenter) findAndUninstrumentDeployments(
 func (i *Instrumenter) uninstrumentDeployment(
 	ctx context.Context,
 	deployment *appsv1.Deployment,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.revertWorkloadInstrumentation(
 		ctx,
@@ -900,8 +905,8 @@ func (i *Instrumenter) uninstrumentDeployment(
 func (i *Instrumenter) findAndHandleJobOnUninstrumentation(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -922,8 +927,8 @@ func (i *Instrumenter) findAndHandleJobOnUninstrumentation(
 func (i *Instrumenter) handleJobOnUninstrumentation(
 	ctx context.Context,
 	job *batchv1.Job,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	logger := reconcileLogger.WithValues(
 		workkloadTypeLabel,
@@ -958,7 +963,7 @@ func (i *Instrumenter) handleJobOnUninstrumentation(
 			// This job has been instrumented, presumably by the webhook. We cannot undo the instrumentation here, since
 			// jobs are immutable.
 
-			// Deliberately not calling newWorkloadModifier(i.Images, &logger).RemoveLabelsFromImmutableJob(&job) here
+			// Deliberately not calling newWorkloadModifier(i.Images, logger).RemoveLabelsFromImmutableJob(&job) here
 			// since we cannot remove the instrumentation, so we also have to leave the labels in place.
 			createImmutableWorkloadsError = true
 			modificationResult = workloads.NewNotModifiedImmutableWorkloadCannotBeRevertedResult()
@@ -970,7 +975,7 @@ func (i *Instrumenter) handleJobOnUninstrumentation(
 				newWorkloadModifier(
 					i.ClusterInstrumentationConfig,
 					namespaceInstrumentationConfig,
-					&logger,
+					logger,
 				).
 					RemoveLabelsFromImmutableJob(job)
 
@@ -982,13 +987,13 @@ func (i *Instrumenter) handleJobOnUninstrumentation(
 			modificationResult = workloads.NewNotModifiedNoChangesResult()
 			return nil
 		}
-	}, &logger)
+	}, logger)
 
 	if retryErr != nil {
 		// For the case that the job was instrumented, and we could not uninstrument it, we create a
 		// ImmutableWorkloadError inside the retry loop. This error is then handled in the postProcessUninstrumentation.
 		// The same is true for any other error types (for example errors in `i.ClientUpdate).
-		i.postProcessUninstrumentation(job, workloads.NewNotModifiedDueToErrorResult(), retryErr, &logger)
+		i.postProcessUninstrumentation(job, workloads.NewNotModifiedDueToErrorResult(), retryErr, logger)
 	} else if createImmutableWorkloadsError {
 		i.postProcessUninstrumentation(
 			job,
@@ -997,18 +1002,18 @@ func (i *Instrumenter) handleJobOnUninstrumentation(
 				workloadType:     "job",
 				workloadName:     fmt.Sprintf("%s/%s", job.GetNamespace(), job.GetName()),
 				modificationMode: util.ModificationModeUninstrumentation,
-			}, &logger,
+			}, logger,
 		)
 	} else {
-		i.postProcessUninstrumentation(job, modificationResult, nil, &logger)
+		i.postProcessUninstrumentation(job, modificationResult, nil, logger)
 	}
 }
 
 func (i *Instrumenter) findAndUninstrumentReplicaSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -1029,8 +1034,8 @@ func (i *Instrumenter) findAndUninstrumentReplicaSets(
 func (i *Instrumenter) uninstrumentReplicaSet(
 	ctx context.Context,
 	replicaSet *appsv1.ReplicaSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	hasBeenUpdated := i.revertWorkloadInstrumentation(
 		ctx,
@@ -1049,8 +1054,8 @@ func (i *Instrumenter) uninstrumentReplicaSet(
 func (i *Instrumenter) findAndUninstrumentStatefulSets(
 	ctx context.Context,
 	namespace string,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) error {
 	pgr := pager.New(pager.SimplePageFunc(
 		func(opts metav1.ListOptions) (runtime.Object, error) {
@@ -1071,8 +1076,8 @@ func (i *Instrumenter) findAndUninstrumentStatefulSets(
 func (i *Instrumenter) uninstrumentStatefulSet(
 	ctx context.Context,
 	statefulSet *appsv1.StatefulSet,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) {
 	i.revertWorkloadInstrumentation(
 		ctx,
@@ -1087,8 +1092,8 @@ func (i *Instrumenter) uninstrumentStatefulSet(
 func (i *Instrumenter) revertWorkloadInstrumentation(
 	ctx context.Context,
 	workload instrumentableWorkload,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	reconcileLogger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	reconcileLogger logd.Logger,
 ) bool {
 	objectMeta := workload.getObjectMeta()
 	kind := workload.getKind()
@@ -1112,6 +1117,7 @@ func (i *Instrumenter) revertWorkloadInstrumentation(
 	// although it has dash0.com/enabled=false it must have been set after the instrumentation, in which case
 	// uninstrumenting it is the correct thing to do.
 
+	logger.Debug("reverting instrumentation for workload")
 	modificationResult := workloads.NewNotModifiedReasonUnknownResult()
 	retryErr := util.Retry(fmt.Sprintf("uninstrumenting %s", kind), func() error {
 		if err := i.Get(ctx, client.ObjectKey{
@@ -1129,7 +1135,7 @@ func (i *Instrumenter) revertWorkloadInstrumentation(
 		modificationResult = workload.revert(
 			i.ClusterInstrumentationConfig,
 			namespaceInstrumentationConfig,
-			&logger,
+			logger,
 		)
 		if modificationResult.HasBeenModified {
 			// Changing the workload spec sometimes triggers a new admission request, which would re-instrument the
@@ -1140,28 +1146,31 @@ func (i *Instrumenter) revertWorkloadInstrumentation(
 		} else {
 			return nil
 		}
-	}, &logger)
+	}, logger)
 
-	return i.postProcessUninstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, &logger)
+	return i.postProcessUninstrumentation(workload.asRuntimeObject(), modificationResult, retryErr, logger)
 }
 
 func (i *Instrumenter) postProcessUninstrumentation(
 	resource runtime.Object,
 	modificationResult workloads.ModificationResult,
 	retryErr error,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) bool {
 	if retryErr != nil {
 		e := &ImmutableWorkloadError{}
 		if errors.As(retryErr, e) {
 			logger.Info(e.Error())
 		} else {
-			logger.Error(retryErr, "Dash0's removal of instrumentation by controller has not been successful.")
+			logger.ErrorAsWarnTelemetryCollectionIssue(
+				retryErr,
+				"Dash0's removal of instrumentation by controller has not been successful.",
+			)
 		}
 		util.QueueFailedUninstrumentationEvent(i.Recorder, resource, actor, retryErr)
 		return false
 	} else if !modificationResult.HasBeenModified {
-		if !modificationResult.SkipLogging {
+		if !modificationResult.LogAtDebugOnly {
 			logger.Info(modificationResult.RenderReasonMessage(actor))
 		}
 		util.QueueNoUninstrumentationNecessaryEvent(i.Recorder, resource, actor)
@@ -1175,8 +1184,8 @@ func (i *Instrumenter) postProcessUninstrumentation(
 
 func newWorkloadModifier(
 	clusterInstrumentationConfig *util.ClusterInstrumentationConfig,
-	namespaceInstrumentationConfig util.NamespaceInstrumentationConfig,
-	logger *logr.Logger,
+	namespaceInstrumentationConfig dash0v1beta1.NamespaceInstrumentationConfig,
+	logger logd.Logger,
 ) *workloads.ResourceModifier {
 	return workloads.NewResourceModifier(
 		clusterInstrumentationConfig,
@@ -1189,7 +1198,7 @@ func newWorkloadModifier(
 func (i *Instrumenter) restartPodsOfReplicaSet(
 	ctx context.Context,
 	replicaSet *appsv1.ReplicaSet,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	// Note: ReplicaSet pods are not restarted automatically by Kubernetes when their spec is changed (for other
 	// resource types like deployments or daemonsets this is managed by Kubernetes automatically). Therefore, we
@@ -1202,7 +1211,7 @@ func (i *Instrumenter) restartPodsOfReplicaSet(
 				TimeoutSeconds: &timeoutForListingPods,
 			})
 	if err != nil {
-		logger.Error(
+		logger.ErrorAsWarnTelemetryCollectionIssue(
 			err,
 			fmt.Sprintf(
 				"Failed to list all pods in the namespaces for the purpose of restarting the pods owned by the "+
@@ -1226,10 +1235,10 @@ func (i *Instrumenter) restartPodsOfReplicaSet(
 		return true
 	})
 
+	logger.Debug(fmt.Sprintf("found %d pod(s) to restart for replica set %s/%s", len(podsOfReplicaSet), replicaSet.Namespace, replicaSet.Name))
 	for _, pod := range podsOfReplicaSet {
-		err := i.Delete(ctx, &pod)
-		if err != nil {
-			logger.Info(
+		if err := i.Delete(ctx, &pod); err != nil {
+			logger.WarnTelemetryCollectionIssue(
 				fmt.Sprintf(
 					"Failed to restart pod owned by the replica "+
 						"set %s/%s (%s), this pod will not be restarted automatically.",
@@ -1237,6 +1246,8 @@ func (i *Instrumenter) restartPodsOfReplicaSet(
 					replicaSet.Name,
 					replicaSet.UID,
 				))
+		} else {
+			logger.Debug(fmt.Sprintf("deleted pod %s/%s to trigger restart", pod.Namespace, pod.Name))
 		}
 	}
 }

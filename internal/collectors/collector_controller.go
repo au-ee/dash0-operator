@@ -15,11 +15,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/dash0hq/dash0-operator/internal/collectors/otelcolresources"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 type CollectorReconciler struct {
@@ -52,7 +52,7 @@ func (r *CollectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			r.withNamePredicate([]string{
 				otelcolresources.DaemonSetCollectorConfigConfigMapName(r.oTelCollectorNamePrefix),
 				otelcolresources.DeploymentCollectorConfigConfigMapName(r.oTelCollectorNamePrefix),
-				// Note: We are deliberately not watching the filelog receiver offsets ConfigMap, since it is updated
+				// Note: We are deliberately not watching the file_log receiver offsets ConfigMap, since it is updated
 				// frequently by the filelog offset sync container and does not require reconciliation.
 			}, true)).
 		Watches(
@@ -131,14 +131,14 @@ func (r *CollectorReconciler) Reconcile(
 	ctx context.Context,
 	request reconcile.Request,
 ) (reconcile.Result, error) {
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("reconciling collector resources", "request", request)
 
 	hasBeenReconciled, err := r.collectorManager.ReconcileOpenTelemetryCollector(
 		ctx,
 	)
 	if err != nil {
-		logger.Error(err, "Failed to create/update collector resources.")
+		logger.ErrorTelemetryCollectionIssue(err, "Failed to create/update collector resources.")
 		return reconcile.Result{}, err
 	}
 	if hasBeenReconciled {

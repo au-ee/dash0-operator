@@ -5,11 +5,11 @@ package selfmonitoringapiaccess
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
-	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -18,18 +18,16 @@ import (
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	"github.com/dash0hq/dash0-operator/images/pkg/common"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
-
-type AuthTokenClient interface {
-	SetAuthToken(context.Context, string, *logr.Logger)
-	RemoveAuthToken(context.Context, *logr.Logger)
-}
 
 type OtlpProtocol string
 
 type SelfMonitoringConfiguration struct {
 	SelfMonitoringEnabled bool
 	Export                dash0common.Export
+	Token                 *string // the resolved token (in case of a Dash0 export)
 }
 
 type EndpointAndHeaders struct {
@@ -53,6 +51,36 @@ var (
 
 	collectorMetricsSelfMonitoringPrelude = `
     metrics:
+      level: detailed
+      views:
+        # this metric was added in 0.145.0 and has a high cardinality due to its pod_identifier attribute
+        - selector:
+            instrument_name: "otelcol.k8s.pod.association"
+          stream:
+            aggregation:
+              drop: {}
+        # the metrics below are not directly related to the issue, but have been added by enabling 'level: detailed',
+        # which is required to use views
+        - selector:
+            instrument_name: "http.client.*"
+          stream:
+            aggregation:
+              drop: {}
+        - selector:
+            instrument_name: "http.server.*"
+          stream:
+            aggregation:
+              drop: {}
+        - selector:
+            instrument_name: "rpc.*"
+          stream:
+            aggregation:
+              drop: {}
+        - selector:
+            instrument_name: "otelcol_processor_batch_batch_send_size_bytes"
+          stream:
+            aggregation:
+              drop: {}
       readers:
         - periodic:
             interval: 30000
@@ -68,42 +96,57 @@ var (
 )
 
 func ConvertOperatorConfigurationResourceToSelfMonitoringConfiguration(
+	ctx context.Context,
+	k8sClient client.Client,
+	operatorNamespace string,
 	resource *dash0v1alpha1.Dash0OperatorConfiguration,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (SelfMonitoringConfiguration, error) {
 	if resource == nil {
 		return SelfMonitoringConfiguration{}, nil
 	}
 
-	selfMonitoringIsEnabled := util.ReadBoolPointerWithDefault(resource.Spec.SelfMonitoring.Enabled, true)
+	selfMonitoringIsEnabled := pointers.ReadBoolPointerWithDefault(resource.Spec.SelfMonitoring.Enabled, true)
 	if !selfMonitoringIsEnabled {
 		return SelfMonitoringConfiguration{}, nil
 	}
 
-	export := resource.Spec.Export
-	if export == nil {
-		logger.Info("Invalid configuration of Dash0OperatorConfiguration resource: Self-monitoring is enabled " +
-			"but no export configuration is set. Self-monitoring telemetry will not be sent.")
+	if !resource.HasExportsConfigured() {
+		logger.Warn(
+			"Invalid configuration of Dash0OperatorConfiguration resource: Self-monitoring is enabled " +
+				"but no export configuration is set. Self-monitoring telemetry will not be sent.",
+		)
 		return SelfMonitoringConfiguration{}, nil
 	}
 
+	// for self-monitoring we only send telemetry to a single backend
+	export := resource.EffectiveExports()[0]
 	if export.Dash0 != nil {
+		token, err := GetAuthTokenForDash0Export(ctx, k8sClient, operatorNamespace, *export.Dash0, logger)
+		if err != nil || token == nil {
+			logger.Warn(
+				"Self-monitoring is enabled but either no authorization is defined or the token could not be retrieved. " +
+					"Self-monitoring telemetry will not be sent.",
+			)
+			return SelfMonitoringConfiguration{}, nil
+		}
 		return convertResourceToDash0ExportConfiguration(
-			export,
+			&export,
+			token,
 			selfMonitoringIsEnabled,
 			logger,
 		)
 	}
 	if export.Grpc != nil {
 		return convertResourceToGrpcExportConfiguration(
-			export,
+			&export,
 			selfMonitoringIsEnabled,
 			logger,
 		)
 	}
 	if export.Http != nil {
 		return convertResourceToHttpExportConfiguration(
-			export,
+			&export,
 			selfMonitoringIsEnabled,
 		)
 	}
@@ -113,20 +156,25 @@ func ConvertOperatorConfigurationResourceToSelfMonitoringConfiguration(
 
 func convertResourceToDash0ExportConfiguration(
 	export *dash0common.Export,
+	token *string,
 	selfMonitoringEnabled bool,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (SelfMonitoringConfiguration, error) {
 	if export.Grpc != nil {
 		logger.Info(
 			fmt.Sprintf(
 				"Ignoring grpc export configuration (%s) for self-monitoring telemetry, will send to the configured Dash0 export.",
-				export.Grpc.Endpoint))
+				export.Grpc.Endpoint,
+			),
+		)
 	}
 	if export.Http != nil {
 		logger.Info(
 			fmt.Sprintf(
 				"Ignoring http export configuration (%s) for self-monitoring telemetry, will send to the configured Dash0 export.",
-				export.Http.Endpoint))
+				export.Http.Endpoint,
+			),
+		)
 	}
 
 	dash0Export := export.Dash0
@@ -140,19 +188,22 @@ func convertResourceToDash0ExportConfiguration(
 				ApiEndpoint:   dash0Export.ApiEndpoint,
 			},
 		},
+		Token: token,
 	}, nil
 }
 
 func convertResourceToGrpcExportConfiguration(
 	export *dash0common.Export,
 	selfMonitoringEnabled bool,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (SelfMonitoringConfiguration, error) {
 	if export.Http != nil {
 		logger.Info(
 			fmt.Sprintf(
 				"Ignoring http export configuration (%s) for self-monitoring telemetry, will send to the configured gRPC export.",
-				export.Http.Endpoint))
+				export.Http.Endpoint,
+			),
+		)
 	}
 
 	grpcExport := export.Grpc
@@ -279,12 +330,14 @@ func enableSelfMonitoringInCollectorContainer(
 	exportSettings := ConvertExportConfigurationToEnvVarSettings(selfMonitoringExport)
 	updateOrAppendEnvVar(container, otelExporterOtlpEndpointEnvVarName, exportSettings.Endpoint)
 	updateOrAppendEnvVar(container, otelExporterOtlpProtocolEnvVarName, exportSettings.Protocol)
-	updateOrAppendEnvVar(container, util.OtelResourceAttributesEnvVarName,
+	updateOrAppendEnvVar(
+		container, util.OtelResourceAttributesEnvVarName,
 		fmt.Sprintf(
 			"service.namespace=dash0-operator,service.name=%s,service.version=%s",
 			container.Name,
 			operatorVersion,
-		))
+		),
+	)
 	if developmentMode {
 		updateOrAppendEnvVar(container, otelLogLevelEnvVarName, "debug")
 	}
@@ -344,9 +397,11 @@ func updateOrAppendEnvVar(container *corev1.Container, name string, value string
 		Name:  name,
 		Value: value,
 	}
-	idx := slices.IndexFunc(container.Env, func(e corev1.EnvVar) bool {
-		return e.Name == name
-	})
+	idx := slices.IndexFunc(
+		container.Env, func(e corev1.EnvVar) bool {
+			return e.Name == name
+		},
+	)
 	if idx >= 0 {
 		// We need to update the existing value
 		container.Env[idx] = newEnvVar
@@ -375,15 +430,19 @@ func matchEnvVar(envVarName string) func(corev1.EnvVar) bool {
 func ConvertExportConfigurationToEnvVarSettings(selfMonitoringExport dash0common.Export) EndpointAndHeaders {
 	if selfMonitoringExport.Dash0 != nil {
 		dash0Export := selfMonitoringExport.Dash0
-		headers := []dash0common.Header{{
-			Name:  util.AuthorizationHeaderName,
-			Value: selfMonitoringAuthHeaderValue,
-		}}
+		headers := []dash0common.Header{
+			{
+				Name:  util.AuthorizationHeaderName,
+				Value: selfMonitoringAuthHeaderValue,
+			},
+		}
 		if dash0Export.Dataset != "" && dash0Export.Dataset != util.DatasetDefault {
-			headers = append(headers, dash0common.Header{
-				Name:  util.Dash0DatasetHeaderName,
-				Value: dash0Export.Dataset,
-			})
+			headers = append(
+				headers, dash0common.Header{
+					Name:  util.Dash0DatasetHeaderName,
+					Value: dash0Export.Dataset,
+				},
+			)
 		}
 		return EndpointAndHeaders{
 			Endpoint: prependProtocol(dash0Export.Endpoint, "https://"),
@@ -453,7 +512,10 @@ func convertExportConfigurationToCollectorSelfMonitoringPipelineString(
 	}
 	selfMonitoringExport := selfMonitoringConfiguration.Export
 	if selfMonitoringExport.Dash0 != nil {
-		return convertDash0ExportConfigurationToCollectorLogSelfMonitoringPipelineString(prelude, selfMonitoringExport.Dash0)
+		return convertDash0ExportConfigurationToCollectorLogSelfMonitoringPipelineString(
+			prelude,
+			selfMonitoringExport.Dash0,
+		)
 	} else if selfMonitoringExport.Grpc != nil {
 		return convertGrpcExportConfigurationToCollectorLogSelfMonitoringPipelineString(prelude, selfMonitoringExport.Grpc)
 	} else if selfMonitoringExport.Http != nil {
@@ -467,19 +529,26 @@ func convertDash0ExportConfigurationToCollectorLogSelfMonitoringPipelineString(
 	dash0Export *dash0common.Dash0Configuration,
 ) string {
 	pipeline := prelude +
-		fmt.Sprintf(`
+		fmt.Sprintf(
+			`
                 protocol: grpc
-                endpoint: %s`, prependProtocol(dash0Export.Endpoint, "https://"))
+                endpoint: %s`, prependProtocol(dash0Export.Endpoint, "https://"),
+		)
 	pipeline = addInsecureFlagIfNecessary(pipeline, dash0Export.Endpoint)
-	pipeline += fmt.Sprintf(`
+	pipeline += fmt.Sprintf(
+		`
                 headers:
-                  %s: "Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"`,
+                  - name: %s
+                    value: "Bearer ${env:SELF_MONITORING_AUTH_TOKEN}"`,
 		util.AuthorizationHeaderName,
 	)
 	if dash0Export.Dataset != "" && dash0Export.Dataset != util.DatasetDefault {
-		pipeline += fmt.Sprintf(`
-                  %s: "%s"
-`, util.Dash0DatasetHeaderName, dash0Export.Dataset)
+		pipeline += fmt.Sprintf(
+			`
+                  - name: %s
+                    value: "%s"
+`, util.Dash0DatasetHeaderName, dash0Export.Dataset,
+		)
 	} else {
 		// Append final newline, which is deliberately not included in the snippet that includes protocol and
 		// endpoint.
@@ -493,7 +562,8 @@ func convertGrpcExportConfigurationToCollectorLogSelfMonitoringPipelineString(
 	grpcExport *dash0common.GrpcConfiguration,
 ) string {
 	pipeline := prelude +
-		fmt.Sprintf(`
+		fmt.Sprintf(
+			`
                 protocol: grpc
                 endpoint: %s`,
 			prependProtocol(grpcExport.Endpoint, "dns://"),
@@ -513,7 +583,8 @@ func convertHttpExportConfigurationToCollectorLogSelfMonitoringPipelineString(
 		encoding = "json"
 	}
 	pipeline := prelude +
-		fmt.Sprintf(`
+		fmt.Sprintf(
+			`
                 protocol: http/%s
                 endpoint: %s`,
 			encoding,
@@ -531,8 +602,10 @@ func appendHeadersToCollectorLogSelfMonitoringPipelineString(pipeline string, he
 	}
 	for _, header := range headers {
 		if header.Name != "" {
-			pipeline += fmt.Sprintf(`
-                  %s: "%s"`,
+			pipeline += fmt.Sprintf(
+				`
+                  - name: %s
+                    value: "%s"`,
 				header.Name,
 				header.Value,
 			)
@@ -551,31 +624,52 @@ func addInsecureFlagIfNecessary(pipeline string, endpoint string) string {
 	return pipeline
 }
 
+// getAuthTokenForDash0Export takes a Dash0 export configuration and returns the configured token by either
+// resolving the provided secretRef or returning the token literal.
+func GetAuthTokenForDash0Export(
+	ctx context.Context,
+	k8sClient client.Client,
+	operatorNamespace string, // we always look up the auth secrets in the operator namespace
+	dash0Export dash0common.Dash0Configuration,
+	logger logd.Logger,
+) (*string, error) {
+	if dash0Export.Authorization.SecretRef != nil {
+		// The operator configuration resource uses a secret ref to provide the Dash0 auth token, exchange the secret
+		// ref for an actual token and distribute the token value to all clients that need an auth token.
+		token, err := ExchangeSecretRefForToken(
+			ctx,
+			k8sClient,
+			operatorNamespace,
+			dash0Export,
+			logger,
+		)
+		if err != nil {
+			logger.Error(err, "cannot exchange secret ref for token")
+			return nil, err
+		} else {
+			return token, nil
+		}
+	} else if dash0Export.Authorization.Token != nil &&
+		*dash0Export.Authorization.Token != "" {
+		// The operator configuration resource uses a token literal to provide the Dash0 auth token
+		return dash0Export.Authorization.Token, nil
+	}
+	// The operator configuration resource neither has a secret ref nor a token literal, remove the auth token from all
+	// clients. This case should not happen since we only call this func if HasDash0ApiAccessConfigured returns true.
+	return nil, errors.New("authorization has neither secretRef nor token literal")
+}
+
 func ExchangeSecretRefForToken(
 	ctx context.Context,
 	k8sClient client.Client,
-	authTokenClients []AuthTokenClient,
-	operatorNamespace string,
-	operatorConfiguration *dash0v1alpha1.Dash0OperatorConfiguration,
-	logger *logr.Logger,
-) error {
-	if operatorConfiguration == nil {
-		removeToken(ctx, authTokenClients, logger)
-		return fmt.Errorf("operatorConfiguration is nil")
+	operatorNamespace string, // we always look up the auth secrets in the operator namespace
+	dash0Config dash0common.Dash0Configuration,
+	logger logd.Logger,
+) (*string, error) {
+	if dash0Config.Authorization.SecretRef == nil {
+		return nil, fmt.Errorf("dash0Config has no secret ref")
 	}
-	if operatorConfiguration.Spec.Export == nil {
-		removeToken(ctx, authTokenClients, logger)
-		return fmt.Errorf("operatorConfiguration has no export")
-	}
-	if operatorConfiguration.Spec.Export.Dash0 == nil {
-		removeToken(ctx, authTokenClients, logger)
-		return fmt.Errorf("operatorConfiguration has no Dash0 export")
-	}
-	if operatorConfiguration.Spec.Export.Dash0.Authorization.SecretRef == nil {
-		removeToken(ctx, authTokenClients, logger)
-		return fmt.Errorf("operatorConfiguration has no secret ref")
-	}
-	secretRef := operatorConfiguration.Spec.Export.Dash0.Authorization.SecretRef
+	secretRef := dash0Config.Authorization.SecretRef
 	var dash0AuthTokenSecret corev1.Secret
 	if err := k8sClient.Get(
 		ctx,
@@ -585,34 +679,26 @@ func ExchangeSecretRefForToken(
 		},
 		&dash0AuthTokenSecret,
 	); err != nil {
-		removeToken(ctx, authTokenClients, logger)
-		msg := fmt.Sprintf("failed to fetch secret with name %s in namespace %s for Dash0 self-monitoring/API access",
+		msg := fmt.Sprintf(
+			"failed to fetch secret with name %s in namespace %s for Dash0 self-monitoring/API access",
 			secretRef.Name,
 			operatorNamespace,
 		)
 		logger.Error(err, msg)
-		return fmt.Errorf(msg+": %w", err)
+		return nil, fmt.Errorf(msg+": %w", err)
 	} else {
 		rawToken, hasToken := dash0AuthTokenSecret.Data[secretRef.Key]
 		if !hasToken || rawToken == nil || len(rawToken) == 0 {
-			removeToken(ctx, authTokenClients, logger)
-			err = fmt.Errorf("secret \"%s/%s\" does not contain key \"%s\"",
+			err = fmt.Errorf(
+				"secret \"%s/%s\" does not contain key \"%s\"",
 				operatorNamespace,
 				secretRef.Name,
-				secretRef.Key)
+				secretRef.Key,
+			)
 			logger.Error(err, "secret does not contain the expected key")
-			return err
+			return nil, err
 		}
 		decodedToken := string(rawToken)
-		for _, authTokenClient := range authTokenClients {
-			authTokenClient.SetAuthToken(ctx, decodedToken, logger)
-		}
-		return nil
-	}
-}
-
-func removeToken(ctx context.Context, authTokenClients []AuthTokenClient, logger *logr.Logger) {
-	for _, authTokenClient := range authTokenClients {
-		authTokenClient.RemoveAuthToken(ctx, logger)
+		return &decodedToken, nil
 	}
 }

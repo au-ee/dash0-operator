@@ -10,12 +10,11 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/go-logr/logr"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	clienteventsv1 "k8s.io/client-go/kubernetes/typed/events/v1"
+	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -26,7 +25,7 @@ func HandlePotentiallySuccessfulInstrumentationEvent(
 	eventSource WorkloadModifierActor,
 	containersTotal int,
 	instrumentationIssuesPerContainer map[string][]string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	if len(instrumentationIssuesPerContainer) == 0 {
 		// All containers have been instrumented, no container had instrumentation issues.
@@ -154,17 +153,23 @@ func stringifyContainerInstrumentationIssues(instrumentationIssuesPerContainer m
 	return sb.String()
 }
 
-func AttachEventToObject(
+// AttachEventToInvolvedObject attaches an event that has been created by the webhook to its referenced object by
+// setting the event's InvolvedObject.UID. This only works with the legacy event API from k8s.io/api/core/v1, since the
+// equivalent field (Regarding.UID) is immutable in the new API from k8s.io/api/events/v1.
+//
+// Without doing this, the event will not show up in the event section of "kubectl describe" for the workload, because
+// kubectl always searches for related events with the object's uid.
+func AttachEventToInvolvedObject(
 	ctx context.Context,
 	k8sClient client.Client,
-	eventApi clienteventsv1.EventInterface,
-	event *eventsv1.Event,
+	legacyEventApi clientcorev1.EventInterface,
+	legacyEvent *corev1.Event,
 ) error {
-	if err := setUidAndResourceVersionForEvent(ctx, k8sClient, event); err != nil {
+	if err := setUidAndResourceVersionForEvent(ctx, k8sClient, legacyEvent); err != nil {
 		return fmt.Errorf("could not update event.Regarding: %w", err)
 	}
-	if _, err := eventApi.Update(ctx, event, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("could not update the dangling event %v: %w", event.UID, err)
+	if _, err := legacyEventApi.Update(ctx, legacyEvent, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("could not update the dangling event %v: %w", legacyEvent.UID, err)
 	}
 	return nil
 }
@@ -172,30 +177,30 @@ func AttachEventToObject(
 func setUidAndResourceVersionForEvent(
 	ctx context.Context,
 	k8sClient client.Client,
-	event *eventsv1.Event,
+	legacyEvent *corev1.Event,
 ) error {
-	regardingObject := &event.Regarding
-	object, err := GetReceiverForWorkloadType(regardingObject.APIVersion, regardingObject.Kind)
+	involvedObject := &legacyEvent.InvolvedObject
+	object, err := GetReceiverForWorkloadType(involvedObject.APIVersion, involvedObject.Kind)
 	if err != nil {
 		return err
 	}
 
 	if err = k8sClient.Get(
 		ctx,
-		client.ObjectKey{Namespace: regardingObject.Namespace, Name: regardingObject.Name},
+		client.ObjectKey{Namespace: involvedObject.Namespace, Name: involvedObject.Name},
 		object,
 	); err != nil {
 		return fmt.Errorf(
-			"could not load regarding object %s %s/%s: %w",
-			regardingObject.Kind,
-			regardingObject.Namespace,
-			regardingObject.Name,
+			"could not load involved object %s %s/%s: %w",
+			involvedObject.Kind,
+			involvedObject.Namespace,
+			involvedObject.Name,
 			err,
 		)
 	}
 
-	regardingObject.UID = object.GetUID()
-	regardingObject.ResourceVersion = object.GetResourceVersion()
+	involvedObject.UID = object.GetUID()
+	involvedObject.ResourceVersion = object.GetResourceVersion()
 
 	return nil
 }

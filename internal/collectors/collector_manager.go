@@ -11,12 +11,10 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
@@ -24,15 +22,18 @@ import (
 	"github.com/dash0hq/dash0-operator/internal/collectors/otelcolresources"
 	"github.com/dash0hq/dash0-operator/internal/resources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 type CollectorManager struct {
 	client.Client
-	clientset              *kubernetes.Clientset
-	oTelColResourceManager *otelcolresources.OTelColResourceManager
-	extraConfig            atomic.Pointer[util.ExtraConfig]
-	developmentMode        bool
-	updateInProgress       atomic.Bool
+	clientset                     *kubernetes.Clientset
+	oTelColResourceManager        *otelcolresources.OTelColResourceManager
+	extraConfig                   atomic.Pointer[util.ExtraConfig]
+	developmentMode               bool
+	intelligentEdgeFeatureEnabled bool
+	updateInProgress              atomic.Bool
 }
 
 type CollectorReconcileTrigger string
@@ -53,24 +54,26 @@ func NewCollectorManager(
 	clientset *kubernetes.Clientset,
 	extraConfig util.ExtraConfig,
 	developmentMode bool,
+	intelligentEdgeFeatureEnabled bool,
 	oTelColResourceManager *otelcolresources.OTelColResourceManager,
 ) *CollectorManager {
 	m := &CollectorManager{
-		Client:                 k8sClient,
-		clientset:              clientset,
-		developmentMode:        developmentMode,
-		oTelColResourceManager: oTelColResourceManager,
+		Client:                        k8sClient,
+		clientset:                     clientset,
+		developmentMode:               developmentMode,
+		intelligentEdgeFeatureEnabled: intelligentEdgeFeatureEnabled,
+		oTelColResourceManager:        oTelColResourceManager,
 	}
 	m.extraConfig.Store(&extraConfig)
 	return m
 }
 
-func (m *CollectorManager) UpdateExtraConfig(ctx context.Context, newConfig util.ExtraConfig, logger *logr.Logger) {
+func (m *CollectorManager) UpdateExtraConfig(ctx context.Context, newConfig util.ExtraConfig, logger logd.Logger) {
 	previousConfig := m.extraConfig.Swap(&newConfig)
 	if previousConfig == nil || !reflect.DeepEqual(*previousConfig, newConfig) {
 		hasBeenReconciled, err := m.ReconcileOpenTelemetryCollector(ctx)
 		if err != nil {
-			logger.Error(err, "Failed to create/update collector resources after extra config map update.")
+			logger.ErrorTelemetryCollectionIssue(err, "Failed to create/update collector resources after extra config map update.")
 		}
 		if hasBeenReconciled {
 			logger.Info("successfully reconciled collector resources after extra config map update")
@@ -94,12 +97,10 @@ func (m *CollectorManager) UpdateExtraConfig(ctx context.Context, newConfig util
 func (m *CollectorManager) ReconcileOpenTelemetryCollector(
 	ctx context.Context,
 ) (bool, error) {
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	if m.updateInProgress.Load() {
-		if m.developmentMode {
-			logger.Info("creation/update of the OpenTelemetry collector resources is already in progress, skipping " +
-				"additional reconciliation request.")
-		}
+		logger.Debug("creation/update of the OpenTelemetry collector resources is already in progress, skipping " +
+			"additional reconciliation request.")
 		return false, nil
 	}
 
@@ -108,13 +109,31 @@ func (m *CollectorManager) ReconcileOpenTelemetryCollector(
 		m.updateInProgress.Store(false)
 	}()
 
-	operatorConfigurationResource, err := m.findOperatorConfigurationResource(ctx, &logger)
+	operatorConfigurationResource, err := m.findOperatorConfigurationResource(ctx, logger)
 	if err != nil {
 		return false, err
 	}
-	allMonitoringResources, err := m.findAllMonitoringResources(ctx, &logger)
+	if operatorConfigurationResource != nil {
+		logger.Debug("found operator configuration resource for collector reconciliation", "name", operatorConfigurationResource.Name)
+	} else {
+		logger.Debug("no operator configuration resource found for collector reconciliation")
+	}
+	allMonitoringResources, err := m.findAllMonitoringResources(ctx, logger)
 	if err != nil {
 		return false, err
+	}
+	logger.Debug("found available monitoring resources for collector reconciliation", "count", len(allMonitoringResources))
+	var intelligentEdgeResource *dash0v1alpha1.Dash0IntelligentEdge
+	if m.intelligentEdgeFeatureEnabled {
+		intelligentEdgeResource, err = m.findIntelligentEdgeResource(ctx, logger)
+		if err != nil {
+			return false, err
+		}
+		if intelligentEdgeResource != nil {
+			logger.Debug("found intelligent edge resource for collector reconciliation", "name", intelligentEdgeResource.Name)
+		} else {
+			logger.Debug("no intelligent edge resource found for collector reconciliation")
+		}
 	}
 
 	extraConfig := m.extraConfig.Load()
@@ -123,24 +142,25 @@ func (m *CollectorManager) ReconcileOpenTelemetryCollector(
 	}
 
 	if operatorConfigurationResource == nil {
-		logger.Info(logMsgOperatorConfigMissing)
-		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, &logger)
+		logger.WarnTelemetryCollectionIssue(logMsgOperatorConfigMissing)
+		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, logger)
 		return err == nil, err
-	} else if !util.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.TelemetryCollection.Enabled, true) {
+	} else if !pointers.ReadBoolPointerWithDefault(operatorConfigurationResource.Spec.TelemetryCollection.Enabled, true) {
 		logger.Info(fmt.Sprintf(logMsgTelemetryDisabled, operatorConfigurationResource.Name))
-		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, &logger)
+		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, logger)
 		return err == nil, err
-	} else if operatorConfigurationResource.Spec.Export == nil {
+	} else if !operatorConfigurationResource.HasExportsConfigured() {
 		logger.Info(fmt.Sprintf(logMsgDefaultExportMissing, operatorConfigurationResource.Name))
-		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, &logger)
+		err = m.removeOpenTelemetryCollector(ctx, *extraConfig, logger)
 		return err == nil, err
 	} else {
 		err = m.createOrUpdateOpenTelemetryCollector(
 			ctx,
 			operatorConfigurationResource,
 			allMonitoringResources,
+			intelligentEdgeResource,
 			*extraConfig,
-			&logger,
+			logger,
 		)
 		return err == nil, err
 	}
@@ -150,8 +170,9 @@ func (m *CollectorManager) createOrUpdateOpenTelemetryCollector(
 	ctx context.Context,
 	operatorConfigurationResource *dash0v1alpha1.Dash0OperatorConfiguration,
 	allMonitoringResources []dash0v1beta1.Dash0Monitoring,
+	intelligentEdgeResource *dash0v1alpha1.Dash0IntelligentEdge,
 	extraConfig util.ExtraConfig,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	slices.SortFunc(
 		allMonitoringResources,
@@ -165,10 +186,11 @@ func (m *CollectorManager) createOrUpdateOpenTelemetryCollector(
 			extraConfig,
 			operatorConfigurationResource,
 			allMonitoringResources,
+			intelligentEdgeResource,
 			logger,
 		)
 	if err != nil {
-		logger.Error(
+		logger.ErrorTelemetryCollectionIssue(
 			err,
 			"failed to create one or more of the OpenTelemetry collector DaemonSet/Deployment resources, some or "+
 				"all telemetry will be missing",
@@ -181,6 +203,8 @@ func (m *CollectorManager) createOrUpdateOpenTelemetryCollector(
 		logger.Info("OpenTelemetry collector Kubernetes resources have been created.")
 	} else if resourcesHaveBeenUpdated {
 		logger.Info("OpenTelemetry collector Kubernetes resources have been updated.")
+	} else {
+		logger.Debug("OpenTelemetry collector Kubernetes resources are already up to date, no changes required")
 	}
 	return nil
 }
@@ -188,7 +212,7 @@ func (m *CollectorManager) createOrUpdateOpenTelemetryCollector(
 func (m *CollectorManager) removeOpenTelemetryCollector(
 	ctx context.Context,
 	extraConfig util.ExtraConfig,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	resourcesHaveBeenDeleted, err := m.oTelColResourceManager.DeleteResources(
 		ctx,
@@ -204,13 +228,15 @@ func (m *CollectorManager) removeOpenTelemetryCollector(
 	}
 	if resourcesHaveBeenDeleted {
 		logger.Info("OpenTelemetry collector Kubernetes resources have been deleted.")
+	} else {
+		logger.Debug("no OpenTelemetry collector Kubernetes resources to delete")
 	}
 	return nil
 }
 
 func (m *CollectorManager) findOperatorConfigurationResource(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (*dash0v1alpha1.Dash0OperatorConfiguration, error) {
 	operatorConfigurationResource, err := resources.FindUniqueOrMostRecentResourceInScope(
 		ctx,
@@ -228,9 +254,29 @@ func (m *CollectorManager) findOperatorConfigurationResource(
 	return operatorConfigurationResource.(*dash0v1alpha1.Dash0OperatorConfiguration), nil
 }
 
+func (m *CollectorManager) findIntelligentEdgeResource(
+	ctx context.Context,
+	logger logd.Logger,
+) (*dash0v1alpha1.Dash0IntelligentEdge, error) {
+	intelligentEdgeResource, err := resources.FindUniqueOrMostRecentResourceInScope(
+		ctx,
+		m.Client,
+		"",
+		&dash0v1alpha1.Dash0IntelligentEdge{},
+		logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if intelligentEdgeResource == nil {
+		return nil, nil
+	}
+	return intelligentEdgeResource.(*dash0v1alpha1.Dash0IntelligentEdge), nil
+}
+
 func (m *CollectorManager) findAllMonitoringResources(
 	ctx context.Context,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) ([]dash0v1beta1.Dash0Monitoring, error) {
 	monitoringResourceList := dash0v1beta1.Dash0MonitoringList{}
 	if err := m.List(
@@ -238,7 +284,7 @@ func (m *CollectorManager) findAllMonitoringResources(
 		&monitoringResourceList,
 		&client.ListOptions{},
 	); err != nil {
-		logger.Error(err, "Failed to list all Dash0 monitoring resources, requeuing reconcile request.")
+		logger.ErrorTelemetryCollectionIssue(err, "Failed to list all Dash0 monitoring resources, requeuing reconcile request.")
 		return nil, err
 	}
 
@@ -254,5 +300,10 @@ func (m *CollectorManager) findAllMonitoringResources(
 		}
 		monitoringResources = append(monitoringResources, mr)
 	}
+	logger.Debug(
+		"filtered monitoring resources by availability",
+		"total", len(monitoringResourceList.Items),
+		"available", len(monitoringResources),
+	)
 	return monitoringResources, nil
 }

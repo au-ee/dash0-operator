@@ -125,6 +125,61 @@ var _ = Describe("The desired state of the OpenTelemetry TargetAllocator resourc
 		Expect(deploymentAffinityPref[0].Preference.MatchExpressions[0].Values[1]).To(Equal("affinity-key2-value2"))
 	})
 
+	It("should render additional labels and annotations on the workload and the pods", func() {
+		desiredState, err := assembleDesiredStateForUpsert(&targetAllocatorConfig{
+			OperatorNamespace: OperatorNamespace,
+			NamePrefix:        TargetAllocatorPrefixTest,
+			Images:            TestImages,
+		}, nil, util.ExtraConfig{
+			TargetAllocatorLabels:         map[string]string{"ta-label": "ta-label-value"},
+			TargetAllocatorAnnotations:    map[string]string{"ta-annotation": "ta-annotation-value"},
+			TargetAllocatorPodLabels:      map[string]string{"ta-pod-label": "ta-pod-label-value"},
+			TargetAllocatorPodAnnotations: map[string]string{"ta-pod-annotation": "ta-pod-annotation-value"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		deployment := getDeployment(desiredState)
+		Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue("ta-label", "ta-label-value"))
+		// operator-managed labels are still present
+		Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue(util.AppKubernetesIoNameLabel, AppKubernetesIoNameValue))
+		Expect(deployment.ObjectMeta.Annotations).To(HaveKeyWithValue("ta-annotation", "ta-annotation-value"))
+		Expect(deployment.Spec.Template.Labels).To(HaveKeyWithValue("ta-pod-label", "ta-pod-label-value"))
+		Expect(deployment.Spec.Template.Labels).To(HaveKeyWithValue(util.AppKubernetesIoNameLabel, AppKubernetesIoNameValue))
+		Expect(deployment.Spec.Template.Annotations).To(HaveKeyWithValue("ta-pod-annotation", "ta-pod-annotation-value"))
+		// operator-managed pod annotations are still present
+		Expect(deployment.Spec.Template.Annotations).To(HaveKey("ta-config-sha"))
+	})
+
+	It("should not let additional labels override operator-managed labels", func() {
+		desiredState, err := assembleDesiredStateForUpsert(&targetAllocatorConfig{
+			OperatorNamespace: OperatorNamespace,
+			NamePrefix:        TargetAllocatorPrefixTest,
+			Images:            TestImages,
+		}, nil, util.ExtraConfig{
+			TargetAllocatorPodLabels: map[string]string{util.AppKubernetesIoNameLabel: "custom-value"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		// the operator-managed value wins over the additional label
+		Expect(getDeployment(desiredState).Spec.Template.Labels).
+			To(HaveKeyWithValue(util.AppKubernetesIoNameLabel, AppKubernetesIoNameValue))
+	})
+
+	It("should add GKE Autopilot allowlist match labels", func() {
+		desiredState, err := assembleDesiredStateForUpsert(&targetAllocatorConfig{
+			OperatorNamespace: OperatorNamespace,
+			NamePrefix:        TargetAllocatorPrefixTest,
+			Images:            TestImages,
+			IsGkeAutopilot:    true,
+		}, nil, util.ExtraConfig{})
+		Expect(err).ToNot(HaveOccurred())
+
+		deploymentTemplateLabels := getDeployment(desiredState).Spec.Template.Labels
+		value, ok := deploymentTemplateLabels[gkeAutopilotAllowlistKey]
+		Expect(ok).To(BeTrue())
+		Expect(value).To(Equal(gkeAutopilotAllowlistValue))
+	})
+
 	When("mTLS is enabled", Ordered, func() {
 		const certSecretName = "ta-mtls-server-cert-secret"
 		var desiredState []clientObject
@@ -168,7 +223,7 @@ var _ = Describe("The desired state of the OpenTelemetry TargetAllocator resourc
 
 			Expect(configMap).ToNot(BeNil())
 			taConfig := parseConfigMapContent(configMap)
-			httpsConfig, ok := ReadFromMap(taConfig, []string{"https"}).(map[string]interface{})
+			httpsConfig, ok := ReadFromMap(taConfig, []string{"https"}).(map[string]any)
 			Expect(ok).To(BeTrue())
 			Expect(httpsConfig["enabled"]).To(Equal(true))
 			Expect(httpsConfig["ca_file_path"]).To(Equal(fmt.Sprintf("%s/ca.crt", targetAllocatorCertsVolumeDir)))
@@ -208,6 +263,6 @@ func findObjectByName(desiredState []clientObject, name string) client.Object {
 	return nil
 }
 
-func parseConfigMapContent(configMap *corev1.ConfigMap) map[string]interface{} {
+func parseConfigMapContent(configMap *corev1.ConfigMap) map[string]any {
 	return ParseConfigMapContent(configMap, "targetallocator.yaml")
 }

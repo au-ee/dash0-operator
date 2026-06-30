@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -17,24 +18,26 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
 	prometheusv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
+	"github.com/dash0hq/dash0-operator/internal/selfmonitoringapiaccess"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 type PrometheusRuleCrdReconciler struct {
@@ -53,9 +56,9 @@ type PrometheusRuleReconciler struct {
 	pseudoClusterUid           types.UID
 	queue                      *workqueue.Typed[ThirdPartyResourceSyncJob]
 	httpClient                 *http.Client
-	apiConfig                  atomic.Pointer[ApiConfig]
-	authToken                  atomic.Pointer[string]
-	httpRetryDelay             time.Duration
+	defaultApiConfigs          selfmonitoringapiaccess.SynchronizedSlice[ApiConfig]
+	namespacedApiConfigs       selfmonitoringapiaccess.SynchronizedMapSlice[ApiConfig]
+	namespacedSyncEnabled      sync.Map
 	controllerStopFunctionLock sync.Mutex
 	controllerStopFunction     *context.CancelFunc
 }
@@ -139,17 +142,29 @@ func (r *PrometheusRuleCrdReconciler) SkipNameValidation() bool {
 	return r.skipNameValidation
 }
 
+func (r *PrometheusRuleCrdReconciler) WantsCrdUpdateEvents() bool {
+	return false
+}
+
+// OnCrdChange is a no-op for PrometheusRule — the CRD has a single version (v1) and we have
+// nothing to derive from observing the CRD object. The hook is required to satisfy the
+// ThirdPartyCrdReconciler interface (see PersesDashboardCrdReconciler for a reconciler that
+// uses it to choose between served versions).
+func (r *PrometheusRuleCrdReconciler) OnCrdChange(_ *apiextensionsv1.CustomResourceDefinition, _ logd.Logger) {
+}
+
 func (r *PrometheusRuleCrdReconciler) OperatorManagerIsLeader() bool {
 	return r.leaderElectionAware.IsLeader()
 }
 
 func (r *PrometheusRuleCrdReconciler) CreateThirdPartyResourceReconciler(pseudoClusterUid types.UID) {
 	r.prometheusRuleReconciler = &PrometheusRuleReconciler{
-		Client:           r.Client,
-		queue:            r.queue,
-		pseudoClusterUid: pseudoClusterUid,
-		httpClient:       r.httpClient,
-		httpRetryDelay:   1 * time.Second,
+		Client:               r.Client,
+		queue:                r.queue,
+		pseudoClusterUid:     pseudoClusterUid,
+		httpClient:           r.httpClient,
+		defaultApiConfigs:    *selfmonitoringapiaccess.NewSynchronizedSlice[ApiConfig](),
+		namespacedApiConfigs: *selfmonitoringapiaccess.NewSynchronizedMapSlice[ApiConfig](),
 	}
 }
 
@@ -161,7 +176,7 @@ func (r *PrometheusRuleCrdReconciler) SetupWithManager(
 	ctx context.Context,
 	mgr ctrl.Manager,
 	startupK8sClient client.Client,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) error {
 	r.mgr = mgr
 	return SetupThirdPartyCrdReconcilerWithManager(
@@ -174,15 +189,18 @@ func (r *PrometheusRuleCrdReconciler) SetupWithManager(
 
 func (r *PrometheusRuleCrdReconciler) Create(
 	ctx context.Context,
-	_ event.TypedCreateEvent[client.Object],
+	e event.TypedCreateEvent[client.Object],
 	_ workqueue.TypedRateLimitingInterface[reconcile.Request],
 ) {
 	if prometheusRuleCrdReconcileRequestMetric != nil {
 		prometheusRuleCrdReconcileRequestMetric.Add(ctx, 1)
 	}
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	r.prometheusRuleCrdExists.Store(true)
-	maybeStartWatchingThirdPartyResources(r, &logger)
+	if crd, ok := e.Object.(*apiextensionsv1.CustomResourceDefinition); ok {
+		r.OnCrdChange(crd, logger)
+	}
+	maybeStartWatchingThirdPartyResources(r, logger)
 }
 
 func (r *PrometheusRuleCrdReconciler) Update(
@@ -190,8 +208,7 @@ func (r *PrometheusRuleCrdReconciler) Update(
 	event.TypedUpdateEvent[client.Object],
 	workqueue.TypedRateLimitingInterface[reconcile.Request],
 ) {
-	// should not be called, we are not interested in updates
-	// note: update is called twice prior to delete, it is also called twice after an actual create
+	// We are not interested in updates of the PrometheusRule CRD.
 }
 
 func (r *PrometheusRuleCrdReconciler) Delete(
@@ -202,11 +219,11 @@ func (r *PrometheusRuleCrdReconciler) Delete(
 	if prometheusRuleCrdReconcileRequestMetric != nil {
 		prometheusRuleCrdReconcileRequestMetric.Add(ctx, 1)
 	}
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info("The PrometheusRule custom resource definition has been deleted.")
 	r.prometheusRuleCrdExists.Store(false)
 
-	stopWatchingThirdPartyResources(ctx, r, &logger)
+	stopWatchingThirdPartyResources(ctx, r, logger)
 }
 
 func (r *PrometheusRuleCrdReconciler) Generic(
@@ -230,7 +247,7 @@ func (r *PrometheusRuleCrdReconciler) Reconcile(
 func (r *PrometheusRuleCrdReconciler) InitializeSelfMonitoringMetrics(
 	meter otelmetric.Meter,
 	metricNamePrefix string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	reconcileRequestMetricName := fmt.Sprintf("%s%s", metricNamePrefix, "prometheusrulecrd.reconcile_requests")
 	var err error
@@ -249,44 +266,77 @@ func (r *PrometheusRuleCrdReconciler) InitializeSelfMonitoringMetrics(
 	)
 }
 
-func (r *PrometheusRuleCrdReconciler) SetApiEndpointAndDataset(
+func (r *PrometheusRuleCrdReconciler) SetDefaultApiConfigs(
 	ctx context.Context,
-	apiConfig *ApiConfig,
-	logger *logr.Logger) {
-	r.prometheusRuleReconciler.apiConfig.Store(apiConfig)
-	if isValidApiConfig(apiConfig) {
+	apiConfig []ApiConfig,
+	logger logd.Logger,
+) {
+	r.prometheusRuleReconciler.defaultApiConfigs.Set(apiConfig)
+	if len(filterValidApiConfigs(apiConfig, logger, "default operator configuration")) > 0 {
 		maybeStartWatchingThirdPartyResources(r, logger)
 	} else {
 		stopWatchingThirdPartyResources(ctx, r, logger)
 	}
 }
 
-func (r *PrometheusRuleCrdReconciler) RemoveApiEndpointAndDataset(ctx context.Context, logger *logr.Logger) {
-	r.prometheusRuleReconciler.apiConfig.Store(nil)
+func (r *PrometheusRuleCrdReconciler) RemoveDefaultApiConfigs(ctx context.Context, logger logd.Logger) {
+	r.prometheusRuleReconciler.defaultApiConfigs.Set(nil)
 	stopWatchingThirdPartyResources(ctx, r, logger)
 }
 
-func (r *PrometheusRuleCrdReconciler) SetAuthToken(
+func (r *PrometheusRuleCrdReconciler) SetNamespacedApiConfigs(
 	ctx context.Context,
-	authToken string,
-	logger *logr.Logger) {
-	r.prometheusRuleReconciler.authToken.Store(&authToken)
-	if authToken != "" {
-		maybeStartWatchingThirdPartyResources(r, logger)
-	} else {
-		stopWatchingThirdPartyResources(ctx, r, logger)
+	namespace string,
+	updatedApiConfig []ApiConfig,
+	logger logd.Logger,
+) {
+	if updatedApiConfig != nil {
+		previousApiConfig, _ := r.prometheusRuleReconciler.namespacedApiConfigs.Get(namespace)
+
+		r.prometheusRuleReconciler.namespacedApiConfigs.Set(namespace, updatedApiConfig)
+
+		if !slices.Equal(previousApiConfig, updatedApiConfig) {
+			r.prometheusRuleReconciler.synchronizeNamespacedResources(ctx, namespace, logger)
+		}
 	}
 }
 
-func (r *PrometheusRuleCrdReconciler) RemoveAuthToken(ctx context.Context, logger *logr.Logger) {
-	r.prometheusRuleReconciler.authToken.Store(nil)
-	stopWatchingThirdPartyResources(ctx, r, logger)
+func (r *PrometheusRuleCrdReconciler) RemoveNamespacedApiConfigs(
+	ctx context.Context,
+	namespace string,
+	logger logd.Logger,
+) {
+	if _, exists := r.prometheusRuleReconciler.namespacedApiConfigs.Get(namespace); exists {
+		r.prometheusRuleReconciler.namespacedApiConfigs.Delete(namespace)
+		r.prometheusRuleReconciler.synchronizeNamespacedResources(ctx, namespace, logger)
+	}
+}
+
+func (r *PrometheusRuleCrdReconciler) SetSynchronizationEnabled(
+	ctx context.Context,
+	namespace string,
+	monitoringResource *dash0v1beta1.Dash0Monitoring,
+	logger logd.Logger,
+) {
+	enabled := r.prometheusRuleReconciler.IsSynchronizationEnabled(monitoringResource)
+	previous, hadPrevious := r.prometheusRuleReconciler.namespacedSyncEnabled.Swap(namespace, enabled)
+	if prev, ok := previous.(bool); hadPrevious && ok && !prev && enabled {
+		logger.Info(fmt.Sprintf(
+			"Synchronization of check rules has been enabled for namespace %s, triggering resync.",
+			namespace,
+		))
+		r.prometheusRuleReconciler.synchronizeNamespacedResources(ctx, namespace, logger)
+	}
+}
+
+func (r *PrometheusRuleCrdReconciler) RemoveSynchronizationEnabled(namespace string) {
+	r.prometheusRuleReconciler.namespacedSyncEnabled.Delete(namespace)
 }
 
 func (r *PrometheusRuleReconciler) InitializeSelfMonitoringMetrics(
 	meter otelmetric.Meter,
 	metricNamePrefix string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) {
 	reconcileRequestMetricName := fmt.Sprintf("%s%s", metricNamePrefix, "prometheusrule.reconcile_requests")
 	var err error
@@ -323,16 +373,12 @@ func (r *PrometheusRuleReconciler) IsWatching() bool {
 	return r.controllerStopFunction != nil
 }
 
-func (r *PrometheusRuleReconciler) GetAuthToken() string {
-	token := r.authToken.Load()
-	if token == nil {
-		return ""
-	}
-	return *token
+func (r *PrometheusRuleReconciler) GetDefaultApiConfigs() []ApiConfig {
+	return r.defaultApiConfigs.Get()
 }
 
-func (r *PrometheusRuleReconciler) GetApiConfig() *atomic.Pointer[ApiConfig] {
-	return &r.apiConfig
+func (r *PrometheusRuleReconciler) GetNamespacedApiConfigs(namespace string) ([]ApiConfig, bool) {
+	return r.namespacedApiConfigs.Get(namespace)
 }
 
 func (r *PrometheusRuleReconciler) ControllerName() string {
@@ -349,14 +395,6 @@ func (r *PrometheusRuleReconciler) Queue() *workqueue.Typed[ThirdPartyResourceSy
 
 func (r *PrometheusRuleReconciler) HttpClient() *http.Client {
 	return r.httpClient
-}
-
-func (r *PrometheusRuleReconciler) GetHttpRetryDelay() time.Duration {
-	return r.httpRetryDelay
-}
-
-func (r *PrometheusRuleReconciler) overrideHttpRetryDelay(delay time.Duration) {
-	r.httpRetryDelay = delay
 }
 
 func (r *PrometheusRuleReconciler) IsSynchronizationEnabled(monitoringResource *dash0v1beta1.Dash0Monitoring) bool {
@@ -379,7 +417,7 @@ func (r *PrometheusRuleReconciler) Create(
 		prometheusRuleReconcileRequestMetric.Add(ctx, 1)
 	}
 
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info(
 		"Detected a new Prometheus rule resource",
 		"namespace",
@@ -400,7 +438,7 @@ func (r *PrometheusRuleReconciler) Update(
 		prometheusRuleReconcileRequestMetric.Add(ctx, 1)
 	}
 
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info(
 		"Detected a change for a Prometheus rule resource",
 		"namespace",
@@ -421,7 +459,7 @@ func (r *PrometheusRuleReconciler) Delete(
 		prometheusRuleReconcileRequestMetric.Add(ctx, 1)
 	}
 
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 	logger.Info(
 		"Detected the deletion of a Prometheus rule resource",
 		"namespace",
@@ -434,11 +472,24 @@ func (r *PrometheusRuleReconciler) Delete(
 }
 
 func (r *PrometheusRuleReconciler) Generic(
-	_ context.Context,
-	_ event.TypedGenericEvent[*unstructured.Unstructured],
+	ctx context.Context,
+	e event.TypedGenericEvent[*unstructured.Unstructured],
 	_ workqueue.TypedRateLimitingInterface[reconcile.Request],
 ) {
-	// ignoring generic events
+	if prometheusRuleReconcileRequestMetric != nil {
+		prometheusRuleReconcileRequestMetric.Add(ctx, 1)
+	}
+
+	logger := logd.FromContext(ctx)
+	logger.Info(
+		"Reconciling check rule triggered by config event (updated API config or authorization).",
+		"namespace",
+		e.Object.GetNamespace(),
+		"name",
+		e.Object.GetName(),
+	)
+
+	upsertViaApi(r, e.Object)
 }
 
 func (r *PrometheusRuleReconciler) Reconcile(
@@ -451,197 +502,281 @@ func (r *PrometheusRuleReconciler) Reconcile(
 	return reconcile.Result{}, nil
 }
 
-func (r *PrometheusRuleReconciler) FetchExistingResourceOriginsRequest(
-	preconditionChecksResult *preconditionValidationResult,
-) (*http.Request, error) {
-	checkRulesUrl := r.renderCheckRuleListUrl(preconditionChecksResult)
+func (r *PrometheusRuleReconciler) FetchExistingResourceOriginsRequests(
+	preconditionValidationResult *preconditionValidationResult,
+	apiConfig ApiConfig,
+) ([]*http.Request, error) {
+	var requests []*http.Request
+
+	// Fetch existing alerting rule origins.
+	checkRulesUrl := r.renderCheckRuleListUrl(preconditionValidationResult, apiConfig.Endpoint, apiConfig.Dataset)
 	if req, err := http.NewRequest(http.MethodGet, checkRulesUrl, nil); err != nil {
 		return nil, err
 	} else {
-		addAuthorizationHeader(req, preconditionChecksResult)
+		addAuthorizationHeader(req, apiConfig.Token)
 		req.Header.Set(util.AcceptHeaderName, util.ApplicationJsonMediaType)
-		return req, nil
+		requests = append(requests, req)
 	}
+
+	// Fetch existing recording rule origins.
+	recordingRulesUrl := r.renderRecordingRuleListUrl(preconditionValidationResult, apiConfig.Endpoint, apiConfig.Dataset)
+	if req, err := http.NewRequest(http.MethodGet, recordingRulesUrl, nil); err != nil {
+		return nil, err
+	} else {
+		addAuthorizationHeader(req, apiConfig.Token)
+		req.Header.Set(util.AcceptHeaderName, util.ApplicationJsonMediaType)
+		requests = append(requests, req)
+	}
+
+	return requests, nil
 }
 
 func (r *PrometheusRuleReconciler) MapResourceToHttpRequests(
 	preconditionChecksResult *preconditionValidationResult,
+	apiConfig ApiConfig,
 	action apiAction,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) *ResourceToRequestsResult {
 	specRaw := preconditionChecksResult.resource["spec"]
-
 	// convert the untyped spec to a value of type prometheusv1.PrometheusRuleSpec by marshalling and then unmarshalling
 	//it
 	specAsYaml, err := yaml.Marshal(specRaw)
 	if err != nil {
 		logger.Error(err, "unable to marshal the Prometheus rule spec")
-		return NewResourceToRequestsResultPreconditionError(err.Error())
+		return NewResourceToRequestsResultPreconditionError(apiConfig, err.Error())
 	}
 	ruleSpec := prometheusv1.PrometheusRuleSpec{}
 	if err = yaml.Unmarshal(specAsYaml, &ruleSpec); err != nil {
 		logger.Error(err, "unable to unmarshal the Prometheus rule spec")
-		return NewResourceToRequestsResultPreconditionError(err.Error())
+		return NewResourceToRequestsResultPreconditionError(apiConfig, err.Error())
 	}
 
 	var originsInResource []string
 	var requests []WrappedApiRequest
+	var alertingRulesTotal int
+	var recordingRulesTotal int
 	allValidationIssues := make(map[string][]string)
 	allSynchronizationErrors := make(map[string]string)
 
 	for _, group := range ruleSpec.Groups {
 		duplicateOrigins := make(map[string]int, len(group.Rules))
 		for ruleIdx, rule := range group.Rules {
-			itemNameSuffix := rule.Alert
-			if itemNameSuffix == "" {
-				itemNameSuffix = strconv.Itoa(ruleIdx)
-			}
-			checkRuleName := fmt.Sprintf("%s - %s", group.Name, itemNameSuffix)
-			checkRuleOriginNotUrlEncoded, checkRuleOriginUrlEncoded :=
-				r.renderCheckRuleOrigin(preconditionChecksResult, duplicateOrigins, group.Name, rule.Alert)
-			checkRuleUrl := r.renderCheckRuleUrl(preconditionChecksResult, checkRuleOriginUrlEncoded)
-			request, validationIssues, syncError, ok := convertRuleToRequest(
-				checkRuleUrl,
-				action,
-				rule,
-				preconditionChecksResult,
-				group.Name,
-				group.Interval,
-				r.readTopLevelAnnotations(preconditionChecksResult),
-				logger,
-			)
-			if len(validationIssues) > 0 {
-				allValidationIssues[checkRuleName] = validationIssues
-				// If a rule becomes temporarily invalid due to a bad edit, we do not want to delete it in Dash0
-				// (assuming it has been valid at some point before and has been synchronized). Instead, we keep the
-				// most recent valid state. To do that, we add its id to the list of ids we have seen (the list will
-				// later be used to determine which of the checks in Dash0 need to be removed because they are no longer
-				// in the K8s resource.
-				originsInResource = append(originsInResource, checkRuleOriginNotUrlEncoded)
-				continue
-			}
-			if syncError != nil {
-				// If a rule cannot be synchronized temporarily, we do not want to delete it in Dash0 immediately
-				// (assuming the rule has been synchronized before at some point). Instead, we keep the
-				// most recent state. To do that, we add its id to the list of ids we have seen (the list will later
-				// be used to determine which of the checks in Dash0 need to be removed because they are no longer
-				// in the K8s resource.
-				allSynchronizationErrors[checkRuleName] = syncError.Error()
-				continue
-			}
-			if ok {
-				requests = append(requests, WrappedApiRequest{
-					Request:  request,
-					ItemName: checkRuleName,
-					Origin:   checkRuleOriginNotUrlEncoded,
-					Dataset:  preconditionChecksResult.dataset,
-				})
-				originsInResource = append(originsInResource, checkRuleOriginNotUrlEncoded)
+			if rule.Record != "" {
+				// This is a recording rule.
+				recordingRulesTotal++
+				itemNameSuffix := rule.Record
+				ruleName := fmt.Sprintf("%s - %s", group.Name, itemNameSuffix)
+				ruleOriginNotUrlEncoded, ruleOriginUrlEncoded :=
+					r.renderRuleOrigin(
+						preconditionChecksResult,
+						apiConfig.Dataset,
+						duplicateOrigins,
+						group.Name,
+						rule.Record,
+					)
+				recordingRuleUrl := r.renderRecordingRuleUrl(
+					ruleOriginUrlEncoded, apiConfig.Endpoint, apiConfig.Dataset,
+				)
+				request, syncError := convertRecordingRuleToRequest(
+					recordingRuleUrl,
+					action,
+					apiConfig,
+					rule,
+					group.Name,
+					group.Interval,
+					logger,
+				)
+				if syncError != nil {
+					allSynchronizationErrors[ruleName] = syncError.Error()
+					originsInResource = append(originsInResource, ruleOriginNotUrlEncoded)
+					continue
+				}
+				if request != nil {
+					requests = append(
+						requests, WrappedApiRequest{
+							Request:  request,
+							ItemName: ruleName,
+							Origin:   ruleOriginNotUrlEncoded,
+						},
+					)
+					originsInResource = append(originsInResource, ruleOriginNotUrlEncoded)
+				}
+			} else {
+				// This is an alerting rule.
+				alertingRulesTotal++
+				itemNameSuffix := rule.Alert
+				if itemNameSuffix == "" {
+					itemNameSuffix = strconv.Itoa(ruleIdx)
+				}
+				checkRuleName := fmt.Sprintf("%s - %s", group.Name, itemNameSuffix)
+				checkRuleOriginNotUrlEncoded, checkRuleOriginUrlEncoded :=
+					r.renderRuleOrigin(
+						preconditionChecksResult,
+						apiConfig.Dataset,
+						duplicateOrigins,
+						group.Name,
+						rule.Alert,
+					)
+				checkRuleUrl := r.renderCheckRuleUrl(checkRuleOriginUrlEncoded, apiConfig.Endpoint, apiConfig.Dataset)
+				// note: syncError does not actually refer to a failed sync attempt but indicates that the request could not be created
+				request, validationIssues, syncError, ok := convertAlertingRuleToRequest(
+					checkRuleUrl,
+					action,
+					apiConfig,
+					rule,
+					group.Name,
+					group.Interval,
+					readTopLevelAnnotations(preconditionChecksResult),
+					logger,
+				)
+				if len(validationIssues) > 0 {
+					allValidationIssues[checkRuleName] = validationIssues
+					// If a rule becomes temporarily invalid due to a bad edit, we do not want to delete it in Dash0
+					// (assuming it has been valid at some point before and has been synchronized). Instead, we keep the
+					// most recent valid state. To do that, we add its id to the list of ids we have seen (the list will
+					// later be used to determine which of the checks in Dash0 need to be removed because they are no
+					// longer in the K8s resource.
+					originsInResource = append(originsInResource, checkRuleOriginNotUrlEncoded)
+					continue
+				}
+				if syncError != nil {
+					// If a rule cannot be synchronized temporarily, we do not want to delete it in Dash0 immediately
+					// (assuming the rule has been synchronized before at some point). Instead, we keep the
+					// most recent state. To do that, we add its id to the list of ids we have seen (the list will later
+					// be used to determine which of the checks in Dash0 need to be removed because they are no longer
+					// in the K8s resource.
+					allSynchronizationErrors[checkRuleName] = syncError.Error()
+					continue
+				}
+				if ok {
+					requests = append(
+						requests, WrappedApiRequest{
+							Request:  request,
+							ItemName: checkRuleName,
+							Origin:   checkRuleOriginNotUrlEncoded,
+						},
+					)
+					originsInResource = append(originsInResource, checkRuleOriginNotUrlEncoded)
+				}
 			}
 		}
 	}
 
-	return NewResourceToRequestsResult(
-		len(requests)+len(allValidationIssues)+len(allSynchronizationErrors),
+	result := NewResourceToRequestsResult(
+		apiConfig,
 		requests,
 		originsInResource,
 		allValidationIssues,
 		allSynchronizationErrors,
 	)
+	result.AlertingRulesTotal = alertingRulesTotal
+	result.RecordingRulesTotal = recordingRulesTotal
+	return result
 }
 
 // renderCheckRuleListUrl renders the URL to fetch the list of existing check rule IDs from the Dash0 API.
-func (r *PrometheusRuleReconciler) renderCheckRuleListUrl(preconditionChecksResult *preconditionValidationResult) string {
-	// 08.09.2025: Start sending the prefix already as originPrefix, the Dash0 API will rename the parameter
-	// soon-ish. We can remove the (misnamed) idPrefix query parameter as soon as the Dash0 API has rolled out the
-	// rename. Then, ~1 year later, the Dash0 API can remove support for the legacy query parameter idPrefix.
+func (r *PrometheusRuleReconciler) renderCheckRuleListUrl(
+	preconditionChecksResult *preconditionValidationResult,
+	endpoint string,
+	dataset string,
+) string {
 	originPrefix :=
-		r.renderCheckRuleOriginPrefix(preconditionChecksResult, url.QueryEscape(preconditionChecksResult.dataset))
+		r.renderRuleOriginPrefix(preconditionChecksResult, url.QueryEscape(dataset))
 	return fmt.Sprintf(
-		"%sapi/alerting/check-rules?dataset=%s&idPrefix=%s&originPrefix=%s",
-		preconditionChecksResult.apiEndpoint,
-		url.QueryEscape(preconditionChecksResult.dataset),
-		originPrefix,
+		"%sapi/alerting/check-rules?dataset=%s&originPrefix=%s",
+		endpoint,
+		url.QueryEscape(dataset),
 		originPrefix,
 	)
 }
 
 // renderCheckRuleUrl renders the URL for a single Dash0 check rule.
 func (r *PrometheusRuleReconciler) renderCheckRuleUrl(
-	preconditionChecksResult *preconditionValidationResult,
 	checkRuleOrigin string,
+	endpoint string,
+	dataset string,
 ) string {
 	return fmt.Sprintf(
 		"%sapi/alerting/check-rules/%s?dataset=%s",
-		preconditionChecksResult.apiEndpoint,
+		endpoint,
 		checkRuleOrigin,
-		url.QueryEscape(preconditionChecksResult.dataset),
+		url.QueryEscape(dataset),
 	)
 }
 
-// renderCheckRuleOrigin renders the origin of a single Dash0 check rule.
+// renderRuleOrigin renders the origin of a single alerting or recording rule.
 // The origin has the pattern
-// "dash0-operator_${clusterUid}_${dataset}_${namespace}_${prometheusrule_resource_name}_${group.name}_${alert}".
-func (r *PrometheusRuleReconciler) renderCheckRuleOrigin(
+// "dash0-operator_${clusterUid}_${dataset}_${namespace}_${prometheusrule_resource_name}_${group.name}_${ruleName}".
+func (r *PrometheusRuleReconciler) renderRuleOrigin(
 	preconditionChecksResult *preconditionValidationResult,
+	dataset string,
 	duplicateOrigins map[string]int,
 	groupName string,
-	alertName string,
+	ruleName string,
 ) (string, string) {
 	// For now the Dash0 backend treats %2F the same as "/", so we need to replace forward slashes with
 	// something other than %2F.
 	// See
 	// https://stackoverflow.com/questions/71581828/gin-problem-accessing-url-encoded-path-param-containing-forward-slash
+	// The character "%" causes a similar problem, so we also replace it.
+	// See https://github.com/oapi-codegen/runtime/issues/35
+	// Colons ":" also cause issues with the recording rules API (404 errors), so we replace them too. This is
+	// particularly relevant for recording rules, which conventionally use colons in their names (e.g.,
+	// "job:http_requests:rate5m").
 	groupNameNotUrlEncoded := strings.ReplaceAll(groupName, "/", "|")
+	groupNameNotUrlEncoded = strings.ReplaceAll(groupNameNotUrlEncoded, "%", "|")
+	groupNameNotUrlEncoded = strings.ReplaceAll(groupNameNotUrlEncoded, ":", "|")
 	groupNameUrlEncoded := url.PathEscape(groupNameNotUrlEncoded)
-	if alertName == "" {
-		// Rules without an alert name will not actually be sent to the Dash0 API, since they are deemed invalid by
-		// convertRuleToCheckRule ("rule has neither the alert nor the record attribute").
-		alertName = "unnamed rule"
+	if ruleName == "" {
+		// Rules without a name will not actually be sent to the Dash0 API, since they are deemed invalid by
+		// convertAlertingRuleToCheckRule ("rule has neither the alert nor the record attribute").
+		ruleName = "unnamed rule"
 	}
-	alertNameNotUrlEncoded := strings.ReplaceAll(alertName, "/", "|")
-	alertNameUrlEncoded := url.PathEscape(alertNameNotUrlEncoded)
+	ruleNameNotUrlEncoded := strings.ReplaceAll(ruleName, "/", "|")
+	ruleNameNotUrlEncoded = strings.ReplaceAll(ruleNameNotUrlEncoded, "%", "|")
+	ruleNameNotUrlEncoded = strings.ReplaceAll(ruleNameNotUrlEncoded, ":", "|")
+	ruleNameUrlEncoded := url.PathEscape(ruleNameNotUrlEncoded)
 
-	checkOriginNotUrlEncoded := fmt.Sprintf(
+	originNotUrlEncoded := fmt.Sprintf(
 		"%s%s_%s",
-		r.renderCheckRuleOriginPrefix(preconditionChecksResult, preconditionChecksResult.dataset),
+		r.renderRuleOriginPrefix(preconditionChecksResult, dataset),
 		groupNameNotUrlEncoded,
-		alertNameNotUrlEncoded,
+		ruleNameNotUrlEncoded,
 	)
-	checkOriginUrlEncoded := fmt.Sprintf(
+	originUrlEncoded := fmt.Sprintf(
 		"%s%s_%s",
 		// dataset can only contain letters, numbers, underscores, and hyphens, so we do not need to replace "/" -> "|".
-		r.renderCheckRuleOriginPrefix(preconditionChecksResult, url.PathEscape(preconditionChecksResult.dataset)),
+		r.renderRuleOriginPrefix(preconditionChecksResult, url.PathEscape(dataset)),
 		groupNameUrlEncoded,
-		alertNameUrlEncoded,
+		ruleNameUrlEncoded,
 	)
 
 	// About duplicate origins: Origins must be unique within a dataset, and they need to be stable against reordering
 	// of rules within a group or deletion of individual rules from a group. We derive the origin from the group name
-	// and the name of the individual alert rule. The group name is guaranteed to be unique within a PrometheusRule
+	// and the name of the individual rule. The group name is guaranteed to be unique within a PrometheusRule
 	// resource, due to a "x-kubernetes-list-type: map" plus "x-kubernetes-list-map-keys: [name]" annotation in the CRD.
-	// The rule.alert field has no such guarantee, duplicate alert names within a group are possible.
+	// The rule name field has no such guarantee, duplicate names within a group are possible.
 	// We keep track of all produced origins within a group in the duplicateOrigins map[string]int. Once an origin
 	// string has been produced for the first time, we set the value for this origin to 1. The counter is increased
 	// each time the origin is produced again. Starting with the second time we see the same origin (i.e. the first
 	// duplicate), the counter is also appended to the origin to ensure unique origins.
-	// (One downside of this approach is that _within a set of rules with identical group & alert name_, reordering
+	// (One downside of this approach is that _within a set of rules with identical group & rule name_, reordering
 	// rules or deleting one of the rules can lead to one rule taking over the origin of another rule, which we
-	// generally avoid for rules without duplicate alert names. Duplicate alert names should be fairly uncommon in
+	// generally avoid for rules without duplicate names. Duplicate names should be fairly uncommon in
 	// practice, they can be considered a configuration error, so this downside is acceptable.)
-	if duplicationIndexForThisOrigin, isDuplicate := duplicateOrigins[checkOriginNotUrlEncoded]; isDuplicate {
-		duplicateOrigins[checkOriginNotUrlEncoded]++
-		checkOriginNotUrlEncoded = checkOriginNotUrlEncoded + "_" + strconv.Itoa(duplicationIndexForThisOrigin)
-		checkOriginUrlEncoded = checkOriginNotUrlEncoded + "_" + strconv.Itoa(duplicationIndexForThisOrigin)
+	if duplicationIndexForThisOrigin, isDuplicate := duplicateOrigins[originNotUrlEncoded]; isDuplicate {
+		duplicateOrigins[originNotUrlEncoded]++
+		originNotUrlEncoded = originNotUrlEncoded + "_" + strconv.Itoa(duplicationIndexForThisOrigin)
+		originUrlEncoded = originNotUrlEncoded + "_" + strconv.Itoa(duplicationIndexForThisOrigin)
 	} else {
-		duplicateOrigins[checkOriginNotUrlEncoded] = 1
+		duplicateOrigins[originNotUrlEncoded] = 1
 	}
-	return checkOriginNotUrlEncoded, checkOriginUrlEncoded
+	return originNotUrlEncoded, originUrlEncoded
 }
 
-// renderCheckRuleOriginPrefix renders the common origin prefix for all Dash0 check rules that are created from one
-// Kubernetes PrometheusRule resource.
-func (r *PrometheusRuleReconciler) renderCheckRuleOriginPrefix(
+// renderRuleOriginPrefix renders the common origin prefix for all alerting or recording rules that are
+// created from one Kubernetes PrometheusRule resource.
+func (r *PrometheusRuleReconciler) renderRuleOriginPrefix(
 	preconditionChecksResult *preconditionValidationResult,
 	dataset string,
 ) string {
@@ -656,12 +791,42 @@ func (r *PrometheusRuleReconciler) renderCheckRuleOriginPrefix(
 	)
 }
 
-func (r *PrometheusRuleReconciler) readTopLevelAnnotations(preconditionChecksResult *preconditionValidationResult) map[string]string {
+// renderRecordingRuleListUrl renders the URL to fetch the list of existing recording rule origins from the Dash0 API.
+func (r *PrometheusRuleReconciler) renderRecordingRuleListUrl(
+	preconditionChecksResult *preconditionValidationResult,
+	endpoint string,
+	dataset string,
+) string {
+	originPrefix :=
+		r.renderRuleOriginPrefix(preconditionChecksResult, url.QueryEscape(dataset))
+	return fmt.Sprintf(
+		"%sapi/recording-rules?dataset=%s&originPrefix=%s",
+		endpoint,
+		url.QueryEscape(dataset),
+		originPrefix,
+	)
+}
+
+// renderRecordingRuleUrl renders the URL for a single Dash0 recording rule.
+func (r *PrometheusRuleReconciler) renderRecordingRuleUrl(
+	recordingRuleOrigin string,
+	endpoint string,
+	dataset string,
+) string {
+	return fmt.Sprintf(
+		"%sapi/recording-rules/%s?dataset=%s",
+		endpoint,
+		recordingRuleOrigin,
+		url.QueryEscape(dataset),
+	)
+}
+
+func readTopLevelAnnotations(preconditionChecksResult *preconditionValidationResult) map[string]string {
 	var metadataAnnotations map[string]string
 	if metadataRaw, ok := preconditionChecksResult.resource["metadata"]; ok {
-		if metadata, ok := metadataRaw.(map[string]interface{}); ok {
+		if metadata, ok := metadataRaw.(map[string]any); ok {
 			if annotationsRaw, ok := metadata["annotations"]; ok {
-				if annotations, ok := annotationsRaw.(map[string]interface{}); ok {
+				if annotations, ok := annotationsRaw.(map[string]any); ok {
 					metadataAnnotations = make(map[string]string, len(annotations))
 					for key, value := range annotations {
 						if strValue, ok := value.(string); ok {
@@ -675,22 +840,22 @@ func (r *PrometheusRuleReconciler) readTopLevelAnnotations(preconditionChecksRes
 	return metadataAnnotations
 }
 
-// convertRuleToRequest converts a Prometheus rule to an HTTP request that can be sent to the Dash0 API. It returns the
-// request object if the conversion is successful and there are no validation issues and no synchronization errors.
-// Otherwise, a list of validation issues or a single synchronization errror is returned. There are also rules which we
-// want to silently skip, in which case no rule, no validation issues and no error is returned, but the final boolean
-// return value is false.
-func convertRuleToRequest(
+// convertAlertingRuleToRequest converts a Prometheus alerting rule to an HTTP request that can be sent to the Dash0 API.
+// It returns the request object if the conversion is successful and there are no validation issues and no
+// synchronization errors. Otherwise, a list of validation issues or a single synchronization error is returned. There
+// are also rules which we want to silently skip, in which case no rule, no validation issues and no error is returned,
+// but the final boolean return value is false.
+func convertAlertingRuleToRequest(
 	checkRuleUrl string,
 	action apiAction,
+	apiConfig ApiConfig,
 	rule prometheusv1.Rule,
-	preconditionChecksResult *preconditionValidationResult,
 	groupName string,
 	interval *prometheusv1.Duration,
 	metadataAnnotations map[string]string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (*http.Request, []string, error, bool) {
-	checkRule, validationIssues, ok := convertRuleToCheckRule(
+	checkRule, validationIssues, ok := convertAlertingRuleToCheckRule(
 		rule,
 		action,
 		groupName,
@@ -746,7 +911,7 @@ func convertRuleToRequest(
 		return nil, nil, httpError, false
 	}
 
-	addAuthorizationHeader(req, preconditionChecksResult)
+	addAuthorizationHeader(req, apiConfig.Token)
 	if action == upsertAction {
 		req.Header.Set(util.ContentTypeHeaderName, util.ApplicationJsonMediaType)
 	}
@@ -754,32 +919,110 @@ func convertRuleToRequest(
 	return req, nil, nil, true
 }
 
-// convertRuleToCheckRule converts a Prometheus rule to a CheckRule. It returns the converted CheckRule if the
-// conversion is successful and there are no validation issues. Otherwise, a list of validation issues is returned.
-// There are also rules which we want to silently skip, in which case no rule and no validation issues are returned,
-// but the boolean return value is false.
-func convertRuleToCheckRule(
+// convertRecordingRuleToRequest converts a Prometheus recording rule to an HTTP request that can be sent to the Dash0
+// recording rules API. It returns the request object if the conversion is successful, or a synchronization error.
+func convertRecordingRuleToRequest(
+	recordingRuleUrl string,
+	action apiAction,
+	apiConfig ApiConfig,
+	rule prometheusv1.Rule,
+	groupName string,
+	interval *prometheusv1.Duration,
+	logger logd.Logger,
+) (*http.Request, error) {
+	var req *http.Request
+	var method string
+	var err error
+
+	switch action {
+	case upsertAction:
+		// The Dash0 recording rules API expects the full PrometheusRule CRD format.
+		prometheusRule := map[string]any{
+			"apiVersion": "monitoring.coreos.com/v1",
+			"kind":       "PrometheusRule",
+			"metadata": map[string]any{
+				"name": fmt.Sprintf("%s - %s", groupName, rule.Record),
+			},
+			"spec": map[string]any{
+				"groups": []map[string]any{
+					{
+						"name":     groupName,
+						"interval": convertDuration(interval),
+						"rules": []map[string]any{
+							{
+								"record": rule.Record,
+								"expr":   convertIntOrString(rule.Expr),
+								"labels": rule.Labels,
+							},
+						},
+					},
+				},
+			},
+		}
+		serializedRecordingRule, _ := json.Marshal(prometheusRule)
+		requestPayload := bytes.NewBuffer(serializedRecordingRule)
+		method = http.MethodPut
+		req, err = http.NewRequest(
+			method,
+			recordingRuleUrl,
+			requestPayload,
+		)
+	case deleteAction:
+		method = http.MethodDelete
+		req, err = http.NewRequest(
+			method,
+			recordingRuleUrl,
+			nil,
+		)
+	default:
+		unknownActionErr := fmt.Errorf("unknown API action: %d", action)
+		logger.Error(unknownActionErr, "unknown API action")
+		return nil, unknownActionErr
+	}
+
+	if err != nil {
+		httpError := fmt.Errorf(
+			"unable to create a new HTTP request to synchronize the recording rule: %s %s: %w",
+			method,
+			recordingRuleUrl,
+			err,
+		)
+		logger.Error(httpError, "error creating http request")
+		return nil, httpError
+	}
+
+	addAuthorizationHeader(req, apiConfig.Token)
+	if action == upsertAction {
+		req.Header.Set(util.ContentTypeHeaderName, util.ApplicationJsonMediaType)
+	}
+
+	return req, nil
+}
+
+// convertAlertingRuleToCheckRule converts a Prometheus alerting rule to a CheckRule. It returns the converted CheckRule
+// if the conversion is successful and there are no validation issues. Otherwise, a list of validation issues is
+// returned. There are also rules which we want to silently skip, in which case no rule and no validation issues are
+// returned, but the boolean return value is false.
+// Note: recording rules (rule.Record != "") are handled separately in MapResourceToHttpRequests and should not reach
+// this function.
+func convertAlertingRuleToCheckRule(
 	rule prometheusv1.Rule,
 	action apiAction,
 	groupName string,
 	interval *prometheusv1.Duration,
 	metadataAnnotations map[string]string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (*CheckRule, []string, bool) {
-	if rule.Record != "" {
-		logger.Info("Skipping rule with record attribute", "record", rule.Record)
-		return nil, nil, false
-	}
 	if rule.Alert == "" {
-		logger.Info(
+		logger.Warn(
 			fmt.Sprintf(
-				"Found invalid rule in group %s which has neither a record nor an alert attribute.", groupName))
+				"Found invalid rule in group %s which has neither a record nor an alert attribute.", groupName,
+			),
+		)
 		return nil, []string{"rule has neither the alert nor the record attribute"}, false
 	}
 
 	if action == deleteAction {
-		// When deleting a rule, we do not need an actual payload, but do need to skip rules with rule.Record or without
-		// rule.Alert (that is why we still call convertRuleToCheckRule for deletions).
 		return &CheckRule{}, nil, true
 	}
 
@@ -862,12 +1105,14 @@ func validateThreshold(
 	}
 
 	if hasThresholdInExpression && !hasThresholdDegradedAnnotation && !hasThresholdCriticalAnnotation {
-		return append(validationIssues, fmt.Sprintf(
-			thresholdAnnotationsMissingMessagePattern,
-			thresholdReference,
-			thresholdDegradedAnnotation,
-			thresholdCriticalAnnotation,
-		))
+		return append(
+			validationIssues, fmt.Sprintf(
+				thresholdAnnotationsMissingMessagePattern,
+				thresholdReference,
+				thresholdDegradedAnnotation,
+				thresholdCriticalAnnotation,
+			),
+		)
 	}
 
 	if !hasThresholdDegradedAnnotation && !hasThresholdCriticalAnnotation {
@@ -917,110 +1162,175 @@ func mergeAnnotations(metadataAnnotations map[string]string, ruleAnnotations map
 	}
 
 	merged := make(map[string]string, len(metadataAnnotations)+len(ruleAnnotations))
-	for key, value := range metadataAnnotations {
-		merged[key] = value
-	}
+	maps.Copy(merged, metadataAnnotations)
 
 	// override metadata annotations with individual rule annotations, i.e. annotations from individual rules take
 	// priority
-	for key, value := range ruleAnnotations {
-		merged[key] = value
-	}
+	maps.Copy(merged, ruleAnnotations)
 
 	return merged
 }
 
 func (r *PrometheusRuleReconciler) CreateDeleteRequests(
-	preconditionChecksResult *preconditionValidationResult,
+	apiConfig ApiConfig,
 	existingOriginsFromApi []string,
 	originsInResource []string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) ([]WrappedApiRequest, map[string]string) {
 	var deleteRequests []WrappedApiRequest
 	allSynchronizationErrors := make(map[string]string)
 	for _, existingOrigin := range existingOriginsFromApi {
 		if !slices.Contains(originsInResource, existingOrigin) {
-			// This means that the rule has been deleted in the resource, so we need to delete it via the API.
-			deleteUrl := r.renderCheckRuleUrl(preconditionChecksResult, existingOrigin)
-			if req, err := http.NewRequest(
-				http.MethodDelete,
-				deleteUrl,
-				nil,
-			); err != nil {
-				httpError := fmt.Errorf(
-					"unable to create a new HTTP request to delete the rule at %s: %w",
+			// The rule has been removed from the K8s resource, delete it via the API. Since the origin string
+			// doesn't indicate whether it was an alerting or recording rule, we send DELETEs to both APIs.
+			// The API that doesn't have this origin will return 404, which is handled gracefully by the HTTP
+			// executor (see executeSingleHttpRequest).
+			deleteUrls := []string{
+				r.renderCheckRuleUrl(existingOrigin, apiConfig.Endpoint, apiConfig.Dataset),
+				r.renderRecordingRuleUrl(existingOrigin, apiConfig.Endpoint, apiConfig.Dataset),
+			}
+			for _, deleteUrl := range deleteUrls {
+				if req, err := http.NewRequest(
+					http.MethodDelete,
 					deleteUrl,
-					err,
-				)
-				logger.Error(httpError, "error creating http request to delete rule")
-				allSynchronizationErrors[existingOrigin] = httpError.Error()
-			} else {
-				addAuthorizationHeader(req, preconditionChecksResult)
-				deleteRequests = append(deleteRequests, WrappedApiRequest{
-					Request:  req,
-					ItemName: existingOrigin + " (deleted)",
-					Origin:   existingOrigin,
-					Dataset:  preconditionChecksResult.dataset,
-				})
+					nil,
+				); err != nil {
+					httpError := fmt.Errorf(
+						"unable to create a new HTTP request to delete the rule at %s: %w",
+						deleteUrl,
+						err,
+					)
+					logger.Error(httpError, "error creating http request to delete rule")
+					allSynchronizationErrors[existingOrigin] = httpError.Error()
+				} else {
+					addAuthorizationHeader(req, apiConfig.Token)
+					deleteRequests = append(
+						deleteRequests, WrappedApiRequest{
+							Request:  req,
+							ItemName: existingOrigin + " (deleted)",
+							Origin:   existingOrigin,
+						},
+					)
+				}
 			}
 		}
 	}
 	return deleteRequests, allSynchronizationErrors
 }
 
-func (r *PrometheusRuleReconciler) ExtractIdOriginAndDatasetFromResponseBody(
+func (r *PrometheusRuleReconciler) ExtractIdFromResponseBody(
 	responseBytes []byte,
-	logger *logr.Logger,
-) Dash0ApiObjectLabels {
-	apiResponseWithOriginAsId := Dash0ApiResponseWithOriginAsId{}
-	if err := json.Unmarshal(responseBytes, &apiResponseWithOriginAsId); err != nil {
+	logger logd.Logger,
+) (id string, err error) {
+	objectWithMetadata := Dash0ApiObjectWithMetadata{}
+	if err := json.Unmarshal(responseBytes, &objectWithMetadata); err != nil {
 		logger.Error(
 			err,
-			"cannot parse response, will not extract the synchronized object's ID or origin",
+			"cannot parse response, will not extract the synchronized object's ID",
 			"response",
 			string(responseBytes),
 		)
-		return Dash0ApiObjectLabels{}
+		return "", err
 	}
-	return Dash0ApiObjectLabels{
-		Origin:  apiResponseWithOriginAsId.Origin,
-		Dataset: apiResponseWithOriginAsId.Dataset,
-	}
+	return objectWithMetadata.Metadata.Labels.Id, nil
 }
 
 func (*PrometheusRuleReconciler) UpdateSynchronizationResultsInDash0MonitoringStatus(
 	monitoringResource *dash0v1beta1.Dash0Monitoring,
 	qualifiedName string,
 	status dash0common.ThirdPartySynchronizationStatus,
-	resourceToRequestsResult *ResourceToRequestsResult,
-	successfullySynchronized []SuccessfulSynchronizationResult,
-) interface{} {
+	syncResults synchronizationResults,
+) any {
 	previousResults := monitoringResource.Status.PrometheusRuleSynchronizationResults
 	if previousResults == nil {
 		previousResults = make(map[string]dash0common.PrometheusRuleSynchronizationResult)
 		monitoringResource.Status.PrometheusRuleSynchronizationResults = previousResults
 	}
 
-	synchronizedRuleAttributes := make(map[string]dash0common.PrometheusRuleSynchronizedRuleAttributes, len(successfullySynchronized))
-	for _, syncResult := range successfullySynchronized {
-		promRuleSyncAttributes := dash0common.PrometheusRuleSynchronizedRuleAttributes{}
-		apiObjectLabels := syncResult.Labels
-		promRuleSyncAttributes.Dash0Origin = apiObjectLabels.Origin
-		promRuleSyncAttributes.Dash0Dataset = apiObjectLabels.Dataset
-		synchronizedRuleAttributes[syncResult.ItemName] = promRuleSyncAttributes
+	rulesSyncResults := make([]dash0common.PrometheusRuleSynchronizationResultPerEndpointAndDataset, 0,
+		len(syncResults.resultsPerApiConfig))
+	for _, resultPerApiConfig := range syncResults.resultsPerApiConfig {
+		synchronizedRuleAttributes := make(
+			map[string]dash0common.PrometheusRuleSynchronizedRuleAttributes,
+			len(resultPerApiConfig.successfullySynchronized),
+		)
+		for _, syncSuccess := range resultPerApiConfig.successfullySynchronized {
+			promRuleSyncAttributes := dash0common.PrometheusRuleSynchronizedRuleAttributes{}
+			apiObjectLabels := syncSuccess.Labels
+			promRuleSyncAttributes.Dash0Origin = apiObjectLabels.Origin
+			synchronizedRuleAttributes[syncSuccess.ItemName] = promRuleSyncAttributes
+		}
+
+		rulesSyncRes := dash0common.PrometheusRuleSynchronizationResultPerEndpointAndDataset{
+			Dash0ApiEndpoint:                    resultPerApiConfig.resourceToRequestsResult.ApiConfig.Endpoint,
+			Dash0Dataset:                        resultPerApiConfig.resourceToRequestsResult.ApiConfig.Dataset,
+			SynchronizedRulesTotal:              len(resultPerApiConfig.successfullySynchronized),
+			SynchronizedRulesAttributes:         synchronizedRuleAttributes,
+			SynchronizationErrorsTotal:          len(resultPerApiConfig.resourceToRequestsResult.SynchronizationErrors),
+			SynchronizationErrors:               resultPerApiConfig.resourceToRequestsResult.SynchronizationErrors,
+			SynchronizationErrorHttpStatusCodes: resultPerApiConfig.resourceToRequestsResult.SynchronizationErrorStatusCodes,
+		}
+
+		rulesSyncResults = append(rulesSyncResults, rulesSyncRes)
 	}
 
 	result := dash0common.PrometheusRuleSynchronizationResult{
-		SynchronizationStatus:       status,
-		SynchronizedAt:              metav1.Time{Time: time.Now()},
-		AlertingRulesTotal:          resourceToRequestsResult.ItemsTotal,
-		SynchronizedRulesTotal:      len(successfullySynchronized),
-		SynchronizedRulesAttributes: synchronizedRuleAttributes,
-		SynchronizationErrorsTotal:  len(resourceToRequestsResult.SynchronizationErrors),
-		SynchronizationErrors:       resourceToRequestsResult.SynchronizationErrors,
-		InvalidRulesTotal:           len(resourceToRequestsResult.ValidationIssues),
-		InvalidRules:                resourceToRequestsResult.ValidationIssues,
+		SynchronizationStatus:  status,
+		SynchronizedAt:         metav1.Time{Time: time.Now()},
+		AlertingRulesTotal:     syncResults.alertingRulesTotal,
+		RecordingRulesTotal:    syncResults.recordingRulesTotal,
+		InvalidRulesTotal:      len(syncResults.validationIssues),
+		InvalidRules:           syncResults.validationIssues,
+		SynchronizationResults: rulesSyncResults,
 	}
 	previousResults[qualifiedName] = result
 	return result
+}
+
+// synchronizeNamespacedResources explicitly triggers a resync of check rules in a given namespace in response to an
+// updated API endpoint, dataset or auth token, or when synchronization has been enabled for the namespace.
+func (r *PrometheusRuleReconciler) synchronizeNamespacedResources(
+	ctx context.Context,
+	namespace string,
+	logger logd.Logger,
+) {
+	// do nothing if we are not currently watching the CRDs
+	if !r.IsWatching() {
+		return
+	}
+
+	logger.Info(fmt.Sprintf("Running synchronization of check rules in namespace %s now.", namespace))
+
+	go func() {
+		allRulesResourcesInNamespace := &unstructured.UnstructuredList{}
+		allRulesResourcesInNamespace.SetGroupVersionKind(
+			schema.GroupVersionKind{
+				Group:   "monitoring.coreos.com",
+				Version: "v1",
+				Kind:    "PrometheusRuleList",
+			},
+		)
+		if err := r.List(
+			ctx,
+			allRulesResourcesInNamespace,
+			&client.ListOptions{
+				Namespace: namespace,
+			},
+		); err != nil {
+			logger.Error(err, fmt.Sprintf("Failed to list check rules resources in namespace %s.", namespace))
+			return
+		}
+
+		for i := range allRulesResourcesInNamespace.Items {
+			ruleResource := &allRulesResourcesInNamespace.Items[i]
+			evt := event.TypedGenericEvent[*unstructured.Unstructured]{
+				Object: ruleResource,
+			}
+			r.Generic(ctx, evt, nil)
+
+			// stagger API requests a bit
+			time.Sleep(50 * time.Millisecond)
+		}
+		logger.Info(fmt.Sprintf("Triggering synchronization of check rules in namespace %s has finished.", namespace))
+	}()
 }

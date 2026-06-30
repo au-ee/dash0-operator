@@ -5,17 +5,18 @@ package util
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/bep/debounce"
 	"github.com/fsnotify/fsnotify"
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
+
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 )
 
 type ResourceRequirementsWithGoMemLimit struct {
@@ -25,9 +26,9 @@ type ResourceRequirementsWithGoMemLimit struct {
 }
 
 type CollectorProbes struct {
-	Liveness  corev1.Probe `json:"liveness,omitempty"`
-	Readiness corev1.Probe `json:"readiness,omitempty"`
-	Startup   corev1.Probe `json:"startup,omitempty"`
+	Liveness  corev1.Probe `json:"liveness"`
+	Readiness corev1.Probe `json:"readiness"`
+	Startup   corev1.Probe `json:"startup"`
 }
 
 // ExtraConfig holds the additional configuration values for the operator, which the operator reads from
@@ -38,22 +39,36 @@ type ExtraConfig struct {
 
 	CollectorFilelogOffsetStorageVolume *corev1.Volume `json:"collectorFilelogOffsetStorageVolume,omitempty"`
 
-	CollectorDaemonSetCollectorContainerResources             ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetCollectorContainerResources,omitempty"`
-	CollectorDaemonSetConfigurationReloaderContainerResources ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetConfigurationReloaderContainerResources,omitempty"`
-	CollectorDaemonSetFileLogOffsetSyncContainerResources     ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetFileLogOffsetSyncContainerResources,omitempty"`
+	CollectorDaemonSetCollectorContainerResources             ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetCollectorContainerResources"`
+	CollectorDaemonSetConfigurationReloaderContainerResources ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetConfigurationReloaderContainerResources"`
+	CollectorDaemonSetFileLogOffsetSyncContainerResources     ResourceRequirementsWithGoMemLimit `json:"collectorDaemonSetFileLogOffsetSyncContainerResources"`
+
+	CollectorDaemonSetLabels         map[string]string `json:"collectorDaemonSetLabels,omitempty"`
+	CollectorDaemonSetAnnotations    map[string]string `json:"collectorDaemonSetAnnotations,omitempty"`
+	CollectorDaemonSetPodLabels      map[string]string `json:"collectorDaemonSetPodLabels,omitempty"`
+	CollectorDaemonSetPodAnnotations map[string]string `json:"collectorDaemonSetPodAnnotations,omitempty"`
 
 	DaemonSetTolerations  []corev1.Toleration  `json:"daemonSetTolerations,omitempty"`
 	DaemonSetNodeAffinity *corev1.NodeAffinity `json:"daemonSetNodeAffinity,omitempty"`
+
+	DaemonSetSysctls []corev1.Sysctl `json:"daemonSetSysctls,omitempty"`
 
 	CollectorDaemonSetPriorityClassName string `json:"collectorDaemonSetPriorityClassName,omitempty"`
 
 	DaemonSetProbes CollectorProbes `json:"daemonSetProbes"`
 
-	CollectorDeploymentCollectorContainerResources             ResourceRequirementsWithGoMemLimit `json:"collectorDeploymentCollectorContainerResources,omitempty"`
-	CollectorDeploymentConfigurationReloaderContainerResources ResourceRequirementsWithGoMemLimit `json:"collectorDeploymentConfigurationReloaderContainerResources,omitempty"`
+	CollectorDeploymentCollectorContainerResources             ResourceRequirementsWithGoMemLimit `json:"collectorDeploymentCollectorContainerResources"`
+	CollectorDeploymentConfigurationReloaderContainerResources ResourceRequirementsWithGoMemLimit `json:"collectorDeploymentConfigurationReloaderContainerResources"`
+
+	CollectorDeploymentLabels         map[string]string `json:"collectorDeploymentLabels,omitempty"`
+	CollectorDeploymentAnnotations    map[string]string `json:"collectorDeploymentAnnotations,omitempty"`
+	CollectorDeploymentPodLabels      map[string]string `json:"collectorDeploymentPodLabels,omitempty"`
+	CollectorDeploymentPodAnnotations map[string]string `json:"collectorDeploymentPodAnnotations,omitempty"`
 
 	DeploymentTolerations  []corev1.Toleration  `json:"deploymentTolerations,omitempty"`
 	DeploymentNodeAffinity *corev1.NodeAffinity `json:"deploymentNodeAffinity,omitempty"`
+
+	DeploymentSysctls []corev1.Sysctl `json:"deploymentSysctls,omitempty"`
 
 	CollectorDeploymentPriorityClassName string `json:"collectorDeploymentPriorityClassName,omitempty"`
 
@@ -62,13 +77,25 @@ type ExtraConfig struct {
 	TargetAllocatorMtlsEnabled              bool                               `json:"targetAllocatorMtlsEnabled,omitempty"`
 	TargetAllocatorMtlsServerCertSecretName string                             `json:"targetAllocatorMtlsServerCertSecretName,omitempty"`
 	TargetAllocatorMtlsClientCertSecretName string                             `json:"targetAllocatorMtlsClientCertSecretName,omitempty"`
-	TargetAllocatorContainerResources       ResourceRequirementsWithGoMemLimit `json:"targetAllocatorContainerResources,omitempty"`
+	TargetAllocatorContainerResources       ResourceRequirementsWithGoMemLimit `json:"targetAllocatorContainerResources"`
+	TargetAllocatorLabels                   map[string]string                  `json:"targetAllocatorLabels,omitempty"`
+	TargetAllocatorAnnotations              map[string]string                  `json:"targetAllocatorAnnotations,omitempty"`
+	TargetAllocatorPodLabels                map[string]string                  `json:"targetAllocatorPodLabels,omitempty"`
+	TargetAllocatorPodAnnotations           map[string]string                  `json:"targetAllocatorPodAnnotations,omitempty"`
 	TargetAllocatorTolerations              []corev1.Toleration                `json:"targetAllocatorTolerations,omitempty"`
 	TargetAllocatorNodeAffinity             *corev1.NodeAffinity               `json:"targetAllocatorNodeAffinity,omitempty"`
+
+	BarkerContainerResources ResourceRequirementsWithGoMemLimit `json:"barkerContainerResources"`
+	BarkerTolerations        []corev1.Toleration                `json:"barkerTolerations,omitempty"`
+	BarkerNodeAffinity       *corev1.NodeAffinity               `json:"barkerNodeAffinity,omitempty"`
+
+	// Actually we would like to use the type *dash0v1alpha1.MonitoringTemplate here, but that leads to circular package
+	// dependencies. We should revisit how to untangle this.
+	MonitoringTemplateRaw *json.RawMessage `json:"monitoringTemplate,omitempty"`
 }
 
 type ExtraConfigClient interface {
-	UpdateExtraConfig(context.Context, ExtraConfig, *logr.Logger)
+	UpdateExtraConfig(context.Context, ExtraConfig, logd.Logger)
 }
 
 const (
@@ -232,7 +259,7 @@ func NewExtraConfigWatcher() *ExtraConfigWatcher {
 	}
 }
 
-func (w *ExtraConfigWatcher) StartWatch(logger *logr.Logger) error {
+func (w *ExtraConfigWatcher) StartWatch(logger logd.Logger) error {
 	return w.watchConfigurationDirectory(extraConfigDir, extraConfigFile, logger)
 }
 
@@ -243,7 +270,7 @@ func (w *ExtraConfigWatcher) AddClient(client ExtraConfigClient) {
 func (w *ExtraConfigWatcher) watchConfigurationDirectory(
 	configurationDir string,
 	extraConfigFile string,
-	setupLogger *logr.Logger,
+	setupLogger logd.Logger,
 ) error {
 	var err error
 	w.watcher, err = fsnotify.NewWatcher()
@@ -265,15 +292,17 @@ func (w *ExtraConfigWatcher) watchConfigurationDirectory(
 					return
 				}
 				ctx := context.Background()
-				logger := log.FromContext(ctx)
+				logger := logd.FromContext(ctx)
 				debouncedFileWatchEvents(func() {
+					logger.Info("the extra config map has been updated")
 					extraConfig, err := readExtraConfigurationFromFile(extraConfigFile)
 					if err != nil {
 						logger.Error(err, "cannot read extra config map file after it has been updated")
 						return
 					}
+					logger.Info("updating all clients with updated extra config map")
 					for _, client := range w.clients {
-						client.UpdateExtraConfig(ctx, extraConfig, &logger)
+						client.UpdateExtraConfig(ctx, extraConfig, logger)
 					}
 				})
 			case fsnotifyErr, ok := <-w.watcher.Errors:
@@ -281,7 +310,7 @@ func (w *ExtraConfigWatcher) watchConfigurationDirectory(
 					return
 				}
 				ctx := context.Background()
-				logger := log.FromContext(ctx)
+				logger := logd.FromContext(ctx)
 				logger.Error(fsnotifyErr, "extra config map file watcher error")
 			}
 		}

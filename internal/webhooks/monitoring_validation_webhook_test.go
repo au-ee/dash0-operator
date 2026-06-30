@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
@@ -22,21 +24,35 @@ import (
 	. "github.com/dash0hq/dash0-operator/test/util"
 )
 
-var _ = Describe("The validation webhook for the monitoring resource", func() {
+var _ = Describe("The validation webhook for the monitoring resource", Ordered, func() {
 
 	type validationTestConfig struct {
 		spec          dash0v1beta1.Dash0MonitoringSpec
 		expectedError string
 	}
 
+	//nolint:prealloc
+	var allTestNamespaces = []string{
+		TestNamespaceName,
+		OperatorNamespace,
+	}
+	allTestNamespaces = append(allTestNamespaces, util.RestrictedNamespaces...)
+
+	BeforeAll(func() {
+		EnsureOperatorNamespaceExists(ctx, k8sClient)
+	})
+
 	AfterEach(func() {
-		Expect(
-			k8sClient.DeleteAllOf(ctx, &dash0v1beta1.Dash0Monitoring{}, client.InNamespace(TestNamespaceName)),
-		).To(Succeed())
+		for _, ns := range allTestNamespaces {
+			err := k8sClient.DeleteAllOf(ctx, &dash0v1beta1.Dash0Monitoring{}, client.InNamespace(ns))
+			if !apierrors.IsNotFound(err) {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		}
 		Expect(k8sClient.DeleteAllOf(ctx, &dash0v1alpha1.Dash0OperatorConfiguration{})).To(Succeed())
 	})
 
-	Describe("when validating", Ordered, func() {
+	Context("when validating", Ordered, func() {
 
 		type kubeSystemTestConfig struct {
 			namespace               string
@@ -44,7 +60,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 			expectRejection         bool
 		}
 
-		DescribeTable("should reject deploying a monitoring resources to kube-system unless instrumentWorkloads.mode=none", func(testConfig kubeSystemTestConfig) {
+		DescribeTable("should reject deploying a monitoring resources to restricted namespaces unless instrumentWorkloads.mode=none", func(testConfig kubeSystemTestConfig) {
 			_, err := CreateMonitoringResourceWithPotentialError(ctx, k8sClient, &dash0v1beta1.Dash0Monitoring{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: testConfig.namespace,
@@ -68,9 +84,11 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 			if testConfig.expectRejection {
 				Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(
 					"admission webhook \"validate-monitoring.dash0.com\" denied the request: Rejecting the deployment "+
-						"of Dash0 monitoring resource \"%s\" to the Kubernetes system namespace \"%s\" with "+
-						"instrumentWorkloads.mode=%s, use instrumentWorkloads.mode=none instead.",
+						"of Dash0 monitoring resource \"%s\" to the",
 					MonitoringResourceName,
+				))))
+				Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(
+					"namespace \"%s\" with instrumentWorkloads.mode=%s, use instrumentWorkloads.mode=none instead.",
 					testConfig.namespace,
 					testConfig.instrumentWorkloadsMode,
 				))))
@@ -108,6 +126,21 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				instrumentWorkloadsMode: dash0common.InstrumentWorkloadsModeNone,
 				expectRejection:         false,
 			}),
+			Entry("reject deploying to operator namespace with instrumentWorkloads.mode=all", kubeSystemTestConfig{
+				namespace:               OperatorNamespace,
+				instrumentWorkloadsMode: dash0common.InstrumentWorkloadsModeAll,
+				expectRejection:         true,
+			}),
+			Entry("reject deploying to operator namespace with instrumentWorkloads.mode=created-and-updated", kubeSystemTestConfig{
+				namespace:               OperatorNamespace,
+				instrumentWorkloadsMode: dash0common.InstrumentWorkloadsModeCreatedAndUpdated,
+				expectRejection:         true,
+			}),
+			Entry("allow deploying to operator namespace with instrumentWorkloads.mode=none", kubeSystemTestConfig{
+				namespace:               OperatorNamespace,
+				instrumentWorkloadsMode: dash0common.InstrumentWorkloadsModeNone,
+				expectRejection:         false,
+			}),
 		)
 
 		It("should reject monitoring resources without export if no operator configuration resource exists", func() {
@@ -130,7 +163,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			)
@@ -157,7 +190,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					SelfMonitoring: dash0v1alpha1.SelfMonitoring{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			)
@@ -179,7 +212,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					"configuration does not have an export configuration either.")))
 		})
 
-		It("should allow monitoring resource creation without export if there is an available operator configuration resource with an export", func() {
+		It("should allow monitoring resource creation without export(s) if there is an available operator configuration resource with exports", func() {
 			operatorConfigurationResource := CreateDefaultOperatorConfigurationResource(ctx, k8sClient)
 			operatorConfigurationResource.EnsureResourceIsMarkedAsAvailable()
 			Expect(k8sClient.Status().Update(ctx, operatorConfigurationResource)).To(Succeed())
@@ -196,7 +229,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("should allow monitoring resource creation with export settings", func() {
+		It("should allow monitoring resource creation with exports settings", func() {
 			_, err := CreateMonitoringResourceWithPotentialError(ctx, k8sClient, &dash0v1beta1.Dash0Monitoring{
 				ObjectMeta: MonitoringResourceDefaultObjectMeta,
 				Spec:       MonitoringResourceDefaultSpec,
@@ -215,8 +248,8 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					Export: &dash0common.Export{
 						Grpc: &dash0common.GrpcConfiguration{
 							Endpoint:           "https://example.com:1234",
-							Insecure:           ptr.To(true),
-							InsecureSkipVerify: ptr.To(true),
+							Insecure:           new(true),
+							InsecureSkipVerify: new(true),
 						},
 					},
 				},
@@ -232,7 +265,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					Export: Dash0ExportWithEndpointAndToken(),
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			)
@@ -276,7 +309,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 			Entry("logCollection.enabled=true", validationTestConfig{
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					LogCollection: dash0common.LogCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				expectedError: "The Dash0 operator configuration resource has telemetry collection disabled " +
@@ -288,7 +321,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 			Entry("prometheusScraping.enabled=true", validationTestConfig{
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					PrometheusScraping: dash0common.PrometheusScraping{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 				expectedError: "The Dash0 operator configuration resource has telemetry collection disabled " +
@@ -348,7 +381,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 						// if the user omits the label selector, this default is set via
 						// +kubebuilder:default=dash0.com/enable!=false
 						// in api/operator/.../dash0monitoring_types.go
-						LabelSelector: util.DefaultAutoInstrumentationLabelSelector,
+						LabelSelector: dash0common.DefaultAutoInstrumentationLabelSelector,
 					},
 				},
 				expectedError: "",
@@ -448,7 +481,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
 							// setting will be ignored during workload modifications
-							Propagators: ptr.To(""),
+							Propagators: new(""),
 						},
 					},
 				},
@@ -459,7 +492,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
 							// setting will be ignored during workload modifications
-							Propagators: ptr.To("   "),
+							Propagators: new("   "),
 						},
 					},
 				},
@@ -469,7 +502,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
-							Propagators: ptr.To("xray"),
+							Propagators: new("xray"),
 						},
 					},
 				},
@@ -479,7 +512,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
-							Propagators: ptr.To("tracecontext,baggage,b3,b3multi,jaeger,xray,ottrace,none"),
+							Propagators: new("tracecontext,baggage,b3,b3multi,jaeger,xray,ottrace,none"),
 						},
 					},
 				},
@@ -489,7 +522,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
-							Propagators: ptr.To("unknown"),
+							Propagators: new("unknown"),
 						},
 					},
 				},
@@ -502,7 +535,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
-							Propagators: ptr.To("tracecontext,baggage,b3,unknown,b3multi,jaeger,xray,ottrace,none"),
+							Propagators: new("tracecontext,baggage,b3,unknown,b3multi,jaeger,xray,ottrace,none"),
 						},
 					},
 				},
@@ -516,7 +549,7 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 				spec: dash0v1beta1.Dash0MonitoringSpec{
 					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
 						TraceContext: dash0v1beta1.TraceContext{
-							Propagators: ptr.To(","),
+							Propagators: new(","),
 						},
 					},
 				},
@@ -627,6 +660,19 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					`unable to parse OTTL condition "invalid_syntax(...": condition has invalid syntax: 1:15: unexpected token "(" (expected <opcomparison> Value)`,
 				},
 			}),
+			Entry("should reject monitoring resource with invalid syntax in profile filter", ottlValidationTestConfig{
+				filter: &dash0common.Filter{
+					Profiles: &dash0common.ProfileFilter{
+						ProfileFilter: []string{
+							"invalid_syntax(...",
+						},
+					},
+				},
+				expectErrorSubstrings: []string{
+					`admission webhook "validate-monitoring.dash0.com" denied the request: `,
+					`unable to parse OTTL condition "invalid_syntax(...": condition has invalid syntax: 1:15: unexpected token "(" (expected <opcomparison> Value)`,
+				},
+			}),
 			Entry("should allow monitoring resource with valid filter", ottlValidationTestConfig{
 				filter: &dash0common.Filter{
 					Traces: &dash0common.TraceFilter{
@@ -655,6 +701,22 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 							`severity_number < SEVERITY_NUMBER_WARN`,
 						},
 					},
+					Profiles: &dash0common.ProfileFilter{
+						ProfileFilter: []string{
+							`duration > 1000000`,
+						},
+					},
+				},
+			}),
+			Entry("should reject monitoring resource with invalid profiles transform", ottlValidationTestConfig{
+				transform: &dash0common.Transform{
+					Profiles: []json.RawMessage{
+						[]byte(`"invalid_syntax(..."`),
+					},
+				},
+				expectErrorSubstrings: []string{
+					`admission webhook "validate-monitoring.dash0.com" denied the request: `,
+					`statement has invalid syntax: 1:16: unexpected token "." (expected ")" Key*)`,
 				},
 			}),
 			Entry("should reject monitoring resource with invalid traces transform", ottlValidationTestConfig{
@@ -704,8 +766,184 @@ var _ = Describe("The validation webhook for the monitoring resource", func() {
 					Logs: []json.RawMessage{
 						[]byte(`"truncate_all(log.attributes, 1024)"`),
 					},
+					Profiles: []json.RawMessage{
+						[]byte(`"truncate_all(profile.attributes, 1024)"`),
+					},
 				},
 			}),
 		)
+
+		type autoMonitoringNamespaceValidationTestConfig struct {
+			doNotCreateOperatorConfiguration bool
+			autoMonitorNamespacesEnabled     *bool
+			namespace                        string
+			labelSelector                    string
+			namespaceLabels                  map[string]string
+			monitoringResourceLabels         map[string]string
+			expectRejection                  bool
+		}
+
+		DescribeTable("should reject custom monitoring resources in automatically monitored namespaces", func(
+			config autoMonitoringNamespaceValidationTestConfig,
+		) {
+			namespace := config.namespace
+			if namespace == "" {
+				namespace = TestNamespaceName
+			}
+
+			if len(config.namespaceLabels) > 0 {
+				ns := &corev1.Namespace{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, ns)).To(Succeed())
+				previousLabels := ns.Labels
+				ns.Labels = config.namespaceLabels
+				Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+				DeferCleanup(func() {
+					ns := &corev1.Namespace{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: namespace}, ns)).To(Succeed())
+					ns.Labels = previousLabels
+					Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+				})
+			}
+
+			if !config.doNotCreateOperatorConfiguration {
+				operatorConfigurationResource := CreateOperatorConfigurationResourceWithSpec(
+					ctx,
+					k8sClient,
+					dash0v1alpha1.Dash0OperatorConfigurationSpec{
+						Exports: Dash0ExportsWithEndpointAndTokenSingle(),
+						AutoMonitorNamespaces: dash0v1alpha1.AutoMonitorNamespaces{
+							Enabled:       config.autoMonitorNamespacesEnabled,
+							LabelSelector: config.labelSelector,
+						},
+					},
+				)
+				operatorConfigurationResource.EnsureResourceIsMarkedAsAvailable()
+				Expect(k8sClient.Status().Update(ctx, operatorConfigurationResource)).To(Succeed())
+			}
+
+			_, err := CreateMonitoringResourceWithPotentialError(ctx, k8sClient, &dash0v1beta1.Dash0Monitoring{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      MonitoringResourceName,
+					Labels:    config.monitoringResourceLabels,
+				},
+				Spec: dash0v1beta1.Dash0MonitoringSpec{
+					InstrumentWorkloads: dash0v1beta1.InstrumentWorkloads{
+						Mode: dash0common.InstrumentWorkloadsModeNone,
+					},
+					Exports: []dash0common.Export{
+						{
+							Dash0: &dash0common.Dash0Configuration{
+								Endpoint: EndpointDash0Test,
+								Authorization: dash0common.Authorization{
+									Token: &AuthorizationTokenTest,
+								},
+							},
+						},
+					},
+				},
+			})
+
+			if config.expectRejection {
+				Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(
+					"admission webhook \"validate-monitoring.dash0.com\" denied the request: "+
+						"Namespace \"%s\" is automatically managed by Dash0. Adding a custom Dash0 monitoring "+
+						"resource to an automatically managed namespace is not allowed.",
+					namespace,
+				))))
+			} else {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		},
+			Entry("do not reject due to autoMonitorNamespaces when there is no operator configuration resource",
+				autoMonitoringNamespaceValidationTestConfig{
+					doNotCreateOperatorConfiguration: true,
+					expectRejection:                  false,
+				},
+			),
+			Entry("allow when autoMonitorNamespaces is explicitly disabled",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(false),
+					expectRejection:              false,
+				},
+			),
+			Entry("allow when autoMonitorNamespaces is not set",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: nil,
+					expectRejection:              false,
+				},
+			),
+			Entry("reject when autoMonitorNamespaces is enabled and the auto-monitoring label is absent",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					expectRejection:              true,
+				},
+			),
+			Entry("allow when autoMonitorNamespaces is enabled and the resource has the auto-monitoring label",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					monitoringResourceLabels:     map[string]string{util.AutoMonitoredNamespaceLabel: "true"},
+					expectRejection:              false,
+				},
+			),
+			Entry("reject when namespace matches the default label selector (no labels on namespace)",
+				// Default selector "dash0.com/enable!=false" matches a namespace that has no labels at all.
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/enable!=false",
+					expectRejection:              true,
+				},
+			),
+			Entry("allow when namespace has opted out via dash0.com/enable=false",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/enable!=false",
+					namespaceLabels:              map[string]string{"dash0.com/enable": "false"},
+					expectRejection:              false,
+				},
+			),
+			Entry("allow when namespace does not carry a label required by a custom selector",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/monitor-this-namespace=true",
+					expectRejection:              false,
+				},
+			),
+			Entry("reject when namespace matches a custom label selector",
+				autoMonitoringNamespaceValidationTestConfig{
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/monitor-this-namespace=true",
+					namespaceLabels:              map[string]string{"dash0.com/monitor-this-namespace": "true"},
+					expectRejection:              true,
+				},
+			),
+			Entry("allow manually managed monitoring resource in a restricted namespace",
+				autoMonitoringNamespaceValidationTestConfig{
+					namespace:                    "kube-system",
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/enable!=false",
+					expectRejection:              false,
+				},
+			),
+			Entry("allow manually managed monitoring resource in the operator namespace",
+				autoMonitoringNamespaceValidationTestConfig{
+					namespace:                    OperatorNamespace,
+					autoMonitorNamespacesEnabled: new(true),
+					labelSelector:                "dash0.com/enable!=false",
+					expectRejection:              false,
+				},
+			),
+		)
+
+		It("should allow monitoring resource creation with only export set (mutating webhook migrates it)", func() {
+			_, err := CreateMonitoringResourceWithPotentialError(ctx, k8sClient, &dash0v1beta1.Dash0Monitoring{
+				ObjectMeta: MonitoringResourceDefaultObjectMeta,
+				Spec: dash0v1beta1.Dash0MonitoringSpec{
+					Export: Dash0ExportWithEndpointAndToken(),
+				},
+			})
+
+			Expect(err).ToNot(HaveOccurred())
+		})
 	})
 })

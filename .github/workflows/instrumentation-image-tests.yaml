@@ -18,7 +18,7 @@ jobs:
       image_name: ${{ steps.instrumentation-test-image.outputs.image_name }}
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
 
@@ -31,7 +31,7 @@ jobs:
           echo "base_ref_branch=${GITHUB_BASE_REF:-main}" >> $GITHUB_OUTPUT
 
       - name: find SHA of last successful workflow run on main branch
-        uses: nrwl/nx-set-shas@3e9ad7370203c1e93d109be57f3b72eb0eb511b1
+        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1
         id: last_succsesfull_commit_main_branch
         with:
           # Get the last successful commit on main branch (actually, on the target branch for the PR, but that is
@@ -84,13 +84,13 @@ jobs:
           echo "changed files for instrumentation image: $INSTRUMENTATION_CHANGED_FILES_LIST"
 
       - name: set up docker buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
         if: |
           steps.changed-files.outputs.instrumentation_any_changed == 'true' ||
           github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/')
 
       - name: login to GitHub container registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
         if: |
           steps.changed-files.outputs.instrumentation_any_changed == 'true' ||
           github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/')
@@ -110,7 +110,7 @@ jobs:
           echo "image_name=ghcr.io/au-ee/instrumentation-ci-test:$image_tag" >> $GITHUB_OUTPUT
 
       - name: build temporary instrumentation image
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
         # Dependabot PRs currently fail in this step, see
         # https://stackoverflow.com/questions/74788092/github-dependabot-doesnt-have-permissions-to-publish-to-ghcr-how-can-i-give-it
         # This can be worked around by ammending the Dependabot commit and force-pushing it, e.g.
@@ -131,19 +131,32 @@ jobs:
           cache-to: type=gha,mode=max,scope=instrumentation
           push: true
 
+  run_python_sitecustomize_py_unit_tests:
+    name: run Python sitecustomize.py unit tests
+    needs:
+      - build_instrumentation_image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+      - name: run Python sitecustomize.py unit tests
+        run: |
+          make python-instrumentation-unit-tests
+
   run_instrumentation_image_tests_x86_64:
     name: Run Instrumentation Image Tests (x86_64)
     needs:
     - build_instrumentation_image
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '24.x'
           cache: 'npm'
@@ -157,6 +170,36 @@ jobs:
         env:
           INSTRUMENTATION_IMAGE: ${{ needs.build_instrumentation_image.outputs.image_name }}
           ARCHITECTURES: 'x86_64'
+        run: |
+          npm ci
+          npm run test
+
+  run_instrumentation_image_tests_arm64:
+    name: Run Instrumentation Image Tests (arm64)
+    needs:
+    - build_instrumentation_image
+    runs-on: depot-ubuntu-24.04-arm-4
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24.x'
+          cache: 'npm'
+          cache-dependency-path: images/instrumentation/test/package-lock.json
+
+      - name: run instrumentation image tests (arm64)
+        if: |
+          needs.build_instrumentation_image.outputs.instrumentation_any_changed == 'true' ||
+          github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/')
+        working-directory: images/instrumentation/test
+        env:
+          INSTRUMENTATION_IMAGE: ${{ needs.build_instrumentation_image.outputs.image_name }}
+          ARCHITECTURES: 'arm64'
         run: |
           npm ci
           npm run test

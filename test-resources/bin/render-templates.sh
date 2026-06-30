@@ -10,8 +10,12 @@ scripts_lib="test-resources/bin/lib"
 
 cd "$project_root"
 
+# shellcheck source=./lib/constants
+source "$scripts_lib/constants"
 # shellcheck source=./lib/util
 source "$scripts_lib/util"
+
+target_namespace="${1:-$default_target_ns}"
 
 load_env_file
 
@@ -25,6 +29,7 @@ else
 fi
 LOG_COLLECTION="${LOG_COLLECTION:-$TELEMETRY_COLLECTION_ENABLED}"
 PROMETHEUS_SCRAPING_ENABLED="${PROMETHEUS_SCRAPING_ENABLED:-$TELEMETRY_COLLECTION_ENABLED}"
+CAPTURE_SQL_QUERY_PARAMETERS="${CAPTURE_SQL_QUERY_PARAMETERS:-false}"
 
 # shellcheck disable=SC2002
 cat \
@@ -65,6 +70,42 @@ cat \
   envsubst > \
   test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.otlpsink.yaml
 
+if [[ "${USE_MULTI_CAST:-}" = true ]]; then
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.multi.yaml.template | \
+  DASH0_INGRESS_ENDPOINT="$DASH0_INGRESS_ENDPOINT" \
+  DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
+  DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
+  SELF_MONITORING_ENABLED="${SELF_MONITORING_ENABLED:-true}" \
+  KUBERNETES_INFRASTRUCTURE_METRICS_COLLECTION_ENABLED="$KUBERNETES_INFRASTRUCTURE_METRICS_COLLECTION_ENABLED" \
+  COLLECT_POD_LABELS_AND_ANNOTATIONS_ENABLED="$COLLECT_POD_LABELS_AND_ANNOTATIONS_ENABLED" \
+  TELEMETRY_COLLECTION_ENABLED="$TELEMETRY_COLLECTION_ENABLED" \
+  DASH0_SECOND_AUTHORIZATION_TOKEN="$DASH0_SECOND_AUTHORIZATION_TOKEN" \
+  DASH0_SECOND_DATASET="$DASH0_SECOND_DATASET" \
+  envsubst > \
+  test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.multi.yaml
+fi
+
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.auto-namespace-monitoring.yaml.template | \
+  DASH0_INGRESS_ENDPOINT="$DASH0_INGRESS_ENDPOINT" \
+  DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
+  DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
+  SELF_MONITORING_ENABLED="${SELF_MONITORING_ENABLED:-true}" \
+  KUBERNETES_INFRASTRUCTURE_METRICS_COLLECTION_ENABLED="$KUBERNETES_INFRASTRUCTURE_METRICS_COLLECTION_ENABLED" \
+  COLLECT_POD_LABELS_AND_ANNOTATIONS_ENABLED="$COLLECT_POD_LABELS_AND_ANNOTATIONS_ENABLED" \
+  TELEMETRY_COLLECTION_ENABLED="$TELEMETRY_COLLECTION_ENABLED" \
+  INSTRUMENT_WORKLOADS_MODE="$INSTRUMENT_WORKLOADS_MODE" \
+  CAPTURE_SQL_QUERY_PARAMETERS="$CAPTURE_SQL_QUERY_PARAMETERS" \
+  LOG_COLLECTION="$LOG_COLLECTION" \
+  PROMETHEUS_SCRAPING_ENABLED="$PROMETHEUS_SCRAPING_ENABLED" \
+  SYNCHRONIZE_PERSES_DASHBOARDS="${SYNCHRONIZE_PERSES_DASHBOARDS:-true}" \
+  SYNCHRONIZE_PROMETHEUS_RULES="${SYNCHRONIZE_PROMETHEUS_RULES:-true}" \
+  envsubst > \
+  test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.auto-namespace-monitoring.yaml
+
 # shellcheck disable=SC2002
 cat \
   test-resources/customresources/dash0monitoring/dash0monitoring.yaml.template | \
@@ -72,6 +113,7 @@ cat \
   DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
   DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
   INSTRUMENT_WORKLOADS_MODE="$INSTRUMENT_WORKLOADS_MODE" \
+  CAPTURE_SQL_QUERY_PARAMETERS="$CAPTURE_SQL_QUERY_PARAMETERS" \
   LOG_COLLECTION="$LOG_COLLECTION" \
   PROMETHEUS_SCRAPING_ENABLED="$PROMETHEUS_SCRAPING_ENABLED" \
   SYNCHRONIZE_PERSES_DASHBOARDS="${SYNCHRONIZE_PERSES_DASHBOARDS:-true}" \
@@ -85,6 +127,7 @@ cat \
   DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
   DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
   INSTRUMENT_WORKLOADS_MODE="$INSTRUMENT_WORKLOADS_MODE" \
+  CAPTURE_SQL_QUERY_PARAMETERS="$CAPTURE_SQL_QUERY_PARAMETERS" \
   LOG_COLLECTION="$LOG_COLLECTION" \
   PROMETHEUS_SCRAPING_ENABLED="$PROMETHEUS_SCRAPING_ENABLED" \
   SYNCHRONIZE_PERSES_DASHBOARDS="${SYNCHRONIZE_PERSES_DASHBOARDS:-true}" \
@@ -98,6 +141,7 @@ cat \
   DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
   DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
   INSTRUMENT_WORKLOADS_MODE="$INSTRUMENT_WORKLOADS_MODE" \
+  CAPTURE_SQL_QUERY_PARAMETERS="$CAPTURE_SQL_QUERY_PARAMETERS" \
   LOG_COLLECTION="$LOG_COLLECTION" \
   PROMETHEUS_SCRAPING_ENABLED="$PROMETHEUS_SCRAPING_ENABLED" \
   SYNCHRONIZE_PERSES_DASHBOARDS="${SYNCHRONIZE_PERSES_DASHBOARDS:-true}" \
@@ -111,6 +155,7 @@ cat \
   DASH0_AUTHORIZATION_TOKEN="$DASH0_AUTHORIZATION_TOKEN" \
   DASH0_API_ENDPOINT="$DASH0_API_ENDPOINT" \
   INSTRUMENT_WORKLOADS_MODE="$INSTRUMENT_WORKLOADS_MODE" \
+  CAPTURE_SQL_QUERY_PARAMETERS="$CAPTURE_SQL_QUERY_PARAMETERS" \
   LOG_COLLECTION="$LOG_COLLECTION" \
   PROMETHEUS_SCRAPING_ENABLED="$PROMETHEUS_SCRAPING_ENABLED" \
   SYNCHRONIZE_PERSES_DASHBOARDS="${SYNCHRONIZE_PERSES_DASHBOARDS:-true}" \
@@ -136,3 +181,34 @@ cat \
   OPERATOR_NAMESPACE="$operator_namespace" \
   envsubst > \
   test-resources/cert-manager/helm-values.yaml
+
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/prometheus/cadvisor-scrapeconfig.yaml.template | \
+  TARGET_NAMESPACE="$target_namespace" \
+  envsubst > \
+  test-resources/customresources/prometheus/cadvisor-scrapeconfig.yaml
+
+DASH0_DATASET_RESOLVED="${OPERATOR_CONFIGURATION_VIA_HELM_DATASET:-${DASH0_DATASET:-default}}"
+
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/dash0spamfilter/dash0spamfilter.yaml.template | \
+  DASH0_DATASET="$DASH0_DATASET_RESOLVED" \
+  TARGET_NAMESPACE="$target_namespace" \
+  envsubst > \
+  test-resources/customresources/dash0spamfilter/dash0spamfilter.yaml
+
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/dash0signaltometrics/logs.yaml.template | \
+  DASH0_DATASET="$DASH0_DATASET_RESOLVED" \
+  envsubst > \
+  test-resources/customresources/dash0signaltometrics/logs.yaml
+
+# shellcheck disable=SC2002
+cat \
+  test-resources/customresources/dash0signaltometrics/spans.yaml.template | \
+  DASH0_DATASET="$DASH0_DATASET_RESOLVED" \
+  envsubst > \
+  test-resources/customresources/dash0signaltometrics/spans.yaml

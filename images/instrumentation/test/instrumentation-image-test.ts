@@ -137,9 +137,13 @@ async function runAllTests(): Promise<void> {
         );
         process.exit(1);
       }
-    } catch (error) {
-      console.error('Error checking Docker driver status:', error);
-      process.exit(1);
+    } catch {
+      // The "{{ .DriverStatus }}" Go template only resolves against Docker's Info schema.
+      // Under podman, nerdctl, finch, etc. the template fails to evaluate — that is not a
+      // problem for the test runner since this guard is specific to Docker Desktop's
+      // classic image store. Log and proceed; any real engine misconfiguration will surface
+      // on the subsequent `docker build`/`docker run` calls.
+      log('could not evaluate Docker driver status (engine is not Docker, or daemon unavailable); skipping containerd image-store check');
     }
   }
 
@@ -255,7 +259,7 @@ async function buildOrPullInstrumentationImage(): Promise<void> {
     let dockerPlatforms = allDockerPlatforms;
     if (architecturesFilter.length > 0) {
       // If we do not run the tests for multiple CPU architectures, we do not need to spend the time to build a
-      // multi-arch instrumenation image.
+      // multi-arch instrumentation image.
       dockerPlatforms = architecturesFilter.map(architectureToDockerPlatform).join(',');
     }
     log(`starting: building instrumentation image for platform(s) ${dockerPlatforms} from local sources`);
@@ -528,12 +532,15 @@ async function runTestCasesForArchitectureRuntimeAndBaseImage(testImage: TestIma
     let testCmd: string[];
     switch (runtime) {
       case 'c':
+      // fall through
       case 'c-debian-11-no-libdl':
+      // fall through
       case 'distroless-with-libc':
         testCmd = [`/test-cases/${testCase}/app.o`];
         break;
 
       case 'dotnet':
+      // fall through
       case 'distroless-static':
         testCmd = [`/test-cases/${testCase}/app`];
         break;
@@ -549,7 +556,21 @@ async function runTestCasesForArchitectureRuntimeAndBaseImage(testImage: TestIma
         break;
 
       case 'python':
+      // fall through
+      case 'python-dependency-conflict':
+      // fall through
+      case 'python-2.7':
         testCmd = ['python', `/test-cases/${testCase}/app.py`];
+        break;
+      case 'python-double-instrumentation':
+        testCmd = ['opentelemetry-instrument', 'python', `/test-cases/${testCase}/app.py`];
+        break;
+      case 'python-venv':
+        testCmd = [
+          '/bin/bash',
+          '-c',
+          `. /test-cases/${testCase}/venv/bin/activate && python /test-cases/${testCase}/app.py`,
+        ];
         break;
 
       case 'node':
@@ -630,6 +651,9 @@ function createRunTestCaseTask(
         dockerRunCmdArray = dockerRunCmdArray.concat(['--env-file', envFile]);
       }
       dockerRunCmdArray = dockerRunCmdArray.concat(['--env', "BASE_IMAGE_RUN='" + baseImageRun + "'"]);
+      if (verbose) {
+        dockerRunCmdArray = dockerRunCmdArray.concat(['--env', 'OTEL_INJECTOR_LOG_LEVEL=debug']);
+      }
       dockerRunCmdArray = dockerRunCmdArray.concat([imageNameTest, ...testCmd]);
       const dockerRunCmd = dockerRunCmdArray.map(arg => `"${arg}"`).join(' ');
 

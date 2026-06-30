@@ -85,7 +85,7 @@ spec:
         {{- include "dash0-operator.podLabels" . | nindent 8 }}
         {{- end }}
         {{- if .Values.operator.gke.autopilot.enabled }}
-        cloud.google.com/matching-allowlist: dash0-operator-manager-v1.0.0
+        cloud.google.com/matching-allowlist: dash0-operator-manager-v1.0.3
         {{- end }}
     spec:
 {{- if .Values.operator.nodeAffinity }}
@@ -120,16 +120,6 @@ spec:
 {{- if .Values.operator.dash0Export.token }}
         - --operator-configuration-token={{ .Values.operator.dash0Export.token }}
 {{- else if (and .Values.operator.dash0Export.secretRef.name .Values.operator.dash0Export.secretRef.key) }}
-{{- if not .Values.operator.dash0Export.disableSecretValidation }}
-{{- $secret := lookup "v1" "Secret" .Release.Namespace .Values.operator.dash0Export.secretRef.name -}}
-{{- if $secret -}}
-{{- if not (index $secret.data .Values.operator.dash0Export.secretRef.key) -}}
-{{- fail (printf "Error: There is a secret named \"%s\" in the target namespace \"%s\", but it does not have the required key \"%s\". Please refer to the installation instructions at https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator." .Values.operator.dash0Export.secretRef.name .Release.Namespace .Values.operator.dash0Export.secretRef.key) -}}
-{{- end -}}{{/* closes "if not (index $secret.data .Values.operator.dash0Export.secretRef.key) -}}" */}}
-{{- else -}}{{/* else for "if $secret" */}}
-{{- fail (printf "Error: There is no secret named \"%s\" in the target namespace \"%s\". Please refer to the installation instructions at https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator." .Values.operator.dash0Export.secretRef.name .Release.Namespace) -}}
-{{- end }}{{/*closes "if $secret" */}}
-{{- end }}{{/*closes "not .Values.operator.dash0Export.disableSecretValidation" */}}
         - --operator-configuration-secret-ref-name={{ .Values.operator.dash0Export.secretRef.name }}
         - --operator-configuration-secret-ref-key={{ .Values.operator.dash0Export.secretRef.key }}
 {{- else }}{{/*else for "Values.operator.dash0Export.token" / "else if (and .Values.operator.dash0Export.secretRef.name .Values.operator.dash0Export.secretRef.key)" */}}
@@ -141,23 +131,50 @@ spec:
         - --operator-configuration-self-monitoring-enabled={{ .Values.operator.selfMonitoringEnabled }}
         - --operator-configuration-kubernetes-infrastructure-metrics-collection-enabled={{ .Values.operator.kubernetesInfrastructureMetricsCollectionEnabled }}
         - --operator-configuration-collect-pod-labels-and-annotations-enabled={{ .Values.operator.collectPodLabelsAndAnnotationsEnabled }}
+        - --operator-configuration-collect-namespace-labels-and-annotations-enabled={{ .Values.operator.collectNamespaceLabelsAndAnnotationsEnabled }}
         - --operator-configuration-prometheus-crd-support-enabled={{ .Values.operator.prometheusCrdSupportEnabled }}
+        - --operator-configuration-profiling-enabled={{ .Values.operator.profilingEnabled }}
 {{- if .Values.operator.clusterName }}
         - --operator-configuration-cluster-name={{ .Values.operator.clusterName }}
 {{- end }}{{/*closes "if .Values.operator.clusterName" */}}
 {{- if .Values.operator.dash0Export.dataset }}
         - --operator-configuration-dataset={{ .Values.operator.dash0Export.dataset }}
 {{- end }}{{/*closes "if .Values.operator.dash0Export.dataset" */}}
+{{- if .Values.operator.dash0Export.keepalive.time }}
+        - --operator-configuration-keepalive-time={{ .Values.operator.dash0Export.keepalive.time }}
+{{- end }}{{/*closes "if .Values.operator.dash0Export.keepalive.time" */}}
+{{- if .Values.operator.dash0Export.keepalive.timeout }}
+        - --operator-configuration-keepalive-timeout={{ .Values.operator.dash0Export.keepalive.timeout }}
+{{- end }}{{/*closes "if .Values.operator.dash0Export.keepalive.timeout" */}}
+{{- if .Values.operator.dash0Export.keepalive.permit_without_stream }}
+        - --operator-configuration-keepalive-permit-without-stream={{ .Values.operator.dash0Export.keepalive.permit_without_stream }}
+{{- end }}{{/*closes "if .Values.operator.dash0Export.keepalive.permit_without_stream" */}}
+        - --operator-configuration-auto-monitor-namespaces-enabled={{ .Values.operator.autoMonitorNamespaces.enabled }}
+        - --operator-configuration-auto-monitor-namespaces-label-selector={{ .Values.operator.autoMonitorNamespaces.labelSelector }}
+{{- if not (or (eq .Values.operator.instrumentation.delivery "auto") (eq .Values.operator.instrumentation.delivery "image-volume") (eq .Values.operator.instrumentation.delivery "init-container")) }}
+{{- fail (printf "Error: operator.instrumentation.delivery must be one of \"auto\", \"image-volume\" or \"init-container\", but was %q." .Values.operator.instrumentation.delivery) -}}
+{{- end }}
+        - --operator-configuration-instrumentation-delivery={{ .Values.operator.instrumentation.delivery }}
 {{- end }}{{/*closes "if .Values.operator.dash0Export.enabled" */}}
-        - --force-use-otel-collector-service-url={{ .Values.operator.collectors.forceUseServiceUrl }}
-        - --gke-autopilot={{ .Values.operator.gke.autopilot.enabled }}
-        - --disable-otel-collector-host-ports={{ .Values.operator.collectors.disableHostPorts }}
+        - --dash0-telemetry-collection-enabled={{ .Values.operator.telemetryCollectionEnabled }}
+{{- if .Values.operator.intelligentEdge.enabled }}
+        - --dash0-feature-intelligent-edge-enabled=true
+{{- end }}
+        - --dash0-force-use-otel-collector-service-url={{ .Values.operator.collectors.forceUseServiceUrl }}
+        - --dash0-gke-autopilot={{ .Values.operator.gke.autopilot.enabled }}
+        - --dash0-disable-otel-collector-host-ports={{ .Values.operator.collectors.disableHostPorts }}
 {{- if (default .Values.operator.instrumentation.delayAfterEachWorkloadMillis .Values.operator.instrumentationDelayAfterEachWorkloadMillis) }}
         - --instrumentation-delay-after-each-workload-millis={{ default .Values.operator.instrumentation.delayAfterEachWorkloadMillis .Values.operator.instrumentationDelayAfterEachWorkloadMillis }}
 {{- end }}
 {{- if (default .Values.operator.instrumentation.delayAfterEachNamespaceMillis .Values.operator.instrumentationDelayAfterEachNamespaceMillis) }}
         - --instrumentation-delay-after-each-namespace-millis={{ default .Values.operator.instrumentation.delayAfterEachNamespaceMillis .Values.operator.instrumentationDelayAfterEachNamespaceMillis }}
 {{- end }}
+        - --dash0-log-level={{ .Values.operator.logLevel }}
+        {{- /*
+        Maintenance note: When adding new args or env entries, make sure they are covered by the Google GKE workload
+        allowlist. In particular, adding args with the prefix "--dash0-" or "--operator-configuration-" is always
+        covered, as well as environment variables with any of the prefixes "DASH0_", "OTEL_", or "K8S_".
+        */}}
         env:
         - name: GOMEMLIMIT
           value: {{ .Values.operator.managerContainerResources.gomemlimit | quote }}
@@ -169,23 +186,40 @@ spec:
           value: {{ include "dash0-operator.deploymentName" . }}
         - name: DASH0_WEBHOOK_SERVICE_NAME
           value: {{ include "dash0-operator.webhookServiceName" . }}
+        - name: DASH0_WEBHOOK_SERVICE_PORT
+          value: {{ include "dash0-operator.webhookServicePort" . | quote }}
+        - name: DASH0_PERSES_DASHBOARD_AUTO_PATCH_CONVERSION_WEBHOOK
+          value: {{ .Values.operator.iac.persesDashboard.autoPatchConversionWebhook | toString | quote }}
+        - name: DASH0_IAC_PERIODIC_RETRY_ENABLED
+          value: {{ .Values.operator.iac.periodicRetry.enabled | toString | quote }}
+        - name: DASH0_IAC_PERIODIC_RETRY_INTERVAL
+          value: {{ .Values.operator.iac.periodicRetry.interval | toString | quote }}
         - name: OTEL_COLLECTOR_NAME_PREFIX
           value: {{ .Release.Name | quote }}
         - name: OTEL_TARGET_ALLOCATOR_NAME_PREFIX
           value: {{ .Release.Name | quote }}
         - name: DASH0_OPERATOR_IMAGE
           value: {{ include "dash0-operator.image" . | quote }}
-        - name: DASH0_INIT_CONTAINER_IMAGE
-          value: {{ include "dash0-operator.initContainerImage" . | quote }}
-        {{- if .Values.operator.initContainerImage.pullPolicy }}
-        - name: DASH0_INIT_CONTAINER_IMAGE_PULL_POLICY
-          value: {{ .Values.operator.initContainerImage.pullPolicy }}
+        - name: DASH0_INSTRUMENTATION_IMAGE
+          value: {{ include "dash0-operator.instrumentationImage" . | quote }}
+        {{- if .Values.operator.instrumentationImage.pullPolicy }}
+        - name: DASH0_INSTRUMENTATION_IMAGE_PULL_POLICY
+          value: {{ .Values.operator.instrumentationImage.pullPolicy }}
         {{- end }}
+        {{- if .Values.operator.intelligentEdge.enabled }}
+        - name: DASH0_COLLECTOR_IMAGE
+          value: {{ include "dash0-operator.intelligentEdgeCollectorImage" . | quote }}
+        {{- if .Values.operator.intelligentEdgeCollectorImage.pullPolicy }}
+        - name: DASH0_COLLECTOR_IMAGE_PULL_POLICY
+          value: {{ .Values.operator.intelligentEdgeCollectorImage.pullPolicy }}
+        {{- end }}
+        {{- else }}
         - name: DASH0_COLLECTOR_IMAGE
           value: {{ include "dash0-operator.collectorImage" . | quote }}
         {{- if .Values.operator.collectorImage.pullPolicy }}
         - name: DASH0_COLLECTOR_IMAGE_PULL_POLICY
           value: {{ .Values.operator.collectorImage.pullPolicy }}
+        {{- end }}
         {{- end }}
         - name: DASH0_TARGET_ALLOCATOR_IMAGE
           value: {{ include "dash0-operator.targetAllocatorImage" . | quote }}
@@ -211,6 +245,44 @@ spec:
         - name: DASH0_FILELOG_OFFSET_VOLUME_OWNERSHIP_IMAGE_PULL_POLICY
           value: {{ .Values.operator.filelogOffsetVolumeOwnershipImage.pullPolicy }}
         {{- end }}
+        {{- if .Values.operator.intelligentEdge.enabled }}
+        - name: DASH0_BARKER_IMAGE
+          value: {{ include "dash0-operator.barkerImage" . | quote }}
+        {{- if .Values.operator.barkerImage.pullPolicy }}
+        - name: DASH0_BARKER_IMAGE_PULL_POLICY
+          value: {{ .Values.operator.barkerImage.pullPolicy }}
+        {{- end }}
+        {{- end }}
+        - name: DASH0_AGENT0_CONNECTOR_IMAGE
+          value: {{ include "dash0-operator.agent0ConnectorImage" . | quote }}
+        {{- if .Values.operator.agent0ConnectorImage.pullPolicy }}
+        - name: DASH0_AGENT0_CONNECTOR_IMAGE_PULL_POLICY
+          value: {{ .Values.operator.agent0ConnectorImage.pullPolicy }}
+        {{- end }}
+        {{- if .Values.operator.agent0Connector.enabled }}
+        {{- if not .Values.operator.agent0Connector.serverAddress }}
+        {{- fail "Error: operator.agent0Connector.enabled is set to true, but you did not provide a value for operator.agent0Connector.serverAddress. Please refer to the installation instructions at https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator." -}}
+        {{- end }}{{/* closes "not .Values.operator.agent0Connector.serverAddress" */}}
+        - name: DASH0_AGENT0_CONNECTOR_ENABLED
+          value: "true"
+        - name: DASH0_AGENT0_CONNECTOR_SERVER_ADDRESS
+          value: {{ .Values.operator.agent0Connector.serverAddress | quote }}
+        {{- if .Values.operator.agent0Connector.token }}
+        - name: DASH0_AGENT0_CONNECTOR_TOKEN
+          value: {{ .Values.operator.agent0Connector.token | quote }}
+        {{- else if (and .Values.operator.agent0Connector.secretRef.name .Values.operator.agent0Connector.secretRef.key) }}
+        - name: DASH0_AGENT0_CONNECTOR_SECRET_REF_NAME
+          value: {{ .Values.operator.agent0Connector.secretRef.name | quote }}
+        - name: DASH0_AGENT0_CONNECTOR_SECRET_REF_KEY
+          value: {{ .Values.operator.agent0Connector.secretRef.key | quote }}
+        {{- else }}{{/* else for "Values.operator.agent0Connector.token" / "else if (and .Values.operator.agent0Connector.secretRef.name .Values.operator.agent0Connector.secretRef.key)" */}}
+        {{- fail "Error: operator.agent0Connector.enabled is set to true, but neither operator.agent0Connector.token nor operator.agent0Connector.secretRef.name & operator.agent0Connector.secretRef.key have been provided. Please refer to the installation instructions at https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator." -}}
+        {{- end }}{{/* closes "if .Values.operator.agent0Connector.token" */}}
+        {{- if .Values.operator.agent0Connector.insecure }}
+        - name: DASH0_AGENT0_CONNECTOR_INSECURE
+          value: "true"
+        {{- end }}{{/* closes "if .Values.operator.agent0Connector.insecure" */}}
+        {{- end }}{{/* closes "if .Values.operator.agent0Connector.enabled" */}}
         {{- if .Values.operator.developmentMode }}
         - name: DASH0_DEVELOPMENT_MODE
           value: {{ .Values.operator.developmentMode | toString | quote }}
@@ -223,6 +295,10 @@ spec:
         - name: DASH0_INSTRUMENTATION_DEBUG
           value: {{ .Values.operator.instrumentation.debug | toString | quote }}
         {{- end }}
+        {{- if .Values.operator.instrumentation.enablePythonAutoInstrumentation }}
+        - name: DASH0_ENABLE_PYTHON_AUTO_INSTRUMENTATION
+          value: {{ .Values.operator.instrumentation.enablePythonAutoInstrumentation | toString | quote }}
+        {{- end }}
         {{- if .Values.operator.disableCollectorResourceWatches }}
         - name: DASH0_DISABLE_COLLECTOR_RESOURCE_WATCHES
           value: {{ .Values.operator.disableCollectorResourceWatches | toString | quote }}
@@ -231,17 +307,45 @@ spec:
         - name: OTEL_COLLECTOR_DEBUG_VERBOSITY_DETAILED
           value: {{ .Values.operator.collectors.debugVerbosityDetailed | toString | quote }}
         {{- end }}
-        {{- if gt (int (.Values.operator.collectors.sendBatchMaxSize | default 0)) 0 }}
+        {{- $sendBatchSize := int (.Values.operator.collectors.sendBatchSize | default 0) }}
+        {{- $sendBatchMaxSize := int (.Values.operator.collectors.sendBatchMaxSize | default 0) }}
+        {{- if lt $sendBatchSize 0 }}
+        {{- fail "Error: operator.collectors.sendBatchSize must not be negative." -}}
+        {{- end }}
+        {{- if lt $sendBatchMaxSize 0 }}
+        {{- fail "Error: operator.collectors.sendBatchMaxSize must not be negative." -}}
+        {{- end }}
+        {{- if and (eq $sendBatchSize 0) (gt $sendBatchMaxSize 0) (lt $sendBatchMaxSize 8192) }}
+        {{- fail "Error: operator.collectors.sendBatchMaxSize must be at least 8192 (the default value of sendBatchSize) when sendBatchSize is not set explicitly." -}}
+        {{- end }}
+        {{- if and (gt $sendBatchSize 0) (gt $sendBatchMaxSize 0) (lt $sendBatchMaxSize $sendBatchSize) }}
+        {{- fail "Error: operator.collectors.sendBatchMaxSize must be greater than or equal to operator.collectors.sendBatchSize." -}}
+        {{- end }}
+        {{- if gt $sendBatchSize 0 }}
+        - name: OTEL_COLLECTOR_SEND_BATCH_SIZE
+          value: {{ .Values.operator.collectors.sendBatchSize | quote }}
+        {{- end }}
+        {{- if gt $sendBatchMaxSize 0 }}
         - name: OTEL_COLLECTOR_SEND_BATCH_MAX_SIZE
           value: {{ .Values.operator.collectors.sendBatchMaxSize | quote }}
         {{- end }}
-        {{- if .Values.operator.collectors.disableReplicasetInformer }}
+        {{- if or .Values.operator.collectors.k8s_attributes.disableReplicasetInformer .Values.operator.collectors.disableReplicasetInformer }}
         - name: OTEL_COLLECTOR_K8SATTRIBUTES_DISABLE_REPLICASET_INFORMER
-          value: {{ .Values.operator.collectors.disableReplicasetInformer | toString | quote }}
+          value: {{ or .Values.operator.collectors.k8s_attributes.disableReplicasetInformer .Values.operator.collectors.disableReplicasetInformer | toString | quote }}
+        {{- end }}
+        {{- if .Values.operator.collectors.k8s_attributes.wait_for_metadata }}
+        - name: OTEL_COLLECTOR_K8SATTRIBUTES_WAIT_FOR_METADATA
+          value: {{ .Values.operator.collectors.k8s_attributes.wait_for_metadata | toString | quote }}
+        - name: OTEL_COLLECTOR_K8SATTRIBUTES_WAIT_FOR_METADATA_TIMEOUT
+          value: {{ .Values.operator.collectors.k8s_attributes.wait_for_metadata_timeout | toString | quote }}
         {{- end }}
         {{- if .Values.operator.collectors.enablePprofExtension }}
         - name: OTEL_COLLECTOR_ENABLE_PPROF_EXTENSION
           value: {{ .Values.operator.collectors.enablePprofExtension | toString | quote }}
+        {{- end }}
+        {{- if .Values.operator.collectors.compressConfigMaps }}
+        - name: OTEL_COLLECTOR_COMPRESS_CONFIG_MAPS
+          value: {{ .Values.operator.collectors.compressConfigMaps | toString | quote }}
         {{- end }}
         - name: K8S_POD_UID
           valueFrom:
@@ -387,6 +491,10 @@ webhooks:
           - gke-managed-checkpointing
           - gke-managed-parallelstorecsi
           - gke-managed-lustrecsi
+          - gke-managed-otel
+          - gke-managed-mldiagnostics
+          - gke-managed-networking-dra-driver
+          - gke-managed-pod-snapshots
       {{- end }}
   clientConfig:
     {{- if not .Values.operator.certManager.useCertManager }}
@@ -486,6 +594,10 @@ webhooks:
             - gke-managed-checkpointing
             - gke-managed-parallelstorecsi
             - gke-managed-lustrecsi
+            - gke-managed-otel
+            - gke-managed-mldiagnostics
+            - gke-managed-networking-dra-driver
+            - gke-managed-pod-snapshots
     {{- end }}
     rules:
       - apiGroups:
@@ -542,6 +654,50 @@ webhooks:
         scope: Cluster
     sideEffects: None
     timeoutSeconds: 5
+{{- if .Values.operator.intelligentEdge.enabled }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ template "dash0-operator.chartName" . }}-intelligent-edge-validator
+  labels:
+    app.kubernetes.io/name: dash0-operator
+    app.kubernetes.io/component: validator
+    app.kubernetes.io/instance: intelligent-edge-validator-webhook
+    {{- include "dash0-operator.labels" . | nindent 4 }}
+  {{- if .Values.operator.certManager.useCertManager }}
+  {{- with .Values.operator.certManager.certManagerAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+webhooks:
+  - name: validate-intelligent-edge.dash0.com
+    clientConfig:
+      {{- if not .Values.operator.certManager.useCertManager }}
+      caBundle: {{ default "" ( $ca.Cert | b64enc ) }}
+      {{- end }}
+      service:
+        name: {{ template "dash0-operator.webhookServiceName" . }}
+        namespace: {{ .Release.Namespace }}
+        port: {{ template "dash0-operator.webhookServicePort" . }}
+        path: /intelligent-edge/validate
+    admissionReviewVersions:
+      - v1
+    rules:
+      - apiGroups:
+          - operator.dash0.com
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - dash0intelligentedges
+        scope: Cluster
+    sideEffects: None
+    timeoutSeconds: 5
+{{- end }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
@@ -584,6 +740,10 @@ webhooks:
             - gke-managed-checkpointing
             - gke-managed-parallelstorecsi
             - gke-managed-lustrecsi
+            - gke-managed-otel
+            - gke-managed-mldiagnostics
+            - gke-managed-networking-dra-driver
+            - gke-managed-pod-snapshots
     {{- end }}
     rules:
       - apiGroups:
@@ -788,6 +948,30 @@ spec:
                           type: array
                       type: object
                     type: array
+                  profile_statements:
+                    items:
+                      properties:
+                        conditions:
+                          items:
+                            type: string
+                          type: array
+                        context:
+                          type: string
+                        error_mode:
+                          description: |-
+                            FilterTransformErrorMode determine how the filter or the transform processor reacts to errors that occur while
+                            processing a condition.
+                          enum:
+                          - ignore
+                          - silent
+                          - propagate
+                          type: string
+                        statements:
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    type: array
                   trace_statements:
                     items:
                       properties:
@@ -815,6 +999,9 @@ spec:
                 type: object
               export:
                 description: |-
+                  Deprecated: Use `exports` instead. If both `export` and `exports` are specified, `export` will be ignored.
+                  The mutating webhook will automatically migrate `export` to `exports` if only `export` is specified.
+
                   The configuration of the observability backend to which telemetry data will be sent. This property is optional.
                   If not set, the operator will use the default export configuration from the cluster-wide
                   Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
@@ -886,6 +1073,23 @@ spec:
                           `ingress.` and end in `dash0.com:4317`.
                         minLength: 1
                         type: string
+                      keepalive:
+                        description: |-
+                          The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                          This setting is optional and there should usually be no need to configure it.
+                        properties:
+                          permit_without_stream:
+                            description: Allow keepalive pings when there are no active
+                              streams.
+                            type: boolean
+                          time:
+                            description: Period after which a keepalive ping is sent
+                              on the transport.
+                            type: string
+                          timeout:
+                            description: Time to wait for a keepalive ping acknowledgement.
+                            type: string
+                        type: object
                     required:
                     - authorization
                     - endpoint
@@ -894,6 +1098,14 @@ spec:
                     description: The settings for an exporter to send telemetry to
                       an arbitrary OTLP-compatible receiver via gRPC.
                     properties:
+                      balancer_name:
+                        description: |-
+                          The name of the load balancer to use. Can be either round_robin or pick_first. Optional; when omitted, the
+                          collector's default (round_robin) is used.
+                        enum:
+                        - round_robin
+                        - pick_first
+                        type: string
                       endpoint:
                         description: The URL of the OTLP-compatible receiver to which
                           telemetry data will be sent. This property is mandatory.
@@ -923,6 +1135,23 @@ spec:
                           Whether to skip verifying the server's certificate chain. It is a validation error to explicitly set
                           `insecure=true` and `insecureSkipVerify=true` at the same time, since `insecure` means TLS won't be used at all.
                         type: boolean
+                      keepalive:
+                        description: |-
+                          The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                          This setting is optional and there should usually be no need to configure it.
+                        properties:
+                          permit_without_stream:
+                            description: Allow keepalive pings when there are no active
+                              streams.
+                            type: boolean
+                          time:
+                            description: Period after which a keepalive ping is sent
+                              on the transport.
+                            type: string
+                          timeout:
+                            description: Time to wait for a keepalive ping acknowledgement.
+                            type: string
+                        type: object
                     required:
                     - endpoint
                     type: object
@@ -965,6 +1194,207 @@ spec:
                     - endpoint
                     type: object
                 type: object
+              exports:
+                description: |-
+                  The configuration of the observability backend(s) to which telemetry data will be sent. This property is optional.
+                  If not set, the operator will use the default export configuration from the cluster-wide
+                  Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
+                  the cluster, or if the Dash0OperatorConfiguration resource does not have at least one export defined, creating a
+                  Dash0Monitoring resource without export settings will result in an error.
+
+                  Each export can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters
+                  per export (i.e. Dash0 plus gRPC plus HTTP). This allows sending the same data to multiple targets simultaneously.
+                  When the exports setting is present, it has to contain at least one export with at least one exporter.
+                items:
+                  description: |-
+                    Export describes the observability backend to which telemetry data will be sent. This can either be Dash0 or another
+                    OTLP-compatible backend. You can also combine up to three exporters (i.e. Dash0 plus gRPC plus HTTP). This allows
+                    sending the same data to two or three targets simultaneously. At least one exporter has to be defined.
+                  minProperties: 1
+                  properties:
+                    dash0:
+                      description: The configuration of the Dash0 ingress endpoint
+                        to which telemetry data will be sent.
+                      properties:
+                        apiEndpoint:
+                          description: |-
+                            The base URL of the Dash0 API to talk to. This is not where telemetry will be sent, but it is used for managing
+                            dashboards, check rules, synthetic checks and views via the operator. This property is optional. The value
+                            needs to be the API endpoint of your Dash0 organization. The correct API endpoint can be copied fom
+                            https://app.dash0.com -> organization settings -> "Endpoints" -> "API". The correct endpoint value will always
+                            start with "https://api." and end in ".dash0.com"
+                          type: string
+                        authorization:
+                          description: Mandatory authorization settings for sending
+                            data to Dash0.
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            secretRef:
+                              description: |-
+                                A reference to a Kubernetes secret containing the Dash0 authorization token. This property is optional, and is
+                                ignored if the token property is set. The authorization token for your Dash0 organization can be copied from
+                                https://app.dash0.com -> organization settings -> "Auth Tokens".
+                              properties:
+                                key:
+                                  default: token
+                                  description: The key of the value which contains
+                                    the Dash0 authorization token. Defaults to "token"
+                                  type: string
+                                name:
+                                  default: dash0-authorization-secret
+                                  description: The name of the secret containing the
+                                    Dash0 authorization token. Defaults to "dash0-authorization-secret".
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                            token:
+                              description: |-
+                                The Dash0 authorization token. This property is optional, but either this property or the SecretRef property has
+                                to be provided. If both are provided, the token will be used and SecretRef will be ignored. The authorization
+                                token for your Dash0 organization can be copied from https://app.dash0.com -> organization settings ->
+                                "Auth Tokens".
+                              type: string
+                          type: object
+                        dataset:
+                          default: default
+                          description: |-
+                            The name of the Dash0 dataset to which telemetry data will be sent. This property is optional. If omitted, the
+                            dataset "default" will be used.
+                          type: string
+                        endpoint:
+                          description: |-
+                            The URL of the Dash0 ingress endpoint to which telemetry data will be sent. This property is mandatory. The value
+                            needs to be the OTLP/gRPC endpoint of your Dash0 organization. The correct OTLP/gRPC endpoint can be copied fom
+                            https://app.dash0.com -> organization settings -> "Endpoints". The correct endpoint value will always start with
+                            `ingress.` and end in `dash0.com:4317`.
+                          minLength: 1
+                          type: string
+                        keepalive:
+                          description: |-
+                            The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                            This setting is optional and there should usually be no need to configure it.
+                          properties:
+                            permit_without_stream:
+                              description: Allow keepalive pings when there are no
+                                active streams.
+                              type: boolean
+                            time:
+                              description: Period after which a keepalive ping is
+                                sent on the transport.
+                              type: string
+                            timeout:
+                              description: Time to wait for a keepalive ping acknowledgement.
+                              type: string
+                          type: object
+                      required:
+                      - authorization
+                      - endpoint
+                      type: object
+                    grpc:
+                      description: The settings for an exporter to send telemetry
+                        to an arbitrary OTLP-compatible receiver via gRPC.
+                      properties:
+                        balancer_name:
+                          description: |-
+                            The name of the load balancer to use. Can be either round_robin or pick_first. Optional; when omitted, the
+                            collector's default (round_robin) is used.
+                          enum:
+                          - round_robin
+                          - pick_first
+                          type: string
+                        endpoint:
+                          description: The URL of the OTLP-compatible receiver to
+                            which telemetry data will be sent. This property is mandatory.
+                          type: string
+                        headers:
+                          description: Additional headers to be sent with each gRPC
+                            request, for example for authorization. This property
+                            is optional.
+                          items:
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                            required:
+                            - name
+                            - value
+                            type: object
+                          type: array
+                        insecure:
+                          description: Explicitly defines whether TLS is used. Per
+                            default, a secure connection is assumed, unless the endpoint
+                            starts with 'http://'.
+                          type: boolean
+                        insecureSkipVerify:
+                          description: |-
+                            Whether to skip verifying the server's certificate chain. It is a validation error to explicitly set
+                            `insecure=true` and `insecureSkipVerify=true` at the same time, since `insecure` means TLS won't be used at all.
+                          type: boolean
+                        keepalive:
+                          description: |-
+                            The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                            This setting is optional and there should usually be no need to configure it.
+                          properties:
+                            permit_without_stream:
+                              description: Allow keepalive pings when there are no
+                                active streams.
+                              type: boolean
+                            time:
+                              description: Period after which a keepalive ping is
+                                sent on the transport.
+                              type: string
+                            timeout:
+                              description: Time to wait for a keepalive ping acknowledgement.
+                              type: string
+                          type: object
+                      required:
+                      - endpoint
+                      type: object
+                    http:
+                      description: The settings for an exporter to send telemetry
+                        to an arbitrary OTLP-compatible receiver via HTTP.
+                      properties:
+                        encoding:
+                          default: proto
+                          description: The encoding of the OTLP data when sent via
+                            HTTP. Can be either proto or json, defaults to proto.
+                          enum:
+                          - proto
+                          - json
+                          type: string
+                        endpoint:
+                          description: The URL of the OTLP-compatible receiver to
+                            which telemetry data will be sent. This property is mandatory.
+                          type: string
+                        headers:
+                          description: Additional headers to be sent with each HTTP
+                            request, for example for authorization. This property
+                            is optional.
+                          items:
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                            required:
+                            - name
+                            - value
+                            type: object
+                          type: array
+                        insecureSkipVerify:
+                          description: Whether verification of TLS certificates should
+                            be skipped. Ignored when the endpoint uses an insecure
+                            connection.
+                          type: boolean
+                      required:
+                      - endpoint
+                      type: object
+                  type: object
+                type: array
               filter:
                 description: |-
                   Optional filters for telemetry data that is collected in this namespace. This can be used to drop entire spans,
@@ -1040,6 +1470,21 @@ spec:
                           - 'name == "k8s.replicaset.available"'
                           - 'name == "k8s.replicaset.desired"'
                           - 'type == METRIC_DATA_TYPE_HISTOGRAM'
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  profiles:
+                    description: |-
+                      Filters for the profiles signal.
+                      This can be used to drop _profiles_.
+                    properties:
+                      profile:
+                        description: |-
+                          A list of conditions for filtering profiles.
+                          This is a list of OTTL conditions.
+                          All profiles where at least one condition evaluates to true will be dropped.
+                          (That is, the conditions are implicitly connected by a logical OR.)
                         items:
                           type: string
                         type: array
@@ -1175,7 +1620,7 @@ spec:
                 description: |-
                   If enabled, the operator will watch Perses dashboard resources in this namespace and create corresponding
                   dashboards in Dash0 via the Dash0 API.
-                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-dashboards-with-the-operator
+                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-dashboards-with-the-operator
                   for details. This setting is optional, it defaults to `true`.
                 type: boolean
               synchronizePrometheusRules:
@@ -1183,7 +1628,7 @@ spec:
                 description: |-
                   If enabled, the operator will watch Prometheus rule resources in this namespace and create corresponding check
                   rules in Dash0 via the Dash0 API.
-                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-check-rules-with-the-operator
+                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-check-rules-with-the-operator
                   for details. This setting is optional, it defaults to `true`.
                 type: boolean
               transform:
@@ -1234,11 +1679,18 @@ spec:
                     description: Transform statements (or groups) for the metric signal
                       type.
                     x-kubernetes-preserve-unknown-fields: true
+                  profile_statements:
+                    description: Transform statements (or groups) for the profile
+                      signal type.
+                    x-kubernetes-preserve-unknown-fields: true
                   trace_statements:
                     description: Transform statements (or groups) for the trace signal
                       type.
                     x-kubernetes-preserve-unknown-fields: true
                 type: object
+            required:
+            - synchronizePersesDashboards
+            - synchronizePrometheusRules
             type: object
           status:
             description: Dash0MonitoringStatus defines the observed state of the Dash0Monitoring
@@ -1311,12 +1763,28 @@ spec:
               persesDashboardSynchronizationResults:
                 additionalProperties:
                   properties:
-                    dash0Dataset:
-                      type: string
-                    dash0Origin:
-                      type: string
-                    synchronizationError:
-                      type: string
+                    synchronizationResults:
+                      items:
+                        properties:
+                          dash0ApiEndpoint:
+                            type: string
+                          dash0Dataset:
+                            type: string
+                          dash0Origin:
+                            type: string
+                          httpStatusCode:
+                            description: |-
+                              HttpStatusCode is the HTTP status code that the Dash0 API returned for the failed synchronization attempt, if the
+                              failure was caused by an unexpected HTTP response. It is 0 (absent) for successful synchronizations and for
+                              transport-level errors (network errors, timeouts) where no HTTP response was received. It is used to decide
+                              whether a failed synchronization should be retried.
+                            type: integer
+                          synchronizationError:
+                            type: string
+                        required:
+                        - dash0ApiEndpoint
+                        type: object
+                      type: array
                     synchronizationStatus:
                       description: |-
                         ThirdPartySynchronizationStatus describes the result of synchronizing a third-party Kubernetes resource (Perses
@@ -1333,9 +1801,6 @@ spec:
                       items:
                         type: string
                       type: array
-                  required:
-                  - synchronizationStatus
-                  - synchronizedAt
                   type: object
                 description: Shows results of synchronizing Perses dashboard resources
                   in this namespace via the Dash0 API.
@@ -1361,12 +1826,44 @@ spec:
                       type: object
                     invalidRulesTotal:
                       type: integer
-                    synchronizationErrors:
-                      additionalProperties:
-                        type: string
-                      type: object
-                    synchronizationErrorsTotal:
+                    recordingRulesTotal:
                       type: integer
+                    synchronizationResults:
+                      items:
+                        properties:
+                          dash0ApiEndpoint:
+                            type: string
+                          dash0Dataset:
+                            type: string
+                          synchronizationErrorHttpStatusCodes:
+                            additionalProperties:
+                              type: integer
+                            description: |-
+                              SynchronizationErrorHttpStatusCodes maps the name of a rule that failed to synchronize to the HTTP status code
+                              that the Dash0 API returned for that rule, if the failure was caused by an unexpected HTTP response. The status
+                              code is 0 (absent) for transport-level errors (network errors, timeouts) where no HTTP response was received. It
+                              is used to decide whether a failed synchronization should be retried. The keys match the keys of
+                              SynchronizationErrors.
+                            type: object
+                          synchronizationErrors:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          synchronizationErrorsTotal:
+                            type: integer
+                          synchronizedRulesAttributes:
+                            additionalProperties:
+                              properties:
+                                dash0Origin:
+                                  type: string
+                              type: object
+                            type: object
+                          synchronizedRulesTotal:
+                            type: integer
+                        required:
+                        - dash0ApiEndpoint
+                        type: object
+                      type: array
                     synchronizationStatus:
                       description: |-
                         ThirdPartySynchronizationStatus describes the result of synchronizing a third-party Kubernetes resource (Perses
@@ -1379,24 +1876,6 @@ spec:
                     synchronizedAt:
                       format: date-time
                       type: string
-                    synchronizedRulesAttributes:
-                      additionalProperties:
-                        properties:
-                          dash0Dataset:
-                            type: string
-                          dash0Origin:
-                            type: string
-                        type: object
-                      type: object
-                    synchronizedRulesTotal:
-                      type: integer
-                  required:
-                  - alertingRulesTotal
-                  - invalidRulesTotal
-                  - synchronizationErrorsTotal
-                  - synchronizationStatus
-                  - synchronizedAt
-                  - synchronizedRulesTotal
                   type: object
                 description: Shows results of synchronizing Prometheus rule resources
                   in this namespace via the Dash0 API.
@@ -1511,6 +1990,30 @@ spec:
                           type: array
                       type: object
                     type: array
+                  profile_statements:
+                    items:
+                      properties:
+                        conditions:
+                          items:
+                            type: string
+                          type: array
+                        context:
+                          type: string
+                        error_mode:
+                          description: |-
+                            FilterTransformErrorMode determine how the filter or the transform processor reacts to errors that occur while
+                            processing a condition.
+                          enum:
+                          - ignore
+                          - silent
+                          - propagate
+                          type: string
+                        statements:
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    type: array
                   trace_statements:
                     items:
                       properties:
@@ -1558,6 +2061,9 @@ spec:
                 type: object
               export:
                 description: |-
+                  Deprecated: Use `exports` instead. If both `export` and `exports` are specified, `export` will be ignored.
+                  The mutating webhook will automatically migrate `export` to `exports` if only `export` is specified.
+
                   The configuration of the observability backend to which telemetry data will be sent. This property is optional.
                   If not set, the operator will use the default export configuration from the cluster-wide
                   Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
@@ -1629,6 +2135,23 @@ spec:
                           `ingress.` and end in `dash0.com:4317`.
                         minLength: 1
                         type: string
+                      keepalive:
+                        description: |-
+                          The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                          This setting is optional and there should usually be no need to configure it.
+                        properties:
+                          permit_without_stream:
+                            description: Allow keepalive pings when there are no active
+                              streams.
+                            type: boolean
+                          time:
+                            description: Period after which a keepalive ping is sent
+                              on the transport.
+                            type: string
+                          timeout:
+                            description: Time to wait for a keepalive ping acknowledgement.
+                            type: string
+                        type: object
                     required:
                     - authorization
                     - endpoint
@@ -1637,6 +2160,14 @@ spec:
                     description: The settings for an exporter to send telemetry to
                       an arbitrary OTLP-compatible receiver via gRPC.
                     properties:
+                      balancer_name:
+                        description: |-
+                          The name of the load balancer to use. Can be either round_robin or pick_first. Optional; when omitted, the
+                          collector's default (round_robin) is used.
+                        enum:
+                        - round_robin
+                        - pick_first
+                        type: string
                       endpoint:
                         description: The URL of the OTLP-compatible receiver to which
                           telemetry data will be sent. This property is mandatory.
@@ -1666,6 +2197,23 @@ spec:
                           Whether to skip verifying the server's certificate chain. It is a validation error to explicitly set
                           `insecure=true` and `insecureSkipVerify=true` at the same time, since `insecure` means TLS won't be used at all.
                         type: boolean
+                      keepalive:
+                        description: |-
+                          The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                          This setting is optional and there should usually be no need to configure it.
+                        properties:
+                          permit_without_stream:
+                            description: Allow keepalive pings when there are no active
+                              streams.
+                            type: boolean
+                          time:
+                            description: Period after which a keepalive ping is sent
+                              on the transport.
+                            type: string
+                          timeout:
+                            description: Time to wait for a keepalive ping acknowledgement.
+                            type: string
+                        type: object
                     required:
                     - endpoint
                     type: object
@@ -1708,6 +2256,207 @@ spec:
                     - endpoint
                     type: object
                 type: object
+              exports:
+                description: |-
+                  The configuration of the observability backend(s) to which telemetry data will be sent. This property is optional.
+                  If not set, the operator will use the default export configuration from the cluster-wide
+                  Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
+                  the cluster, or if the Dash0OperatorConfiguration resource does not have at least one export defined, creating a
+                  Dash0Monitoring resource without export settings will result in an error.
+
+                  Each export can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters
+                  per export (i.e. Dash0 plus gRPC plus HTTP). This allows sending the same data to multiple targets simultaneously.
+                  When the exports setting is present, it has to contain at least one export with at least one exporter.
+                items:
+                  description: |-
+                    Export describes the observability backend to which telemetry data will be sent. This can either be Dash0 or another
+                    OTLP-compatible backend. You can also combine up to three exporters (i.e. Dash0 plus gRPC plus HTTP). This allows
+                    sending the same data to two or three targets simultaneously. At least one exporter has to be defined.
+                  minProperties: 1
+                  properties:
+                    dash0:
+                      description: The configuration of the Dash0 ingress endpoint
+                        to which telemetry data will be sent.
+                      properties:
+                        apiEndpoint:
+                          description: |-
+                            The base URL of the Dash0 API to talk to. This is not where telemetry will be sent, but it is used for managing
+                            dashboards, check rules, synthetic checks and views via the operator. This property is optional. The value
+                            needs to be the API endpoint of your Dash0 organization. The correct API endpoint can be copied fom
+                            https://app.dash0.com -> organization settings -> "Endpoints" -> "API". The correct endpoint value will always
+                            start with "https://api." and end in ".dash0.com"
+                          type: string
+                        authorization:
+                          description: Mandatory authorization settings for sending
+                            data to Dash0.
+                          maxProperties: 1
+                          minProperties: 1
+                          properties:
+                            secretRef:
+                              description: |-
+                                A reference to a Kubernetes secret containing the Dash0 authorization token. This property is optional, and is
+                                ignored if the token property is set. The authorization token for your Dash0 organization can be copied from
+                                https://app.dash0.com -> organization settings -> "Auth Tokens".
+                              properties:
+                                key:
+                                  default: token
+                                  description: The key of the value which contains
+                                    the Dash0 authorization token. Defaults to "token"
+                                  type: string
+                                name:
+                                  default: dash0-authorization-secret
+                                  description: The name of the secret containing the
+                                    Dash0 authorization token. Defaults to "dash0-authorization-secret".
+                                  type: string
+                              required:
+                              - key
+                              - name
+                              type: object
+                            token:
+                              description: |-
+                                The Dash0 authorization token. This property is optional, but either this property or the SecretRef property has
+                                to be provided. If both are provided, the token will be used and SecretRef will be ignored. The authorization
+                                token for your Dash0 organization can be copied from https://app.dash0.com -> organization settings ->
+                                "Auth Tokens".
+                              type: string
+                          type: object
+                        dataset:
+                          default: default
+                          description: |-
+                            The name of the Dash0 dataset to which telemetry data will be sent. This property is optional. If omitted, the
+                            dataset "default" will be used.
+                          type: string
+                        endpoint:
+                          description: |-
+                            The URL of the Dash0 ingress endpoint to which telemetry data will be sent. This property is mandatory. The value
+                            needs to be the OTLP/gRPC endpoint of your Dash0 organization. The correct OTLP/gRPC endpoint can be copied fom
+                            https://app.dash0.com -> organization settings -> "Endpoints". The correct endpoint value will always start with
+                            `ingress.` and end in `dash0.com:4317`.
+                          minLength: 1
+                          type: string
+                        keepalive:
+                          description: |-
+                            The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                            This setting is optional and there should usually be no need to configure it.
+                          properties:
+                            permit_without_stream:
+                              description: Allow keepalive pings when there are no
+                                active streams.
+                              type: boolean
+                            time:
+                              description: Period after which a keepalive ping is
+                                sent on the transport.
+                              type: string
+                            timeout:
+                              description: Time to wait for a keepalive ping acknowledgement.
+                              type: string
+                          type: object
+                      required:
+                      - authorization
+                      - endpoint
+                      type: object
+                    grpc:
+                      description: The settings for an exporter to send telemetry
+                        to an arbitrary OTLP-compatible receiver via gRPC.
+                      properties:
+                        balancer_name:
+                          description: |-
+                            The name of the load balancer to use. Can be either round_robin or pick_first. Optional; when omitted, the
+                            collector's default (round_robin) is used.
+                          enum:
+                          - round_robin
+                          - pick_first
+                          type: string
+                        endpoint:
+                          description: The URL of the OTLP-compatible receiver to
+                            which telemetry data will be sent. This property is mandatory.
+                          type: string
+                        headers:
+                          description: Additional headers to be sent with each gRPC
+                            request, for example for authorization. This property
+                            is optional.
+                          items:
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                            required:
+                            - name
+                            - value
+                            type: object
+                          type: array
+                        insecure:
+                          description: Explicitly defines whether TLS is used. Per
+                            default, a secure connection is assumed, unless the endpoint
+                            starts with 'http://'.
+                          type: boolean
+                        insecureSkipVerify:
+                          description: |-
+                            Whether to skip verifying the server's certificate chain. It is a validation error to explicitly set
+                            `insecure=true` and `insecureSkipVerify=true` at the same time, since `insecure` means TLS won't be used at all.
+                          type: boolean
+                        keepalive:
+                          description: |-
+                            The client-side keepalive configuration. See https://pkg.go.dev/google.golang.org/grpc/keepalive#ClientParameters
+                            This setting is optional and there should usually be no need to configure it.
+                          properties:
+                            permit_without_stream:
+                              description: Allow keepalive pings when there are no
+                                active streams.
+                              type: boolean
+                            time:
+                              description: Period after which a keepalive ping is
+                                sent on the transport.
+                              type: string
+                            timeout:
+                              description: Time to wait for a keepalive ping acknowledgement.
+                              type: string
+                          type: object
+                      required:
+                      - endpoint
+                      type: object
+                    http:
+                      description: The settings for an exporter to send telemetry
+                        to an arbitrary OTLP-compatible receiver via HTTP.
+                      properties:
+                        encoding:
+                          default: proto
+                          description: The encoding of the OTLP data when sent via
+                            HTTP. Can be either proto or json, defaults to proto.
+                          enum:
+                          - proto
+                          - json
+                          type: string
+                        endpoint:
+                          description: The URL of the OTLP-compatible receiver to
+                            which telemetry data will be sent. This property is mandatory.
+                          type: string
+                        headers:
+                          description: Additional headers to be sent with each HTTP
+                            request, for example for authorization. This property
+                            is optional.
+                          items:
+                            properties:
+                              name:
+                                type: string
+                              value:
+                                type: string
+                            required:
+                            - name
+                            - value
+                            type: object
+                          type: array
+                        insecureSkipVerify:
+                          description: Whether verification of TLS certificates should
+                            be skipped. Ignored when the endpoint uses an insecure
+                            connection.
+                          type: boolean
+                      required:
+                      - endpoint
+                      type: object
+                  type: object
+                type: array
               filter:
                 description: |-
                   Optional filters for telemetry data that is collected in this namespace. This can be used to drop entire spans,
@@ -1787,6 +2536,21 @@ spec:
                           type: string
                         type: array
                     type: object
+                  profiles:
+                    description: |-
+                      Filters for the profiles signal.
+                      This can be used to drop _profiles_.
+                    properties:
+                      profile:
+                        description: |-
+                          A list of conditions for filtering profiles.
+                          This is a list of OTTL conditions.
+                          All profiles where at least one condition evaluates to true will be dropped.
+                          (That is, the conditions are implicitly connected by a logical OR.)
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   traces:
                     description: |-
                       Filters for the traces signal.
@@ -1821,7 +2585,34 @@ spec:
                   Settings for automatic instrumentation of workloads in the target namespace. This setting is optional, by default
                   the operator will instrument existing workloads, as well as new workloads at deploy time and changed workloads
                   when they are updated.
+
+                  Note: There are also instrumentWorkloads in the Dash0 operator configuration resource, for cluster-wide settings
+                  for workload instrumentation.
                 properties:
+                  captureSqlQueryParameters:
+                    description: |-
+                      If set to true, the operator enables SQL query parameter capture in the language agents that support it. Currently
+                      this covers the OpenTelemetry Java agent's JDBC instrumentation and the OpenTelemetry .NET auto-instrumentation
+                      for Microsoft.Data.SqlClient and Entity Framework Core, by adding the following environment variables (all set to
+                      "true") to instrumented containers:
+                        - OTEL_INSTRUMENTATION_JDBC_EXPERIMENTAL_CAPTURE_QUERY_PARAMETERS
+                        - OTEL_DOTNET_EXPERIMENTAL_SQLCLIENT_ENABLE_TRACE_DB_QUERY_PARAMETERS
+                        - OTEL_DOTNET_EXPERIMENTAL_EFCORE_ENABLE_TRACE_DB_QUERY_PARAMETERS
+                      Recorded query parameter values are added to the resulting database span attributes. Other language agents ignore
+                      these variables.
+
+                      If a container already has one of these environment variables set to a value other than "true", the existing value
+                      is preserved.
+
+                      Note: These are experimental upstream OpenTelemetry agent flags and may be renamed or removed in future agent
+                      releases. Recorded query parameter values may include sensitive data such as personally identifiable information
+                      (PII), so enable this only for namespaces where capturing query parameter values is acceptable.
+
+                      By default, the value is not set and the environment variables will not be added to workloads. If this option is
+                      set to true at some point and then later set to false or removed, the operator will remove each environment
+                      variable from instrumented workloads if and only if its current value still matches what the operator would have
+                      set ("true").
+                    type: boolean
                   labelSelector:
                     default: dash0.com/enable!=false
                     description: |-
@@ -1837,12 +2628,12 @@ spec:
                       - workloads that do not have the label dash0.com/enable at all, or
                       - workloads that have the label dash0.com/enable with a value other than "false".
 
-                      It is recommended to leave this setting unset (i.e. leave the default "dash0.com/enable!=false" in place), unless
+                      It is recommended to leave this setting unset (i.e., leave the default "dash0.com/enable!=false" in place), unless
                       you have a specific use case that requires a different label selector. One such use case is implementing an
                       opt-in model for workload instrumentation instead of the usual opt-out model. That is, instead of instrumenting
                       all workloads by default and only disabling instrumentation for a few specific workloads, you want to
                       deliberately turn on instrumentation for a few specific workloads and leave all others uninstrumented. Use a
-                      label selector with equals instead of not-equals to achieve this, i.e.
+                      label selector with equals instead of not-equals to achieve this, i.e.,
                       spec.instrumentWorkloads.labelSelector="auto-instrument-this-workload-with-dash0=true".
                     type: string
                   mode:
@@ -1959,7 +2750,7 @@ spec:
                 description: |-
                   If enabled, the operator will watch Perses dashboard resources in this namespace and create corresponding
                   dashboards in Dash0 via the Dash0 API.
-                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-dashboards-with-the-operator
+                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-dashboards-with-the-operator
                   for details. This setting is optional, it defaults to `true`.
                 type: boolean
               synchronizePrometheusRules:
@@ -1967,7 +2758,7 @@ spec:
                 description: |-
                   If enabled, the operator will watch Prometheus rule resources in this namespace and create corresponding check
                   rules in Dash0 via the Dash0 API.
-                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-check-rules-with-the-operator
+                  See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-check-rules-with-the-operator
                   for details. This setting is optional, it defaults to `true`.
                 type: boolean
               transform:
@@ -2018,11 +2809,18 @@ spec:
                     description: Transform statements (or groups) for the metric signal
                       type.
                     x-kubernetes-preserve-unknown-fields: true
+                  profile_statements:
+                    description: Transform statements (or groups) for the profile
+                      signal type.
+                    x-kubernetes-preserve-unknown-fields: true
                   trace_statements:
                     description: Transform statements (or groups) for the trace signal
                       type.
                     x-kubernetes-preserve-unknown-fields: true
                 type: object
+            required:
+            - synchronizePersesDashboards
+            - synchronizePrometheusRules
             type: object
           status:
             description: Dash0MonitoringStatus defines the observed state of the Dash0Monitoring
@@ -2095,12 +2893,28 @@ spec:
               persesDashboardSynchronizationResults:
                 additionalProperties:
                   properties:
-                    dash0Dataset:
-                      type: string
-                    dash0Origin:
-                      type: string
-                    synchronizationError:
-                      type: string
+                    synchronizationResults:
+                      items:
+                        properties:
+                          dash0ApiEndpoint:
+                            type: string
+                          dash0Dataset:
+                            type: string
+                          dash0Origin:
+                            type: string
+                          httpStatusCode:
+                            description: |-
+                              HttpStatusCode is the HTTP status code that the Dash0 API returned for the failed synchronization attempt, if the
+                              failure was caused by an unexpected HTTP response. It is 0 (absent) for successful synchronizations and for
+                              transport-level errors (network errors, timeouts) where no HTTP response was received. It is used to decide
+                              whether a failed synchronization should be retried.
+                            type: integer
+                          synchronizationError:
+                            type: string
+                        required:
+                        - dash0ApiEndpoint
+                        type: object
+                      type: array
                     synchronizationStatus:
                       description: |-
                         ThirdPartySynchronizationStatus describes the result of synchronizing a third-party Kubernetes resource (Perses
@@ -2117,9 +2931,6 @@ spec:
                       items:
                         type: string
                       type: array
-                  required:
-                  - synchronizationStatus
-                  - synchronizedAt
                   type: object
                 description: Shows results of synchronizing Perses dashboard resources
                   in this namespace via the Dash0 API.
@@ -2128,6 +2939,30 @@ spec:
                 description: The spec.instrumentWorkloads.mode setting that has been
                   observed in the previous reconcile cycle.
                 properties:
+                  captureSqlQueryParameters:
+                    description: |-
+                      If set to true, the operator enables SQL query parameter capture in the language agents that support it. Currently
+                      this covers the OpenTelemetry Java agent's JDBC instrumentation and the OpenTelemetry .NET auto-instrumentation
+                      for Microsoft.Data.SqlClient and Entity Framework Core, by adding the following environment variables (all set to
+                      "true") to instrumented containers:
+                        - OTEL_INSTRUMENTATION_JDBC_EXPERIMENTAL_CAPTURE_QUERY_PARAMETERS
+                        - OTEL_DOTNET_EXPERIMENTAL_SQLCLIENT_ENABLE_TRACE_DB_QUERY_PARAMETERS
+                        - OTEL_DOTNET_EXPERIMENTAL_EFCORE_ENABLE_TRACE_DB_QUERY_PARAMETERS
+                      Recorded query parameter values are added to the resulting database span attributes. Other language agents ignore
+                      these variables.
+
+                      If a container already has one of these environment variables set to a value other than "true", the existing value
+                      is preserved.
+
+                      Note: These are experimental upstream OpenTelemetry agent flags and may be renamed or removed in future agent
+                      releases. Recorded query parameter values may include sensitive data such as personally identifiable information
+                      (PII), so enable this only for namespaces where capturing query parameter values is acceptable.
+
+                      By default, the value is not set and the environment variables will not be added to workloads. If this option is
+                      set to true at some point and then later set to false or removed, the operator will remove each environment
+                      variable from instrumented workloads if and only if its current value still matches what the operator would have
+                      set ("true").
+                    type: boolean
                   labelSelector:
                     default: dash0.com/enable!=false
                     description: |-
@@ -2143,12 +2978,12 @@ spec:
                       - workloads that do not have the label dash0.com/enable at all, or
                       - workloads that have the label dash0.com/enable with a value other than "false".
 
-                      It is recommended to leave this setting unset (i.e. leave the default "dash0.com/enable!=false" in place), unless
+                      It is recommended to leave this setting unset (i.e., leave the default "dash0.com/enable!=false" in place), unless
                       you have a specific use case that requires a different label selector. One such use case is implementing an
                       opt-in model for workload instrumentation instead of the usual opt-out model. That is, instead of instrumenting
                       all workloads by default and only disabling instrumentation for a few specific workloads, you want to
                       deliberately turn on instrumentation for a few specific workloads and leave all others uninstrumented. Use a
-                      label selector with equals instead of not-equals to achieve this, i.e.
+                      label selector with equals instead of not-equals to achieve this, i.e.,
                       spec.instrumentWorkloads.labelSelector="auto-instrument-this-workload-with-dash0=true".
                     type: string
                   mode:
@@ -2221,6 +3056,24 @@ spec:
                         type: string
                     type: object
                 type: object
+              previousLogCollection:
+                description: |-
+                  The spec.logCollection setting that has been observed in the previous reconcile cycle. Used to detect when log
+                  collection has been toggled, which requires re-instrumenting workloads so that OTEL_LOGS_EXPORTER is
+                  added/removed accordingly.
+                properties:
+                  enabled:
+                    description: |-
+                      Opt-out for log collection for the target namespace. If set to `false`, the operator will not collect pod logs
+                      in the target namespace and send the resulting log records to Dash0.
+
+                      This setting is optional, it defaults to `true`, that is, if this setting is omitted, the value `true` is assumed
+                      and the operator will collect pod logs in the target namespace; unless there is an operator configuration
+                      resource with `telemetryCollection.enabled=false`, then log collection is off by default. It is a validation error
+                      to set `telemetryCollection.enabled=false` in the operator configuration resource and
+                      `logCollection.enabled=true` in any monitoring resource at the same time.
+                    type: boolean
+                type: object
               prometheusRuleSynchronizationResults:
                 additionalProperties:
                   properties:
@@ -2234,12 +3087,44 @@ spec:
                       type: object
                     invalidRulesTotal:
                       type: integer
-                    synchronizationErrors:
-                      additionalProperties:
-                        type: string
-                      type: object
-                    synchronizationErrorsTotal:
+                    recordingRulesTotal:
                       type: integer
+                    synchronizationResults:
+                      items:
+                        properties:
+                          dash0ApiEndpoint:
+                            type: string
+                          dash0Dataset:
+                            type: string
+                          synchronizationErrorHttpStatusCodes:
+                            additionalProperties:
+                              type: integer
+                            description: |-
+                              SynchronizationErrorHttpStatusCodes maps the name of a rule that failed to synchronize to the HTTP status code
+                              that the Dash0 API returned for that rule, if the failure was caused by an unexpected HTTP response. The status
+                              code is 0 (absent) for transport-level errors (network errors, timeouts) where no HTTP response was received. It
+                              is used to decide whether a failed synchronization should be retried. The keys match the keys of
+                              SynchronizationErrors.
+                            type: object
+                          synchronizationErrors:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          synchronizationErrorsTotal:
+                            type: integer
+                          synchronizedRulesAttributes:
+                            additionalProperties:
+                              properties:
+                                dash0Origin:
+                                  type: string
+                              type: object
+                            type: object
+                          synchronizedRulesTotal:
+                            type: integer
+                        required:
+                        - dash0ApiEndpoint
+                        type: object
+                      type: array
                     synchronizationStatus:
                       description: |-
                         ThirdPartySynchronizationStatus describes the result of synchronizing a third-party Kubernetes resource (Perses
@@ -2252,24 +3137,6 @@ spec:
                     synchronizedAt:
                       format: date-time
                       type: string
-                    synchronizedRulesAttributes:
-                      additionalProperties:
-                        properties:
-                          dash0Dataset:
-                            type: string
-                          dash0Origin:
-                            type: string
-                        type: object
-                      type: object
-                    synchronizedRulesTotal:
-                      type: integer
-                  required:
-                  - alertingRulesTotal
-                  - invalidRulesTotal
-                  - synchronizationErrorsTotal
-                  - synchronizationStatus
-                  - synchronizedAt
-                  - synchronizedRulesTotal
                   type: object
                 description: Shows results of synchronizing Prometheus rule resources
                   in this namespace via the Dash0 API.

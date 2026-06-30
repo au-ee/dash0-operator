@@ -42,6 +42,14 @@ helm.sh/chart: {{ include "dash0-operator.chartNameWithVersion" . }}
 {{- default (printf "%s-controller" (include "dash0-operator.chartName" .)) .Values.operator.serviceAccount.name }}
 {{- end }}
 
+{{- define "dash0-operator.preInstallHookServiceAccountName" -}}
+{{- printf "%s-pre-install" (include "dash0-operator.chartName" .) }}
+{{- end }}
+
+{{- define "dash0-operator.postDeleteHookServiceAccountName" -}}
+{{- printf "%s-post-delete" (include "dash0-operator.chartName" .) }}
+{{- end }}
+
 {{/* otelcol resources config map name */}}
 {{- define "dash0-operator.extraConfigMapName" -}}
 {{ include "dash0-operator.chartName" . }}-extra-config
@@ -64,9 +72,9 @@ helm.sh/chart: {{ include "dash0-operator.chartNameWithVersion" . }}
 {{- include "dash0-operator.imageRef" (dict "image" .Values.operator.image "context" .) -}}
 {{- end }}
 
-{{/* the init container image */}}
-{{- define "dash0-operator.initContainerImage" -}}
-{{- include "dash0-operator.imageRef" (dict "image" .Values.operator.initContainerImage "context" .) -}}
+{{/* the instrumentation image */}}
+{{- define "dash0-operator.instrumentationImage" -}}
+{{- include "dash0-operator.imageRef" (dict "image" .Values.operator.instrumentationImage "context" .) -}}
 {{- end }}
 
 {{/* the collector image */}}
@@ -92,6 +100,21 @@ helm.sh/chart: {{ include "dash0-operator.chartNameWithVersion" . }}
 {{/* the filelog offset volume ownership image */}}
 {{- define "dash0-operator.filelogOffsetVolumeOwnershipImage" -}}
 {{- include "dash0-operator.imageRef" (dict "image" .Values.operator.filelogOffsetVolumeOwnershipImage "context" .) -}}
+{{- end }}
+
+{{/* the intelligent edge collector image */}}
+{{- define "dash0-operator.intelligentEdgeCollectorImage" -}}
+{{- include "dash0-operator.imageRef" (dict "image" .Values.operator.intelligentEdgeCollectorImage "context" .) -}}
+{{- end }}
+
+{{/* the barker image */}}
+{{- define "dash0-operator.barkerImage" -}}
+{{- include "dash0-operator.imageRef" (dict "image" .Values.operator.barkerImage "context" .) -}}
+{{- end }}
+
+{{/* the agent0-connector image */}}
+{{- define "dash0-operator.agent0ConnectorImage" -}}
+{{- include "dash0-operator.imageRef" (dict "image" .Values.operator.agent0ConnectorImage "context" .) -}}
 {{- end }}
 
 {{- define "dash0-operator.imageRef" -}}

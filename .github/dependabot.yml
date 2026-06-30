@@ -11,9 +11,11 @@ updates:
   - package-ecosystem: "gomod"
     directories:
       - "/"
+      - "/images/agent0-connector/src"
       - "/images/configreloader/src"
       - "/images/filelogoffsetsync/src"
       - "/images/pkg/common"
+      - "test/e2e"
     schedule:
       interval: "weekly"
       day: "tuesday"
@@ -43,11 +45,14 @@ updates:
   - package-ecosystem: "docker"
     directories:
       - "/"
+      - "/images/agent0-connector"
       - "/images/collector"
       - "/images/configreloader"
       - "/images/filelogoffsetsync"
       - "/images/filelogoffsetvolumeownership"
+      - "/images/volumeownership"
       - "/images/instrumentation"
+      - "/images/target-allocator"
     schedule:
       interval: "daily"
       time: "07:15"
@@ -55,6 +60,16 @@ updates:
     groups:
       production-dependencies:
         dependency-type: "production"
+    # The following 'ignore' rules are workarounds to prevent noisy/repeated dependabot PRs
+    # that update dependencies to pre-release versions.
+    # The rules need to be manually disabled when a new stable minor version is available.
+    ignore:
+      # enable the following `ignore` to prevent upgrades to golang pre-releases
+      # - dependency-name: "golang"
+      #   update-types: ["version-update:semver-minor"]
+      # enable the following `ignore` to prevent upgrades to python pre-releases
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor"]
 
   # -----------------------
   # -- Test applications --
@@ -64,6 +79,9 @@ updates:
     directories:
       - "/test/e2e/otlp-sink/telemetrymatcher"
       - "/test/e2e/dash0-api-mock"
+      - "/test/e2e/control-plane-mock"
+      - "/test/e2e/decision-maker-mock"
+      - "/test/e2e/outbound-connector-mock"
     schedule:
       interval: "daily"
       time: "07:18"
@@ -71,9 +89,30 @@ updates:
     groups:
       development-dependencies:
         dependency-type: "development"
+    ignore:
+      - dependency-name: "golang"
+        update-types: ["version-update:semver-minor"]
+
+  - package-ecosystem: "helm"
+    directories:
+      - "/test/e2e/otlp-sink/helm-chart"
+      - "/test-resources/ebpf-profiler/helm-chart"
+    schedule:
+      interval: "daily"
+      time: "09:00"
+      timezone: "Europe/Berlin"
+    groups:
+      development-dependencies:
+        dependency-type: "development"
 
   - package-ecosystem: "gomod"
-    directory: "test/e2e/dash0-api-mock"
+    directories:
+      - "test/e2e/dash0-api-mock"
+      - "test/e2e/control-plane-mock"
+      - "test/e2e/decision-maker-mock"
+      - "test/e2e/outbound-connector-mock"
+      - "test/e2e/otlp-sink/telemetrymatcher"
+      - "test/e2e/pkg/shared"
     schedule:
       interval: "weekly"
       day: "tuesday"
@@ -85,6 +124,10 @@ updates:
           - "*"
     commit-message:
       prefix: "test"
+    # enable the following `ignore` to prevent upgrades to RCs
+    # ignore:
+    #   - dependency-name: "golang"
+    #     update-types: ["version-update:semver-minor"]
 
   - package-ecosystem: "maven"
     directory: "test-resources/jvm/spring-boot"

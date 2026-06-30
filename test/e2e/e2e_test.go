@@ -6,6 +6,7 @@ package e2e
 import (
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"slices"
@@ -17,13 +18,14 @@ import (
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	"github.com/dash0hq/dash0-operator/internal/startup"
+	"github.com/dash0hq/dash0-operator/internal/util"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	gomegaformat "github.com/onsi/gomega/format"
 
 	"github.com/dash0hq/dash0-operator/test/e2e/pkg/shared"
-	"github.com/dash0hq/dash0-operator/test/util"
+	testUtil "github.com/dash0hq/dash0-operator/test/util"
 )
 
 const (
@@ -67,6 +69,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				))
 		}
 		kubeContextHasBeenChanged, originalKubeContext = setKubernetesContext(e2eKubernetesContext)
+		readKubernetesServerVersion()
 
 		// Cleans up the test namespace, otlp sink and the operator. Usually this is cleaned up in AfterAll/AfterEach
 		// steps, but for cases where we want to troubleshoot failing e2e tests and have disabled cleanup in After steps
@@ -76,12 +79,18 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 		ensureNginxIngressControllerIsInstalled(&cleanupSteps)
 		ensureMetricsServerIsInstalled(&cleanupSteps)
 
-		recreateNamespace(applicationUnderTestNamespace)
+		setAutoMonitoringOptOutLabelForStandardNamespaces(&cleanupSteps)
+
+		recreateNamespaceWithLabel(applicationUnderTestNamespace, map[string]string{"dash0.com/enable": "\"false\""})
 		cleanupSteps.removeTestApplicationNamespace = true
 
+		determineOperatorHelmChart()
 		determineContainerImages()
 		determineTestAppImages()
 		determineDash0ApiMockImage()
+		determineDecisionMakerMockImage()
+		determineControlPlaneMockImage()
+		determineOutboundConnectorMockImage()
 		determineTelemetryMatcherImage()
 		determineUrls()
 
@@ -104,6 +113,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 			stopPodCrashOrOOMKillDetection <- true
 		}
 		uninstallOtlpSink(&cleanupSteps)
+		removeAutoMonitoringOptOutLabelFromStandardNamespaces(&cleanupSteps)
 		undeployNginxIngressController(&cleanupSteps)
 
 		if cleanupSteps.removeTestApplicationNamespace {
@@ -140,7 +150,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 	// setup they require. I.e. all tests that work with a pre-existing operator deployment with the same standard
 	// configuration are grouped together etc. This helps with the test execution speed.
 
-	Describe("with an existing operator deployment and operation configuration resource", func() {
+	Context("with an existing operator deployment and operation configuration resource", func() {
 		var operatorStartupTimeLowerBound time.Time
 		BeforeAll(func() {
 			operatorStartupTimeLowerBound = time.Now()
@@ -149,9 +159,12 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				operatorNamespace,
 				operatorHelmChart,
 				operatorHelmChartUrl,
-				images,
+				"",
+				&images,
 				true,
-				nil,
+				map[string]string{
+					"operator.instrumentation.enablePythonAutoInstrumentation": "true",
+				},
 			)
 		})
 
@@ -159,7 +172,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 			undeployOperator(operatorNamespace)
 		})
 
-		Describe("with a deployed Dash0 monitoring resource", func() {
+		Context("with a deployed Dash0 monitoring resource", func() {
 			BeforeAll(func() {
 				deployDash0MonitoringResourceWithRetry(
 					applicationUnderTestNamespace,
@@ -202,6 +215,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 					Entry("should instrument new Node.js deployments", workloadTypeDeployment, runtimeTypeNodeJs),
 					Entry("should instrument new JVM deployments", workloadTypeDeployment, runtimeTypeJvm),
 					Entry("should instrument new .NET deployments", workloadTypeDeployment, runtimeTypeDotnet),
+					Entry("should instrument new Python deployments", workloadTypeDeployment, runtimeTypePython),
 					Entry("should instrument new Node.js jobs", workloadTypeJob, runtimeTypeNodeJs),
 					Entry("should instrument new Node.js pods", workloadTypePod, runtimeTypeNodeJs),
 					Entry("should instrument new JVM pods", workloadTypePod, runtimeTypeJvm),
@@ -356,6 +370,76 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 			})
 
 			Describe("log collection", func() {
+				It("toggles OTEL_LOGS_EXPORTER=none with the log collection setting", func() {
+					Expect(installTestAppWorkload(
+						runtimeTypeJvm,
+						workloadTypeDeployment,
+						applicationUnderTestNamespace,
+						"",
+						nil,
+						nil,
+					)).To(Succeed())
+
+					By("verifying that the JVM deployment has been instrumented by the controller")
+					Eventually(func(g Gomega) {
+						verifyLabels(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeJvm,
+							workloadTypeDeployment,
+							true,
+							images,
+							"webhook",
+						)
+					}).Should(Succeed())
+
+					noneValue := "none"
+					By("verifying that OTEL_LOGS_EXPORTER=none has been added to the instrumented workload")
+					Eventually(func(g Gomega) {
+						verifyPodEnvVar(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeJvm,
+							workloadTypeDeployment,
+							"app",
+							"OTEL_LOGS_EXPORTER",
+							&noneValue,
+						)
+					}, 30*time.Second, pollingInterval).Should(Succeed())
+
+					By("disabling log collection for the namespace")
+					updateLogCollectionEnabledOfDash0MonitoringResource(applicationUnderTestNamespace, false)
+
+					By("verifying that OTEL_LOGS_EXPORTER has been removed from the re-instrumented workload")
+					Eventually(func(g Gomega) {
+						verifyPodEnvVar(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeJvm,
+							workloadTypeDeployment,
+							"app",
+							"OTEL_LOGS_EXPORTER",
+							nil,
+						)
+					}, 60*time.Second, pollingInterval).Should(Succeed())
+
+					By("re-enabling log collection for the namespace")
+					updateLogCollectionEnabledOfDash0MonitoringResource(applicationUnderTestNamespace, true)
+
+					By("verifying that OTEL_LOGS_EXPORTER=none is added back")
+					Eventually(func(g Gomega) {
+						verifyPodEnvVar(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeJvm,
+							workloadTypeDeployment,
+							"app",
+							"OTEL_LOGS_EXPORTER",
+							&noneValue,
+						)
+					}, 60*time.Second, pollingInterval).Should(Succeed())
+				})
+
 				It("collects pod logs, but does not collect the same logs twice when the collector pod is restarted", func() {
 					Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
 
@@ -494,7 +578,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				})
 			})
 
-			Describe("synchronizing Dash0 API resources", func() {
+			Context("synchronizing Dash0 API resources", func() {
 				BeforeAll(func() {
 					installDash0ApiMock()
 				})
@@ -516,7 +600,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 					)
 
 					//nolint:lll
-					routeRegex := "/api/synthetic-checks/dash0-operator_.*_default_e2e-application-under-test-namespace_synthetic-check-e2e-test\\?dataset=default"
+					routeRegex := "/api/synthetic-checks/dash0-operator_.*_default_e2e-test-ns_synthetic-check-e2e-test\\?dataset=default"
 
 					By("verifying the synthetic check has been synchronized to the Dash0 API via PUT")
 					req := fetchCapturedApiRequest(0)
@@ -549,6 +633,47 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				})
 
 				//nolint:dupl
+				It("should synchronize a Dash0SignalToMetrics to the Dash0 API", func() {
+					deploySignalToMetricsResource(
+						applicationUnderTestNamespace,
+						dash0ApiResourceValues{},
+					)
+
+					//nolint:lll
+					routeRegex := "/api/signal-to-metrics/dash0-operator_.*_default_e2e-test-ns_signal-to-metrics-e2e-test\\?dataset=default"
+
+					By("verifying the signal-to-metrics rule has been synchronized to the Dash0 API via PUT")
+					req := fetchCapturedApiRequest(0)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(req.Body).ToNot(BeNil())
+					Expect(*req.Body).To(ContainSubstring("E2E test signal-to-metrics rule"))
+					verifyApiSyncRequest(req)
+
+					setOptOutLabelInSignalToMetrics(applicationUnderTestNamespace, "false")
+					//nolint:lll
+					By("verifying the signal-to-metrics rule has been deleted via the Dash0 API (after setting dash0.com/enable=false)")
+					req = fetchCapturedApiRequest(1)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+
+					setOptOutLabelInSignalToMetrics(applicationUnderTestNamespace, "true")
+					//nolint:lll
+					By("verifying the signal-to-metrics rule has been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
+					req = fetchCapturedApiRequest(2)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(*req.Body).To(ContainSubstring("E2E test signal-to-metrics rule"))
+					verifyApiSyncRequest(req)
+
+					removeSignalToMetricsResource(applicationUnderTestNamespace)
+					By("verifying the signal-to-metrics rule has been deleted via the Dash0 API (after removing the resource)")
+					req = fetchCapturedApiRequest(3)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+				})
+
+				//nolint:dupl
 				It("should synchronize a view to the Dash0 API", func() {
 					deployViewResource(
 						applicationUnderTestNamespace,
@@ -556,7 +681,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 					)
 
 					//nolint:lll
-					routeRegex := "/api/views/dash0-operator_.*_default_e2e-application-under-test-namespace_view-e2e-test\\?dataset=default"
+					routeRegex := "/api/views/dash0-operator_.*_default_e2e-test-ns_view-e2e-test\\?dataset=default"
 
 					By("verifying the view has been synchronized to the Dash0 API via PUT")
 					req := fetchCapturedApiRequest(0)
@@ -589,14 +714,98 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				})
 
 				//nolint:dupl
-				It("should synchronize Perses dashboards to the Dash0 API", func() {
-					deployPersesDashboardResource(
+				It("should synchronize a notification channel to the Dash0 API", func() {
+					deployNotificationChannelResource(
+						applicationUnderTestNamespace,
+						dash0ApiResourceValues{},
+					)
+
+					// Notification channels are org-level, so the URL has no dataset query parameter.
+					//nolint:lll
+					routeRegex := "/api/notification-channels/dash0-operator_.*_e2e-test-ns_notification-channel-e2e-test"
+
+					By("verifying the notification channel has been synchronized to the Dash0 API via PUT")
+					req := fetchCapturedApiRequest(0)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(req.Body).ToNot(BeNil())
+					Expect(*req.Body).To(ContainSubstring("E2E test notification channel"))
+					verifyApiSyncRequest(req)
+
+					setOptOutLabelInNotificationChannel(applicationUnderTestNamespace, "false")
+					//nolint:lll
+					By("verifying the notification channel has been deleted via the Dash0 API (after setting dash0.com/enable=false)")
+					req = fetchCapturedApiRequest(1)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+
+					setOptOutLabelInNotificationChannel(applicationUnderTestNamespace, "true")
+					//nolint:lll
+					By("verifying the notification channel has been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
+					req = fetchCapturedApiRequest(2)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(*req.Body).To(ContainSubstring("E2E test notification channel"))
+					verifyApiSyncRequest(req)
+
+					removeNotificationChannelResource(applicationUnderTestNamespace)
+					By("verifying the notification channel has been deleted via the Dash0 API (after removing the resource)")
+					req = fetchCapturedApiRequest(3)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+				})
+
+				//nolint:dupl
+				It("should synchronize a spam filter to the Dash0 API", func() {
+					deploySpamFilterResource(
 						applicationUnderTestNamespace,
 						dash0ApiResourceValues{},
 					)
 
 					//nolint:lll
-					routeRegex := "/api/dashboards/dash0-operator_.*_default_e2e-application-under-test-namespace_perses-dashboard-e2e-test\\?dataset=default"
+					routeRegex := "/api/spam-filters/dash0-operator_.*_default_e2e-test-ns_spam-filter-e2e-test\\?dataset=default"
+
+					By("verifying the spam filter has been synchronized to the Dash0 API via PUT")
+					req := fetchCapturedApiRequest(0)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(req.Body).ToNot(BeNil())
+					Expect(*req.Body).To(ContainSubstring("k8s.namespace.name"))
+					verifyApiSyncRequest(req)
+
+					setOptOutLabelInSpamFilter(applicationUnderTestNamespace, "false")
+					By("verifying the spam filter has been deleted via the Dash0 API (after setting dash0.com/enable=false)\"")
+					req = fetchCapturedApiRequest(1)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+
+					setOptOutLabelInSpamFilter(applicationUnderTestNamespace, "true")
+					//nolint:lll
+					By("verifying the spam filter has been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
+					req = fetchCapturedApiRequest(2)
+					Expect(req.Method).To(Equal("PUT"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+					Expect(*req.Body).To(ContainSubstring("k8s.namespace.name"))
+					verifyApiSyncRequest(req)
+
+					removeSpamFilterResource(applicationUnderTestNamespace)
+					By("verifying the spam filter has been deleted via the Dash0 API (after removing the resource)")
+					req = fetchCapturedApiRequest(3)
+					Expect(req.Method).To(Equal("DELETE"))
+					Expect(req.Url).To(MatchRegexp(routeRegex))
+				})
+
+				runPersesDashboardSyncTest := func(persesDashboardCrdVersion string) {
+					verifyPersesDashboardCrdConversionWebhookConfigured(operatorNamespace)
+
+					deployPersesDashboardResource(
+						applicationUnderTestNamespace,
+						persesDashboardCrdVersion,
+						dash0ApiResourceValues{},
+					)
+
+					//nolint:lll
+					routeRegex := "/api/dashboards/dash0-operator_.*_default_e2e-test-ns_perses-dashboard-e2e-test-v1alpha\\d\\?dataset=default"
 
 					By("verifying the dashboard has been synchronized to the Dash0 API via PUT")
 					req := fetchCapturedApiRequest(0)
@@ -606,13 +815,13 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 					Expect(*req.Body).To(ContainSubstring("This is a test dashboard."))
 					verifyApiSyncRequest(req)
 
-					setOptOutLabelInPersesDashboard(applicationUnderTestNamespace, "false")
+					setOptOutLabelInPersesDashboard(applicationUnderTestNamespace, persesDashboardCrdVersion, "false")
 					By("verifying the dashboard has been deleted via the Dash0 API (after setting dash0.com/enable=false)\"")
 					req = fetchCapturedApiRequest(1)
 					Expect(req.Method).To(Equal("DELETE"))
 					Expect(req.Url).To(MatchRegexp(routeRegex))
 
-					setOptOutLabelInPersesDashboard(applicationUnderTestNamespace, "true")
+					setOptOutLabelInPersesDashboard(applicationUnderTestNamespace, persesDashboardCrdVersion, "true")
 					By("verifying the dashboard has been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
 					req = fetchCapturedApiRequest(2)
 					Expect(req.Method).To(Equal("PUT"))
@@ -620,11 +829,19 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 					Expect(*req.Body).To(ContainSubstring("This is a test dashboard."))
 					verifyApiSyncRequest(req)
 
-					removePersesDashboardResource(applicationUnderTestNamespace)
+					removePersesDashboardResource(applicationUnderTestNamespace, persesDashboardCrdVersion)
 					By("verifying the dashboard has been deleted via the Dash0 API (after removing the resource)")
 					req = fetchCapturedApiRequest(3)
 					Expect(req.Method).To(Equal("DELETE"))
 					Expect(req.Url).To(MatchRegexp(routeRegex))
+				}
+
+				It("should synchronize Perses v1alpha1 dashboards to the Dash0 API", func() {
+					runPersesDashboardSyncTest(persesDashboardV1Alpha1)
+				})
+
+				It("should synchronize Perses v1alpha2 dashboards to the Dash0 API", func() {
+					runPersesDashboardSyncTest(persesDashboardV1Alpha2)
 				})
 
 				//nolint:lll
@@ -634,78 +851,138 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 						dash0ApiResourceValues{},
 					)
 
-					routeRegexes := []string{
-						"/api/alerting/check-rules\\?dataset=default&idPrefix=dash0-operator_.*_default_e2e-application-under-test-namespace_prometheus-rules-e2e-test_",
-						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-application-under-test-namespace_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20Deployment%20replicas%20mismatch\\?dataset=default",
-						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-application-under-test-namespace_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20pod%20crash%20looping\\?dataset=default",
-						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-application-under-test-namespace_prometheus-rules-e2e-test_dash0%7Ccollector_exporter%20send%20failed%20spans\\?dataset=default",
+					listRouteRegexes := []string{
+						"/api/alerting/check-rules\\?dataset=default&originPrefix=dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_",
+						"/api/recording-rules\\?dataset=default&originPrefix=dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_",
+					}
+					ruleRouteRegexes := []string{
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20Deployment%20replicas%20mismatch\\?dataset=default",
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20pod%20crash%20looping\\?dataset=default",
+						"/api/recording-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_job%7Chttp_requests%7Crate5m\\?dataset=default",
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ccollector_exporter%20send%20failed%20spans\\?dataset=default",
 					}
 					substrings := []string{
 						"dash0/k8s - K8s Deployment replicas mismatch",
 						"dash0/k8s - K8s pod crash looping",
+						"dash0/k8s - job:http_requests:rate5m",
 						"dash0/collector - exporter send failed spans",
 					}
 
-					By("verifying the check rules have been synchronized to the Dash0 API via PUT")
-					requests := fetchCapturedApiRequests(0, 4)
-					Expect(requests).To(HaveLen(4))
-					Expect(requests[0].Method).To(Equal("GET"))
-					Expect(requests[0].Url).To(MatchRegexp(routeRegexes[0]))
-					regexIdx := 1
-					substringIdx := 0
-					for i := 1; i < 4; i++ {
-						req := requests[i]
+					By("verifying the rules have been synchronized to the Dash0 API via PUT")
+					requests := fetchCapturedApiRequests(0, 6)
+					Expect(requests).To(HaveLen(6))
+					for i := 0; i < 2; i++ {
+						Expect(requests[i].Method).To(Equal("GET"))
+						Expect(requests[i].Url).To(MatchRegexp(listRouteRegexes[i]))
+					}
+					for i := 0; i < 4; i++ {
+						req := requests[i+2]
 						Expect(req.Method).To(Equal("PUT"))
-						Expect(req.Url).To(MatchRegexp(routeRegexes[regexIdx]))
-						regexIdx++
+						Expect(req.Url).To(MatchRegexp(ruleRouteRegexes[i]))
 						Expect(req.Body).ToNot(BeNil())
-						Expect(*req.Body).To(ContainSubstring(substrings[substringIdx]))
+						Expect(*req.Body).To(ContainSubstring(substrings[i]))
 						verifyApiSyncRequest(req)
-						substringIdx++
 					}
 
 					setOptOutLabelInPrometheusRule(applicationUnderTestNamespace, "false")
-					By("verifying the check rules have been deleted via the Dash0 API (after setting dash0.com/enable=false)\"")
-					requests = fetchCapturedApiRequests(4, 3)
-					Expect(requests).To(HaveLen(3))
-					regexIdx = 1
-					for i := 0; i < 3; i++ {
+					By("verifying the rules have been deleted via the Dash0 API (after setting dash0.com/enable=false)\"")
+					requests = fetchCapturedApiRequests(6, 4)
+					Expect(requests).To(HaveLen(4))
+					for i := 0; i < 4; i++ {
 						req := requests[i]
 						Expect(req.Method).To(Equal("DELETE"))
-						Expect(req.Url).To(MatchRegexp(routeRegexes[regexIdx]))
-						regexIdx++
+						Expect(req.Url).To(MatchRegexp(ruleRouteRegexes[i]))
 					}
 
 					setOptOutLabelInPrometheusRule(applicationUnderTestNamespace, "true")
-					By("verifying the check rules have been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
-					requests = fetchCapturedApiRequests(7, 4)
-					Expect(requests).To(HaveLen(4))
-					Expect(requests[0].Method).To(Equal("GET"))
-					Expect(requests[0].Url).To(MatchRegexp(routeRegexes[0]))
-					regexIdx = 1
-					substringIdx = 0
-					for i := 1; i < 4; i++ {
-						req := requests[i]
+					By("verifying the rules have been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
+					requests = fetchCapturedApiRequests(10, 6)
+					Expect(requests).To(HaveLen(6))
+					for i := 0; i < 2; i++ {
+						Expect(requests[i].Method).To(Equal("GET"))
+						Expect(requests[i].Url).To(MatchRegexp(listRouteRegexes[i]))
+					}
+					for i := 0; i < 4; i++ {
+						req := requests[i+2]
 						Expect(req.Method).To(Equal("PUT"))
-						Expect(req.Url).To(MatchRegexp(routeRegexes[regexIdx]))
-						regexIdx++
-						Expect(*req.Body).To(ContainSubstring(substrings[substringIdx]))
+						Expect(req.Url).To(MatchRegexp(ruleRouteRegexes[i]))
+						Expect(*req.Body).To(ContainSubstring(substrings[i]))
 						verifyApiSyncRequest(req)
-						substringIdx++
 					}
 
 					removePrometheusRuleResource(applicationUnderTestNamespace)
-					By("verifying the check rules have been deleted via the Dash0 API (after removing the resource)")
-					requests = fetchCapturedApiRequests(11, 3)
-					Expect(requests).To(HaveLen(3))
-					regexIdx = 1
-					for i := 0; i < 3; i++ {
+					By("verifying the rules have been deleted via the Dash0 API (after removing the resource)")
+					requests = fetchCapturedApiRequests(16, 4)
+					Expect(requests).To(HaveLen(4))
+					for i := 0; i < 4; i++ {
 						req := requests[i]
 						Expect(req.Method).To(Equal("DELETE"))
-						Expect(req.Url).To(MatchRegexp(routeRegexes[regexIdx]))
-						regexIdx++
+						Expect(req.Url).To(MatchRegexp(ruleRouteRegexes[i]))
 					}
 				})
+
+				//nolint:lll
+				It("should resync Prometheus rules when synchronizePrometheusRules transitions from false to true", func() {
+					listRouteRegexes := []string{
+						"/api/alerting/check-rules\\?dataset=default&originPrefix=dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_",
+						"/api/recording-rules\\?dataset=default&originPrefix=dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_",
+					}
+					ruleRouteRegexes := []string{
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20Deployment%20replicas%20mismatch\\?dataset=default",
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_K8s%20pod%20crash%20looping\\?dataset=default",
+						"/api/recording-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ck8s_job%7Chttp_requests%7Crate5m\\?dataset=default",
+						"/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_dash0%7Ccollector_exporter%20send%20failed%20spans\\?dataset=default",
+					}
+					substrings := []string{
+						"dash0/k8s - K8s Deployment replicas mismatch",
+						"dash0/k8s - K8s pod crash looping",
+						"dash0/k8s - job:http_requests:rate5m",
+						"dash0/collector - exporter send failed spans",
+					}
+
+					By("disabling synchronization of Prometheus rules")
+					updateDash0MonitoringResource(
+						applicationUnderTestNamespace,
+						`{"spec":{"synchronizePrometheusRules":false}}`,
+					)
+					time.Sleep(5 * time.Second)
+
+					By("deploying a PrometheusRule resource while sync is disabled")
+					deployPrometheusRuleResource(
+						applicationUnderTestNamespace,
+						dash0ApiResourceValues{},
+					)
+
+					By("verifying no API requests are made while sync is disabled")
+					Consistently(func(g Gomega) {
+						storedRequests := getStoredApiRequests(g)
+						g.Expect(storedRequests).NotTo(BeNil())
+						g.Expect(storedRequests.Requests).To(BeEmpty())
+					}, 10*time.Second, 1*time.Second).Should(Succeed())
+
+					By("re-enabling synchronization of Prometheus rules")
+					updateDash0MonitoringResource(
+						applicationUnderTestNamespace,
+						`{"spec":{"synchronizePrometheusRules":true}}`,
+					)
+
+					By("verifying the rules have been synchronized after re-enabling sync")
+					requests := fetchCapturedApiRequests(0, 6)
+					Expect(requests).To(HaveLen(6))
+					for i := 0; i < 2; i++ {
+						Expect(requests[i].Method).To(Equal("GET"))
+						Expect(requests[i].Url).To(MatchRegexp(listRouteRegexes[i]))
+					}
+					for i := 0; i < 4; i++ {
+						req := requests[i+2]
+						Expect(req.Method).To(Equal("PUT"))
+						Expect(req.Url).To(MatchRegexp(ruleRouteRegexes[i]))
+						Expect(req.Body).ToNot(BeNil())
+						Expect(*req.Body).To(ContainSubstring(substrings[i]))
+						verifyApiSyncRequest(req)
+					}
+				})
+
 			})
 
 			//nolint:lll
@@ -755,6 +1032,20 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 				})
 			})
 
+			It("should not deploy the agent0-connector since the default for agent0Connector.enabled is `false`", func() {
+				agent0ConnectorDeployment := operatorHelmReleaseName + "-agent0-connector"
+				By("verifying that the agent0-connector deployment does not exist")
+				Expect(runAndIgnoreOutput(
+					exec.Command(
+						"kubectl",
+						"get",
+						"deployment",
+						"--namespace",
+						operatorNamespace,
+						agent0ConnectorDeployment,
+					), false, false, false)).ToNot(Succeed())
+			})
+
 		}) // end of suite "with an existing operator deployment and operation configuration resource::with a deployed
 		// Dash0 monitoring resource"
 
@@ -767,13 +1058,23 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 
 				It("should instrument and uninstrument all workload types", func() {
 					testIds := make(testIdMap)
-					workloadTestConfigs := workloadTestConfigs()
+					workloadTestConfigs := []runtimeWorkloadTestConfig{
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeCronjob, runtime: runtimeTypeNodeJs},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeDaemonSet, runtime: runtimeTypeNodeJs},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeDeployment, runtime: runtimeTypeNodeJs},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeDeployment, runtime: runtimeTypeJvm},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeDeployment, runtime: runtimeTypeDotnet},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeDeployment, runtime: runtimeTypePython},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeReplicaSet, runtime: runtimeTypeNodeJs},
+						{namespace: applicationUnderTestNamespace, workloadType: workloadTypeStatefulSet, runtime: runtimeTypeNodeJs},
+					}
+
 					for _, c := range workloadTestConfigs {
-						mapKey := getTestIdMapKey(c.runtime, c.workloadType)
+						mapKey := getTestIdMapKey(c.runtime, c.workloadType, applicationUnderTestNamespace)
 						testIds[mapKey] = generateNewTestId(c.runtime, c.workloadType)
 					}
 
-					deployWorkloadsForMultipleRuntimesInParallel(workloadTestConfigs, testIds)
+					deployWorkloadsInParallel(workloadTestConfigs, testIds)
 
 					deployDash0MonitoringResourceWithRetry(
 						applicationUnderTestNamespace,
@@ -781,19 +1082,6 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 						operatorNamespace,
 					)
 
-					// Note: On kind, this fails sometimes due to missing workload resource attribute
-					//  - k8s.deployment.name: ! FAILED - expected dash0-operator-nodejs-20-express-test-deployment but the
-					//    span has no such attribute
-					//  - k8s.pod.name: passed
-					//  - timestamp: skipped - no lower bound provided
-					//  - span.kind: passed
-					//  - http.target: passed
-					//  Expected
-					//      <bool>: false
-					//  to be true
-					//  In [It] at: /Users/bastian/dco/test/e2e/verify_instrumentation.go:64 @ 11/26/24 10:28:53.645
-					// No amount of retrying helps. Once the collector is in this state, all spans lack that resource
-					// attribute. See comment in spans.go#workloadSpansResourceMatcher.
 					runInParallel(workloadTestConfigs, func(c runtimeWorkloadTestConfig) {
 						By(fmt.Sprintf("verifying that the %s %s has been instrumented by the controller",
 							c.runtime.runtimeTypeLabel,
@@ -803,7 +1091,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 							applicationUnderTestNamespace,
 							c.runtime,
 							c.workloadType,
-							getTestIdFromMap(testIds, c.runtime, c.workloadType),
+							getTestIdFromMap(testIds, c.runtime, c.workloadType, applicationUnderTestNamespace),
 							images,
 							"controller",
 						)
@@ -823,7 +1111,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 							applicationUnderTestNamespace,
 							c.runtime,
 							c.workloadType,
-							getTestIdFromMap(testIds, c.runtime, c.workloadType),
+							getTestIdFromMap(testIds, c.runtime, c.workloadType, applicationUnderTestNamespace),
 							"controller",
 						)
 					})
@@ -851,7 +1139,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 							workloadTypeJob,
 							"Dash0 instrumentation of this workload by the controller has not been successful. "+
 								"Error message: Dash0 cannot instrument the existing job "+
-								"e2e-application-under-test-namespace/dash0-operator-nodejs-20-express-test-job, since "+
+								"e2e-test-ns/dash0-operator-nodejs-20-express-test-job, since "+
 								"this type of workload is immutable.",
 						)
 					}, labelChangeTimeout, pollingInterval).Should(Succeed())
@@ -928,7 +1216,7 @@ var _ = Describe("Dash0 Operator", Ordered, ContinueOnFailure, func() {
 							workloadTypeJob,
 							fmt.Sprintf("The controller's attempt to remove the Dash0 instrumentation from this "+
 								"workload has not been successful. Error message: Dash0 cannot remove the "+
-								"instrumentation from the existing job e2e-application-under-test-namespace/%s-job, "+
+								"instrumentation from the existing job e2e-test-ns/%s-job, "+
 								"since this type of workload is immutable.", runtimeTypeNodeJs.workloadName),
 						)
 					}, labelChangeTimeout, pollingInterval).Should(Succeed())
@@ -1176,7 +1464,7 @@ traces:
   span:
   - 'attributes["http.route"] == "/ready"'
 `
-					// minTimestampCollectorRestart := time.Now()
+					minTimestampCollectorConfigReload := time.Now()
 					deployDash0MonitoringResourceWithRetry(
 						applicationUnderTestNamespace,
 						dash0MonitoringValues{
@@ -1190,18 +1478,9 @@ traces:
 					verifyDaemonSetCollectorConfigMapContainsString(
 						operatorNamespace,
 						// nolint:lll
-						`- 'resource.attributes["k8s.namespace.name"] == "e2e-application-under-test-namespace" and (attributes["http.route"] == "/ready")'`,
+						`- 'resource.attributes["k8s.namespace.name"] == "e2e-test-ns" and (attributes["http.route"] == "/ready")'`,
 					)
-					// TODO reactivate this once we move these tests to the suite
-					// "with an existing operator deployment and operation configuration resource::without deployed Dash0
-					//  monitoring resource"
-					// (waits for https://github.com/open-telemetry/opentelemetry-go-contrib/pull/6984 to be merged and
-					// released)
-					// By("verify that the collector has restarted after the config change")
-					// Eventually(func(g Gomega) {
-					// 	mostRecentCollectorReadyTimeStamp := findMostRecentCollectorReadyLogLine(g)
-					// 	g.Expect(mostRecentCollectorReadyTimeStamp).To(BeTemporally(">", minTimestampCollectorRestart))
-					// }, 30*time.Second, time.Second).Should(Succeed())
+					verifyCollectorHasReloadedItsConfiguration(collectorDaemonSetNameQualified, minTimestampCollectorConfigReload)
 
 					testId := uuid.New().String()
 					timestampLowerBound := time.Now()
@@ -1250,7 +1529,7 @@ traces:
 trace_statements:
 - truncate_all(span.attributes, 10)
 `
-					// minTimestampCollectorRestart := time.Now()
+					minTimestampCollectorConfigReload := time.Now()
 					deployDash0MonitoringResourceWithRetry(
 						applicationUnderTestNamespace,
 						dash0MonitoringValues{
@@ -1267,18 +1546,9 @@ trace_statements:
 					)
 					verifyDaemonSetCollectorConfigMapContainsString(
 						operatorNamespace,
-						`- 'resource.attributes["k8s.namespace.name"] == "e2e-application-under-test-namespace"'`,
+						`- 'resource.attributes["k8s.namespace.name"] == "e2e-test-ns"'`,
 					)
-					// TODO reactivate this once we move these tests to the suite
-					// "with an existing operator deployment and operation configuration resource::without deployed Dash0
-					//  monitoring resource"
-					// (waits for https://github.com/open-telemetry/opentelemetry-go-contrib/pull/6984 to be merged and
-					// released)
-					// By("verify that the collector has restarted after the config change")
-					// Eventually(func(g Gomega) {
-					//	 mostRecentCollectorReadyTimeStamp := findMostRecentCollectorReadyLogLine(g)
-					//	 g.Expect(mostRecentCollectorReadyTimeStamp).To(BeTemporally(">", minTimestampCollectorRestart))
-					// }, 30*time.Second, time.Second).Should(Succeed())
+					verifyCollectorHasReloadedItsConfiguration(collectorDaemonSetNameQualified, minTimestampCollectorConfigReload)
 
 					testId := uuid.New().String()
 					timestampLowerBound := time.Now()
@@ -1318,14 +1588,379 @@ trace_statements:
 
 	}) // end of suite "with an existing operator deployment and operation configuration resource"
 
-	Describe("with an existing operator deployment without an operation configuration resource", func() {
+	// Intelligent Edge (IE) tests need their own operator install since IE swaps out the
+	// collector image.
+	//
+	// Gated behind E2E_ENABLE_INTELLIGENT_EDGE_TESTS=true so the e2e runs can be run without
+	// requring access to the currently private images by default.
+	if shouldRunIntelligentEdgeTests() {
+		Context("with the intelligent edge feature enabled", Ordered, func() {
+			BeforeAll(func() {
+				By("deploying the Dash0 operator with the intelligent-edge feature flag")
+				deployOperatorWithDefaultAutoOperationConfiguration(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					false,
+					map[string]string{
+						"operator.intelligentEdge.enabled": "true",
+					},
+				)
+
+				installDash0ApiMock()
+				installControlPlaneMock()
+				installDecisionMakerMock()
+			})
+
+			AfterEach(func() {
+				cleanupStoredApiRequests()
+			})
+
+			AfterAll(func() {
+				uninstallDecisionMakerMock()
+				uninstallControlPlaneMock()
+				uninstallDash0ApiMock()
+				undeployOperator(operatorNamespace)
+			})
+
+			//nolint:dupl
+			It("should synchronize a Dash0SamplingRule to the Dash0 API", func() {
+				deploySamplingRuleResource(dash0ApiResourceValues{})
+				defer removeSamplingRuleResource()
+
+				// Dash0SamplingRule is cluster-scoped, so the origin has no namespace segment.
+				//nolint:lll
+				routeRegex := "/api/sampling-rules/dash0-operator_.*_default_sampling-rule-e2e-test\\?dataset=default"
+
+				By("verifying the sampling rule has been synchronized to the Dash0 API via PUT")
+				req := fetchCapturedApiRequest(0)
+				Expect(req.Method).To(Equal("PUT"))
+				Expect(req.Url).To(MatchRegexp(routeRegex))
+				Expect(req.Body).ToNot(BeNil())
+				Expect(*req.Body).To(ContainSubstring("\"kind\":\"Dash0Sampling\""))
+				Expect(*req.Body).To(ContainSubstring("E2E test sampling rule"))
+				Expect(*req.Body).To(ContainSubstring("\"rate\":0.1"))
+				Expect(*req.Body).To(ContainSubstring("\"dash0.com/dataset\":\"default\""))
+				verifySamplingRuleApiSyncRequest(req)
+
+				setOptOutLabelInSamplingRule("false")
+				By("verifying the sampling rule has been deleted via the Dash0 API (after setting dash0.com/enable=false)")
+				req = fetchCapturedApiRequest(1)
+				Expect(req.Method).To(Equal("DELETE"))
+				Expect(req.Url).To(MatchRegexp(routeRegex))
+
+				setOptOutLabelInSamplingRule("true")
+				//nolint:lll
+				By("verifying the sampling rule has been synchronized to the Dash0 API via PUT (after setting dash0.com/enable=true)")
+				req = fetchCapturedApiRequest(2)
+				Expect(req.Method).To(Equal("PUT"))
+				Expect(req.Url).To(MatchRegexp(routeRegex))
+				Expect(*req.Body).To(ContainSubstring("E2E test sampling rule"))
+				Expect(*req.Body).To(ContainSubstring("\"rate\":0.1"))
+				verifySamplingRuleApiSyncRequest(req)
+
+				removeSamplingRuleResource()
+				By("verifying the sampling rule has been deleted via the Dash0 API (after removing the resource)")
+				req = fetchCapturedApiRequest(3)
+				Expect(req.Method).To(Equal("DELETE"))
+				Expect(req.Url).To(MatchRegexp(routeRegex))
+			})
+
+			Describe("with a deployed Dash0IntelligentEdge resource", Ordered, func() {
+				BeforeAll(func() {
+					deployIntelligentEdgeResource(intelligentEdgeValues{
+						DecisionMakerEndpoint:   decisionMakerMockGrpcEndpoint,
+						ControlPlaneApiEndpoint: controlPlaneMockServiceBaseUrl,
+					})
+				})
+
+				AfterAll(func() {
+					removeIntelligentEdgeResource()
+				})
+
+				It("deploys the Barker proxy wired to the configured Decision Maker endpoint", func() {
+					barkerDeployment := operatorHelmReleaseName + "-barker"
+
+					By("waiting for the Barker deployment to become available")
+					Eventually(func(g Gomega) {
+						g.Expect(runAndIgnoreOutput(exec.Command(
+							"kubectl",
+							"-n", operatorNamespace,
+							"wait", "--for=condition=Available",
+							"deployment/"+barkerDeployment,
+							"--timeout=30s",
+						))).To(Succeed())
+					}, 120*time.Second, 2*time.Second).Should(Succeed())
+
+					By("verifying the Barker service exists")
+					Expect(runAndIgnoreOutput(exec.Command(
+						"kubectl", "-n", operatorNamespace, "get", "service", barkerDeployment,
+					))).To(Succeed())
+
+					By("verifying the Barker container is configured with the Decision Maker mock endpoint")
+					upstream, err := run(exec.Command(
+						"kubectl",
+						"-n", operatorNamespace,
+						"get", "deployment", barkerDeployment,
+						"-o", `jsonpath={.spec.template.spec.containers[?(@.name=="barker")].env[?(@.name=="UPSTREAM_ADDRESS")].value}`,
+					), false)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(strings.TrimSpace(upstream)).To(Equal(decisionMakerMockGrpcEndpoint))
+
+					By("verifying that Barker actually connects upstream to the Decision Maker mock")
+					Eventually(func(g Gomega) {
+						counts := fetchDecisionMakerGrpcCallCounts(g)
+						g.Expect(counts).NotTo(BeEmpty())
+						// Barker opens both subscription streams (server-info + sampling-rules)
+						// on connect; either is sufficient signal that the upstream wiring
+						// works end-to-end.
+						g.Expect(counts["SubscribeServerInfo"]+counts["SubscribeSamplingRules"]).To(
+							BeNumerically(">", 0),
+							"expected at least one subscription RPC, got %v", counts)
+					}, 60*time.Second, pollingInterval).Should(Succeed())
+				})
+
+				It("reconfigures the collector daemonset to include the IE pipeline", func() {
+					expectedSnippets := []string{
+						"dash0settingsonedgeextension",
+						"dash0sampling:",
+						"dash0redmetrics:",
+						"dash0signaltometrics:",
+						"dash0filter:",
+						"dash0resource:",
+						"dash0operation:",
+						"traces/sampled:",
+						"forward/traces-to-sampling",
+					}
+
+					By("verifying the daemonset collector configmap contains the IE components")
+					for _, snippet := range expectedSnippets {
+						verifyDaemonSetCollectorConfigMapContainsString(operatorNamespace, snippet)
+					}
+
+					By("verifying the collector daemonset rolls out cleanly after the IE config change")
+					Expect(runAndIgnoreOutput(exec.Command(
+						"kubectl",
+						"-n", operatorNamespace,
+						"rollout", "status", collectorDaemonSetNameQualified,
+						"--timeout=120s",
+					))).To(Succeed())
+
+					By("verifying the dash0settingsonedgeextension polled the control-plane mock")
+					Eventually(func(g Gomega) {
+						stored := getStoredControlPlaneRequests(g)
+						g.Expect(stored).NotTo(BeNil())
+						hasSettingsCall := false
+						for _, r := range stored.Requests {
+							if r.Method == http.MethodGet && strings.Contains(r.Url, "/public/edge/settings") {
+								hasSettingsCall = true
+								break
+							}
+						}
+						g.Expect(hasSettingsCall).To(
+							BeTrue(),
+							"expected at least one GET /public/edge/settings on the control-plane mock, got %v",
+							stored.Requests,
+						)
+					}, 60*time.Second, pollingInterval).Should(Succeed())
+				})
+
+				Describe("with a workload sending traces", Ordered, func() {
+					BeforeAll(func() {
+						deployDash0MonitoringResourceWithRetry(
+							applicationUnderTestNamespace,
+							dash0MonitoringValuesDefault,
+							operatorNamespace,
+						)
+						By("verifying the collector daemonset rolls out cleanly after the Dash0Monitoring config change")
+						Expect(runAndIgnoreOutput(exec.Command(
+							"kubectl",
+							"-n", operatorNamespace,
+							"rollout", "status", collectorDaemonSetNameQualified,
+							"--timeout=120s",
+						))).To(Succeed())
+						Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+					})
+
+					AfterAll(func() {
+						removeAllTestApplications(applicationUnderTestNamespace)
+						undeployDash0MonitoringResource(applicationUnderTestNamespace)
+					})
+
+					It("emits dash0.spans.red metrics via the dash0redmetrics connector", func() {
+						timestampLowerBound := time.Now()
+						testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
+
+						By("driving trace activity through the test app")
+						verifyThatWorkloadHasBeenInstrumented(
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							testId,
+							images,
+							"webhook",
+						)
+
+						By("verifying the dash0redmetrics connector emitted dash0.spans.red_services")
+						Eventually(func(g Gomega) {
+							askTelemetryMatcherForMetricNames(
+								g,
+								shared.ExpectAtLeastOne,
+								[]string{"dash0.spans.red_services"},
+								timestampLowerBound,
+							)
+						}, 90*time.Second, pollingInterval).Should(Succeed())
+					})
+				})
+
+				It("tears down Barker and reverts the collector when the resource is deleted", func() {
+					barkerDeployment := operatorHelmReleaseName + "-barker"
+
+					removeIntelligentEdgeResource()
+
+					By("verifying the Barker deployment is removed")
+					Expect(runAndIgnoreOutput(exec.Command(
+						"kubectl",
+						"-n", operatorNamespace,
+						"wait", "--for=delete",
+						"deployment/"+barkerDeployment,
+						"--timeout=60s",
+					))).To(Succeed())
+
+					By("verifying the Barker service is removed")
+					Eventually(func(g Gomega) {
+						_, err := run(exec.Command(
+							"kubectl", "-n", operatorNamespace, "get", "service", barkerDeployment,
+						), false)
+						g.Expect(err).To(HaveOccurred())
+					}, 30*time.Second, pollingInterval).Should(Succeed())
+
+					By("verifying the daemonset collector configmap no longer references the IE pipeline")
+					Eventually(func(g Gomega) {
+						verifyConfigMapDoesNotContainStrings(operatorNamespace,
+							collectorDaemonSetConfigMapNameQualified, "dash0settingsonedgeextension")
+					}, 60*time.Second, pollingInterval).Should(Succeed())
+				})
+			})
+		}) // end of suite "with the intelligent edge feature enabled"
+	}
+
+	Context("with the agent0-connector enabled", Ordered, func() {
+		const agent0ConnectorDummyToken = "auth_e2e-agent0-connector-dummy-token"
+
+		agent0ConnectorDeployment := operatorHelmReleaseName + "-agent0-connector"
+
+		BeforeAll(func() {
+			By("installing the outbound-connector mock")
+			installOutboundConnectorMock()
+
+			By("deploying the Dash0 operator with the agent0-connector enabled")
+			deployOperatorWithDefaultAutoOperationConfiguration(
+				operatorNamespace,
+				operatorHelmChart,
+				operatorHelmChartUrl,
+				"",
+				&images,
+				false,
+				map[string]string{
+					"operator.agent0Connector.enabled":       "true",
+					"operator.agent0Connector.serverAddress": outboundConnectorMockGrpcEndpoint,
+					"operator.agent0Connector.token":         agent0ConnectorDummyToken,
+					"operator.agent0Connector.insecure":      "true",
+				},
+			)
+		})
+
+		AfterAll(func() {
+			undeployOperator(operatorNamespace)
+			uninstallOutboundConnectorMock()
+		})
+
+		It("establishes the command request stream and executes a kubectl command", func() {
+			By("determining the pseudo cluster UID (the UID of the kube-system namespace)")
+			pseudoClusterUid, err := run(exec.Command(
+				"kubectl",
+				"get", "namespace", "kube-system",
+				"-o", "jsonpath={.metadata.uid}",
+			), false)
+			Expect(err).ToNot(HaveOccurred())
+			pseudoClusterUid = strings.TrimSpace(pseudoClusterUid)
+			Expect(pseudoClusterUid).ToNot(BeEmpty())
+
+			By("waiting for the agent0-connector deployment to become available")
+			Eventually(func(g Gomega) {
+				g.Expect(runAndIgnoreOutput(exec.Command(
+					"kubectl",
+					"-n", operatorNamespace,
+					"wait", "--for=condition=Available",
+					"deployment/"+agent0ConnectorDeployment,
+					"--timeout=30s",
+				))).To(Succeed())
+			}, 120*time.Second, 2*time.Second).Should(Succeed())
+
+			By("verifying the agent0-connector subscribes with the expected client ID and authorization token")
+			Eventually(func(g Gomega) {
+				clients := fetchOutboundConnectorMockClients(g)
+				g.Expect(clients).To(HaveLen(1), "expected exactly one connected client, got %v", clients)
+				g.Expect(clients[0].ClientID).To(
+					Equal(pseudoClusterUid),
+					"client ID should be the pseudo cluster UID (kube-system namespace UID)")
+				g.Expect(clients[0].Authorization).To(
+					Equal("Bearer "+agent0ConnectorDummyToken),
+					"authorization should be the Helm-configured token, prefixed with \"Bearer \"")
+			}, 90*time.Second, pollingInterval).Should(Succeed())
+
+			By("triggering a \"kubectl get namespaces\" command request")
+			var requestId string
+			Eventually(func(g Gomega) {
+				requestId = triggerOutboundConnectorMockCommandRequest(
+					g,
+					pseudoClusterUid,
+					"kubectl",
+					[]string{"get", "namespaces"},
+				)
+			}, 30*time.Second, pollingInterval).Should(Succeed())
+
+			By("verifying the expected command response is received by the outbound-connector mock")
+			Eventually(func(g Gomega) {
+				responses := fetchOutboundConnectorMockCommandResponses(g)
+				var response *outboundConnectorMockCommandResponse
+				for i := range responses {
+					if responses[i].RequestID == requestId {
+						response = &responses[i]
+						break
+					}
+				}
+				g.Expect(response).ToNot(BeNil(),
+					"expected a command response for request ID %s, got %v", requestId, responses)
+				g.Expect(response.Timeout).To(BeFalse())
+				g.Expect(response.ExitCode).To(
+					BeEquivalentTo(0),
+					"kubectl get namespaces should succeed; stderr was: %s", response.Stderr)
+				g.Expect(response.Stdout).To(
+					ContainSubstring("kube-system"),
+					"stdout should list the kube-system namespace")
+				g.Expect(response.Stdout).To(
+					ContainSubstring("default"),
+					"stdout should list the default namespace")
+				g.Expect(response.Stdout).To(
+					ContainSubstring(operatorNamespace),
+					"stdout should list the operator namespace")
+			}, 90*time.Second, pollingInterval).Should(Succeed())
+		})
+	})
+
+	Context("with an existing operator deployment without an operation configuration resource", func() {
 		BeforeAll(func() {
 			By("deploying the Dash0 operator")
 			deployOperatorWithoutAutoOperationConfiguration(
 				operatorNamespace,
 				operatorHelmChart,
 				operatorHelmChartUrl,
-				images,
+				"",
+				&images,
 				nil,
 			)
 		})
@@ -1347,7 +1982,7 @@ trace_statements:
 		})
 	}) // end of suite "with an existing operator deployment without an operation configuration resource"
 
-	Describe("without an existing operator deployment", func() {
+	Context("without an existing operator deployment", func() {
 
 		Describe("collect basic metrics without having a Dash0 monitoring resource", func() {
 
@@ -1359,7 +1994,8 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					// We are verifying that no namespaced metrics are collected later on in this test, but
 					// self-monitoring metrics are namespaced, so we are deliberately disabling self-monitoring for this
 					// test.
@@ -1393,7 +2029,8 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					nil,
 				)
 				By("create an operator configuration resource with telemetryCollection.enabled=false")
@@ -1434,6 +2071,58 @@ trace_statements:
 			})
 		})
 
+		Describe("with operator.telemetryCollectionEnabled=false via Helm values", func() {
+
+			AfterAll(func() {
+				undeployOperator(operatorNamespace)
+			})
+
+			It("should not deploy collectors or the target allocator", func() {
+				By("deploying the Dash0 operator with telemetryCollectionEnabled=false via Helm values")
+				Expect(deployOperator(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					&startup.OperatorConfigurationValues{
+						Endpoint:                   defaultEndpoint,
+						ApiEndpoint:                dash0ApiMockServiceBaseUrl,
+						Token:                      defaultToken,
+						TelemetryCollectionEnabled: false,
+					},
+					nil,
+				)).To(Succeed())
+
+				waitForAutoOperatorConfigurationResourceToBecomeAvailable()
+
+				// Deploy a monitoring resource for the sole purpose of verifying that it can be deployed successfully and
+				// becomes ready.
+				deployDash0MonitoringResourceWithRetry(
+					applicationUnderTestNamespace,
+					dash0MonitoringValues{
+						InstrumentWorkloadsMode: dash0common.InstrumentWorkloadsModeNone,
+					},
+					operatorNamespace,
+				)
+
+				By("verifying that all telemetry-collection-related settings are disabled")
+				Eventually(func(g Gomega) {
+					operatorConfiguration := loadOperatorConfigurationResource(g, util.OperatorConfigurationAutoResourceName)
+					verifyThatAllTelemetrySettingsAreDisabledInOperatorConfiguration(g, operatorConfiguration)
+				}, 30*time.Second, pollingInterval).Should(Succeed())
+
+				// Verify that neither the collector daemon set, the collector deployment, nor the target allocator are created
+				// when telemetryCollectionEnabled is false.
+				By("validating that the OpenTelemetry collectors do not exist")
+				Consistently(func(g Gomega) {
+					verifyCollectorDaemonSetIsNotPresent(g)
+					verifyCollectorDeploymentIsNotPresent(g)
+				}, 20*time.Second, pollingInterval).Should(Succeed())
+				verifyThatTargetAllocatorIsNotDeployed(operatorNamespace)
+			})
+		})
+
 		Describe("when using cert-manager instead of auto-generated certs", func() {
 
 			BeforeAll(func() {
@@ -1446,7 +2135,8 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					true,
 					map[string]string{
 						"operator.certManager.useCertManager": "true",
@@ -1499,26 +2189,16 @@ trace_statements:
 			})
 		})
 
-		Describe("operator startup", func() {
-			AfterAll(func() {
-				undeployOperator(operatorNamespace)
-			})
-
-			It("should update instrumentation modifications at startup", func() {
-				testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
-				By("installing the Node.js deployment")
-				Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
-
-				// We initially deploy the operator with alternative image tags to simulate the workloads having
-				// been instrumented by outdated images. Then (later) we will redeploy the operator with the actual
-				// image names that are used throughout the whole test suite (defined by environment variables), to
-				// simulate updating the instrumentation.
-				initialAlternativeImages := deriveAlternativeImagesForUpdateTest(images)
+		// This test suite should be removed once Python auto-instrumentation is on by default.
+		Describe("with Python auto-instrumentation disabled", func() {
+			BeforeAll(func() {
+				By("deploying the Dash0 operator")
 				deployOperatorWithDefaultAutoOperationConfiguration(
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					initialAlternativeImages,
+					"",
+					&images,
 					true,
 					nil,
 				)
@@ -1527,28 +2207,418 @@ trace_statements:
 					dash0MonitoringValuesDefault,
 					operatorNamespace,
 				)
+			})
 
-				By("verifying that the Node.js deployment has been instrumented by the controller")
+			AfterAll(func() {
+				undeployDash0MonitoringResource(applicationUnderTestNamespace)
+				undeployOperator(operatorNamespace)
+			})
+
+			It("should not instrument Python if Python auto-instrumentation is not enabled", func() {
+				testId := generateNewTestId(runtimeTypePython, workloadTypeDeployment)
+				query := fmt.Sprintf("id=%s", testId)
+				By("installing the Python deployment")
+				Expect(installPythonDeployment(applicationUnderTestNamespace)).To(Succeed())
+
+				By("waiting for the Python deployment to get modified (polling its labels and events to check)")
+				Eventually(func(g Gomega) {
+					verifyLabels(
+						g,
+						applicationUnderTestNamespace,
+						runtimeTypePython,
+						workloadTypeDeployment,
+						true,
+						images,
+						"webhook",
+					)
+					verifySuccessfulInstrumentationEvent(
+						g,
+						applicationUnderTestNamespace,
+						runtimeTypePython,
+						workloadTypeDeployment,
+						"webhook",
+					)
+				}, labelChangeTimeout, pollingInterval).Should(Succeed())
+
+				waitForApplicationToBecomeResponsive(
+					runtimeTypePython,
+					workloadTypeDeployment,
+					testEndpoint,
+					query,
+				)
+				secondsToCheckForSpans := 20
+				By(
+					fmt.Sprintf("verifying that no spans are produced (checking for %d seconds)",
+						secondsToCheckForSpans,
+					))
+				timestampLowerBound := time.Now()
+				Consistently(func(g Gomega) {
+					verifyNoSpans(g, runtimeTypePython, workloadTypeDeployment, testEndpoint, query, timestampLowerBound)
+				}, time.Duration(secondsToCheckForSpans)*time.Second, 1*time.Second).Should(Succeed())
+			})
+		})
+
+		Context("with instrumentation delivery", func() {
+			Context("image volume", func() {
+				BeforeAll(func() {
+					if kubernetesMajor == 1 && kubernetesMinor < 35 {
+						Skip(fmt.Sprintf(
+							"image volumes require Kubernetes 1.35+, server is %d.%d",
+							kubernetesMajor, kubernetesMinor,
+						))
+					}
+					By("deploying the Dash0 operator")
+					deployOperatorWithDefaultAutoOperationConfiguration(
+						operatorNamespace,
+						operatorHelmChart,
+						operatorHelmChartUrl,
+						"",
+						&images,
+						true,
+						map[string]string{
+							"operator.instrumentation.delivery": "image-volume",
+						},
+					)
+					deployDash0MonitoringResourceWithRetry(
+						applicationUnderTestNamespace,
+						dash0MonitoringValuesDefault,
+						operatorNamespace,
+					)
+				})
+
+				AfterAll(func() {
+					undeployDash0MonitoringResource(applicationUnderTestNamespace)
+					undeployOperator(operatorNamespace)
+				})
+
+				//nolint:dupl
+				It("should instrument a workload with an image volume", func() {
+					testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
+					query := fmt.Sprintf("id=%s", testId)
+					By("installing the Node.js deployment")
+					Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+
+					By("waiting for the Node.js deployment to get instrumented")
+					Eventually(func(g Gomega) {
+						verifyLabels(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							true,
+							images,
+							"webhook",
+						)
+						instrumentationDeliveryAnnotation := readAnnotation(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							"dash0.com/instrumentation-delivery",
+						)
+						g.Expect(instrumentationDeliveryAnnotation).To(Equal("image-volume"))
+						verifySuccessfulInstrumentationEvent(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							"webhook",
+						)
+					}, labelChangeTimeout, pollingInterval).Should(Succeed())
+					waitForRollout(applicationUnderTestNamespace, runtimeTypeNodeJs, workloadTypeDeployment)
+					waitForApplicationToBecomeResponsive(
+						runtimeTypeNodeJs,
+						workloadTypeDeployment,
+						testEndpoint,
+						"",
+					)
+
+					By("verifying that the deployment's pod spec has a dash0-instrumentation image volume, " +
+						"no init container, and no emptyDir volume")
+					deploymentName := workloadName(runtimeTypeNodeJs, workloadTypeDeployment)
+					imageReference, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.volumes[?(@.name=='dash0-instrumentation')].image.reference}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(imageReference).ToNot(BeEmpty(), "the instrumented pod has no image volume")
+
+					initContainers, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.initContainers}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(initContainers).To(
+						BeEmpty(),
+						"the instrumented pod has an init container, it should have been instrumented with an image volume instead",
+					)
+
+					emptyDirVolumes, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.volumes[?(@.emptyDir)].name}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(emptyDirVolumes).To(
+						BeEmpty(),
+						"the instrumented pod has an emptydir volume, it should have been instrumented with an image volume instead",
+					)
+
+					By("waiting for spans to be captured")
+					spanTimeout := verifyTelemetryTimeout
+					timestampLowerBound := time.Now()
+					Eventually(func(g Gomega) {
+						verifySpans(
+							g,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							testEndpoint,
+							query,
+							timestampLowerBound,
+							true,
+						)
+					}, spanTimeout, pollingInterval).Should(Succeed())
+				})
+			})
+
+			Context("init container", func() {
+				BeforeAll(func() {
+					By("deploying the Dash0 operator")
+					deployOperatorWithDefaultAutoOperationConfiguration(
+						operatorNamespace,
+						operatorHelmChart,
+						operatorHelmChartUrl,
+						"",
+						&images,
+						true,
+						map[string]string{
+							"operator.instrumentation.delivery": "init-container",
+						},
+					)
+					deployDash0MonitoringResourceWithRetry(
+						applicationUnderTestNamespace,
+						dash0MonitoringValuesDefault,
+						operatorNamespace,
+					)
+				})
+
+				AfterAll(func() {
+					undeployDash0MonitoringResource(applicationUnderTestNamespace)
+					undeployOperator(operatorNamespace)
+				})
+
+				//nolint:dupl
+				It("should instrument a workload with an init container and emptydir volume", func() {
+					testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
+					query := fmt.Sprintf("id=%s", testId)
+					By("installing the Node.js deployment")
+					Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+
+					By("waiting for the Node.js deployment to get instrumented")
+					Eventually(func(g Gomega) {
+						verifyLabels(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							true,
+							images,
+							"webhook",
+						)
+						instrumentationDeliveryAnnotation := readAnnotation(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							"dash0.com/instrumentation-delivery",
+						)
+						g.Expect(instrumentationDeliveryAnnotation).To(Equal("init-container"))
+						verifySuccessfulInstrumentationEvent(
+							g,
+							applicationUnderTestNamespace,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							"webhook",
+						)
+					}, labelChangeTimeout, pollingInterval).Should(Succeed())
+					waitForRollout(applicationUnderTestNamespace, runtimeTypeNodeJs, workloadTypeDeployment)
+					waitForApplicationToBecomeResponsive(
+						runtimeTypeNodeJs,
+						workloadTypeDeployment,
+						testEndpoint,
+						"",
+					)
+
+					By("verifying that the deployment's pod spec has the the dash0-instrumentation init container, " +
+						"a dash0-instrumentation emptydir volume, and no image volume")
+					deploymentName := workloadName(runtimeTypeNodeJs, workloadTypeDeployment)
+					initContainer, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.initContainers[?(@.name=='dash0-instrumentation')].name}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(initContainer).ToNot(
+						BeEmpty(),
+						"the instrumented pod did not have the dash0-instrumentation init container",
+					)
+
+					emptyDirVolume, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.volumes[?(@.emptyDir)].name}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(emptyDirVolume).To(Equal("dash0-instrumentation"))
+
+					imageVolumes, err := run(exec.Command(
+						"kubectl",
+						"get",
+						"--namespace",
+						applicationUnderTestNamespace,
+						workloadTypeDeployment.workloadTypeString,
+						deploymentName,
+						"-o=jsonpath={.spec.template.spec.volumes[?(@.image)].name}",
+					))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(imageVolumes).To(
+						BeEmpty(),
+						"the instrumented pod has an image volume, it should have been instrumented with an init container",
+					)
+
+					By("waiting for spans to be captured")
+					spanTimeout := verifyTelemetryTimeout
+					timestampLowerBound := time.Now()
+					Eventually(func(g Gomega) {
+						verifySpans(
+							g,
+							runtimeTypeNodeJs,
+							workloadTypeDeployment,
+							testEndpoint,
+							query,
+							timestampLowerBound,
+							true,
+						)
+					}, spanTimeout, pollingInterval).Should(Succeed())
+				})
+			})
+		})
+
+		Describe("with configmap compression", func() {
+			BeforeAll(func() {
+				By("deploying the Dash0 operator with configmap compression enabled")
+				deployOperatorWithDefaultAutoOperationConfiguration(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					true,
+					map[string]string{
+						"operator.collectors.compressConfigMaps": "true",
+					},
+				)
+				deployDash0MonitoringResourceWithRetry(
+					applicationUnderTestNamespace,
+					dash0MonitoringValuesDefault,
+					operatorNamespace,
+				)
+			})
+
+			AfterAll(func() {
+				undeployDash0MonitoringResource(applicationUnderTestNamespace)
+				undeployOperator(operatorNamespace)
+			})
+
+			It("should produce telemetry when the collector config map is compressed", func() {
+				By("verifying that the collector config maps use binary data (compression)")
+				verifyCollectorConfigMapsAreCompressed(operatorNamespace)
+
+				testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
+
+				By("installing the Node.js deployment")
+				Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+
+				By("verifying that the Node.js workload has been instrumented by the webhook")
 				verifyThatWorkloadHasBeenInstrumented(
 					applicationUnderTestNamespace,
 					runtimeTypeNodeJs,
 					workloadTypeDeployment,
 					testId,
-					initialAlternativeImages,
+					images,
+					"webhook",
+				)
+			})
+		})
+
+		Describe("operator upgrade", func() {
+			AfterAll(func() {
+				undeployOperator(operatorNamespace)
+			})
+
+			// This test initially deploys the most recently published Helm chart (unless that is what this test suite run
+			// tests, then it will install the previous version). Then, in a second step we upgrade the operator with the
+			// chart and image names that are used throughout the whole test suite. That is usually the chart and images built
+			// from local sources, or alternatively the most recently published release. This simulates updating the operator
+			// to a new release.
+			It("should update instrumentations of workloads at startup", func() {
+				testId := generateNewTestId(runtimeTypeNodeJs, workloadTypeDeployment)
+				By("installing the Node.js deployment")
+				Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+
+				By("installing the previous operator release")
+				previousChartVersion := deployPreviousOperatorRelease()
+
+				deployDash0MonitoringResourceWithRetry(
+					applicationUnderTestNamespace,
+					dash0MonitoringValuesDefault,
+					operatorNamespace,
+				)
+
+				By("verifying that the Node.js deployment has been instrumented by the previous operator release")
+				verifyThatWorkloadHasBeenInstrumented(
+					applicationUnderTestNamespace,
+					runtimeTypeNodeJs,
+					workloadTypeDeployment,
+					testId,
+					createContainerImagesForHelmChartVersion(previousChartVersion),
 					"controller",
 				)
 
-				// Now update the operator with the actual image names that are used throughout the whole test suite.
-				upgradeOperator(
+				// Now upgrade the operator.
+				Expect(upgradeOperator(
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					// now we use :latest (or :main-dev or whatever has been provided via env vars) instead of
-					// :e2e-test to trigger an actual change
-					images,
-				)
+					"",
+					&images,
+					nil,
+					nil,
+				)).To(Succeed())
 
-				By("verifying that the Node.js deployment's instrumentation settings have been updated by the controller")
+				By("verifying that the Node.js deployment's instrumentation has been updated by the controller")
 				verifyThatWorkloadHasBeenInstrumented(
 					applicationUnderTestNamespace,
 					runtimeTypeNodeJs,
@@ -1568,7 +2638,8 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					nil,
 				)
 				time.Sleep(10 * time.Second)
@@ -1584,7 +2655,7 @@ trace_statements:
 			})
 
 			//nolint:lll
-			It("should update the daemon set collector configuration when updating the Dash0 endpoint in the operator configuration resource", func() {
+			It("should update and reload the collector configuration when updating the Dash0 endpoint in the operator configuration resource", func() {
 				deployDash0OperatorConfigurationResourceWithRetry(dash0OperatorConfigurationValues{
 					SelfMonitoringEnabled:      false,
 					Endpoint:                   defaultEndpoint,
@@ -1603,25 +2674,70 @@ trace_statements:
 					operatorNamespace,
 				)
 
-				By("waiting for the collector to be ready")
-				var firstCollectorReadyTimeStamp time.Time
+				By("waiting for the collectors to be ready")
+				var firstDaemonSetCollectorReadyTimeStamp time.Time
+				var firstDeploymentCollectorReadyTimeStamp time.Time
 				Eventually(func(g Gomega) {
-					firstCollectorReadyTimeStamp = findMostRecentCollectorReadyLogLine(g)
+					firstDaemonSetCollectorReadyTimeStamp = findCollectorReadyLogTimestamp(g, collectorDaemonSetNameQualified)
 				}, 30*time.Second, time.Second).Should(Succeed())
+				Eventually(func(g Gomega) {
+					firstDeploymentCollectorReadyTimeStamp = findCollectorReadyLogTimestamp(g, collectorDeploymentNameQualified)
+				}, 30*time.Second, time.Second).Should(Succeed())
+
+				daemonSetRestartCountsBeforeConfigChange := getDaemonSetCollectorPodRestartCounts(operatorNamespace)
+				deploymentRestartCountsBeforeConfigChange := getDeploymentCollectorPodRestartCounts(operatorNamespace)
 
 				By("updating the Dash0 operator configuration endpoint setting")
 				newEndpoint := "ingress.eu-east-1.aws.dash0-dev.com:4317"
-				updateEndpointOfDash0OperatorConfigurationResource(newEndpoint)
+				updateOperatorConfigurationExportEndpoint(newEndpoint)
 
-				By("verify that the config map has been updated by the controller")
+				By("verify that the config maps have been updated by the controller")
 				verifyDaemonSetCollectorConfigMapContainsString(operatorNamespace, newEndpoint)
+				verifyDeploymentCollectorConfigMapContainsString(operatorNamespace, newEndpoint)
 
-				By("verify that the collector has restarted and has become ready once more")
-				Eventually(func(g Gomega) {
-					secondCollectorReadyTimeStamp := findMostRecentCollectorReadyLogLine(g)
-					g.Expect(secondCollectorReadyTimeStamp).To(BeTemporally(">", firstCollectorReadyTimeStamp))
-				}, 2*time.Minute, time.Second).Should(Succeed())
+				verifyCollectorHasReloadedItsConfiguration(
+					collectorDaemonSetNameQualified,
+					firstDaemonSetCollectorReadyTimeStamp,
+				)
+				verifyCollectorHasReloadedItsConfiguration(
+					collectorDeploymentNameQualified,
+					firstDeploymentCollectorReadyTimeStamp,
+				)
 
+				// Verify that the collector has reloaded the configuration in-process, instead of restarting the process.
+				By("verify that the collectors have not restarted")
+				daemonSetRestartCountsAfterConfigChange := getDaemonSetCollectorPodRestartCounts(operatorNamespace)
+				Expect(daemonSetRestartCountsAfterConfigChange).To(HaveLen(len(daemonSetRestartCountsBeforeConfigChange)))
+				for podName, restartCountBefore := range daemonSetRestartCountsBeforeConfigChange {
+					restartCountAfter, ok := daemonSetRestartCountsAfterConfigChange[podName]
+					Expect(ok).To(BeTrue(), "daemonset collector pod is missing after config change")
+					Expect(restartCountAfter).To(
+						Equal(restartCountBefore),
+						fmt.Sprintf(
+							"Pod %s had a restart count of %d before the config change, and now has a restart count of %d,",
+							podName,
+							restartCountBefore,
+							restartCountAfter,
+						)+". This means it has been restarted due to the config change. This is unexpected, it should have "+
+							"reloaded the configuration in-process.",
+					)
+				}
+				deploymentRestartCountsAfterConfigChange := getDeploymentCollectorPodRestartCounts(operatorNamespace)
+				Expect(deploymentRestartCountsAfterConfigChange).To(HaveLen(len(deploymentRestartCountsBeforeConfigChange)))
+				for podName, restartCountBefore := range deploymentRestartCountsBeforeConfigChange {
+					restartCountAfter, ok := deploymentRestartCountsAfterConfigChange[podName]
+					Expect(ok).To(BeTrue(), "deployment collector pod is missing after config change")
+					Expect(restartCountAfter).To(
+						Equal(restartCountBefore),
+						fmt.Sprintf(
+							"Pod %s had a restart count of %d before the config change, and now has a restart count of %d,",
+							podName,
+							restartCountBefore,
+							restartCountAfter,
+						)+". This means it has been restarted due to the config change. This is unexpected, it should have "+
+							"reloaded the configuration in-process.",
+					)
+				}
 			})
 		})
 
@@ -1632,7 +2748,8 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					nil,
 				)
 				time.Sleep(10 * time.Second)
@@ -1667,10 +2784,12 @@ trace_statements:
 					operatorNamespace,
 					operatorHelmChart,
 					operatorHelmChartUrl,
-					images,
+					"",
+					&images,
 					&startup.OperatorConfigurationValues{
-						Endpoint: util.EndpointDash0Test,
+						Endpoint: testUtil.EndpointDash0Test,
 						// no token, no secret ref
+						TelemetryCollectionEnabled: true,
 					},
 					nil,
 				)
@@ -1685,8 +2804,8 @@ trace_statements:
 		Describe("operator removal", func() {
 
 			const (
-				namespace1 = "e2e-application-under-test-namespace-removal-1"
-				namespace2 = "e2e-application-under-test-namespace-removal-2"
+				namespace1 = "e2e-test-ns-removal-1"
+				namespace2 = "e2e-test-ns-removal-2"
 			)
 
 			BeforeAll(func() {
@@ -1710,12 +2829,12 @@ trace_statements:
 
 			configs := []removalTestNamespaceConfig{
 				{
-					namespace:    "e2e-application-under-test-namespace-removal-1",
+					namespace:    "e2e-test-ns-removal-1",
 					workloadType: workloadTypeDaemonSet,
 					runtime:      runtimeTypeNodeJs,
 				},
 				{
-					namespace:    "e2e-application-under-test-namespace-removal-2",
+					namespace:    "e2e-test-ns-removal-2",
 					workloadType: workloadTypeDeployment,
 					runtime:      runtimeTypeJvm,
 				},
@@ -1750,7 +2869,8 @@ trace_statements:
 						operatorNamespace,
 						operatorHelmChart,
 						operatorHelmChartUrl,
-						images,
+						"",
+						&images,
 						true,
 						nil,
 					)
@@ -1791,7 +2911,7 @@ trace_statements:
 
 					Eventually(func(g Gomega) {
 						for _, config := range configs {
-							verifyDash0MonitoringResourceDoesNotExist(g, config.namespace)
+							verifyDash0MonitoringResourceDoesNotExist(g, config.namespace, dash0MonitoringResourceName)
 						}
 						verifyDash0OperatorReleaseIsNotInstalled(g, operatorNamespace)
 					}).Should(Succeed())
@@ -1801,17 +2921,684 @@ trace_statements:
 			})
 		})
 
+		Context("auto-namespace monitoring", func() {
+
+			const (
+				namespaceExisting              = "e2e-test-ns-existing"
+				namespaceExistingAlwaysOptIn   = "e2e-test-ns-existing-opt-in"
+				namespaceExistingDefaultOptOut = "e2e-test-ns-existing-opt-out"
+				namespaceNew                   = "e2e-test-ns-new"
+				namespaceNewAlwaysOptIn        = "e2e-test-ns-new-opt-in"
+				namespaceNewDefaultOptOut      = "e2e-test-ns-new-opt-out"
+			)
+
+			var (
+				workloadTestConfigExisting = runtimeWorkloadTestConfig{
+					namespace:    namespaceExisting,
+					workloadType: workloadTypeDeployment,
+					runtime:      runtimeTypeNodeJs,
+				}
+				workloadTestConfigExistingAlwaysOptIn = runtimeWorkloadTestConfig{
+					namespace:    namespaceExistingAlwaysOptIn,
+					workloadType: workloadTypeReplicaSet,
+					runtime:      runtimeTypeNodeJs,
+				}
+				workloadTestConfigExistingDefaultOptOut = runtimeWorkloadTestConfig{
+					namespace:    namespaceExistingDefaultOptOut,
+					workloadType: workloadTypeStatefulSet,
+					runtime:      runtimeTypeNodeJs,
+				}
+				workloadTestConfigNew = runtimeWorkloadTestConfig{
+					namespace:    namespaceNew,
+					workloadType: workloadTypeDeployment,
+					runtime:      runtimeTypeDotnet,
+				}
+				workloadTestConfigNewAlwaysOptIn = runtimeWorkloadTestConfig{
+					namespace:    namespaceNewAlwaysOptIn,
+					workloadType: workloadTypeReplicaSet,
+					runtime:      runtimeTypeDotnet,
+				}
+				workloadTestConfigNewDefaultOptOut = runtimeWorkloadTestConfig{
+					namespace:    namespaceNewDefaultOptOut,
+					workloadType: workloadTypeStatefulSet,
+					runtime:      runtimeTypeDotnet,
+				}
+
+				allWorkloadTestConfigs = []runtimeWorkloadTestConfig{
+					workloadTestConfigExisting,
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigExistingDefaultOptOut,
+					workloadTestConfigNew,
+					workloadTestConfigNewAlwaysOptIn,
+					workloadTestConfigNewDefaultOptOut,
+				}
+			)
+
+			AfterEach(func() {
+				undeployDash0MonitoringResource(namespaceExisting)
+				undeployDash0MonitoringResource(namespaceExistingAlwaysOptIn)
+				undeployDash0MonitoringResource(namespaceExistingDefaultOptOut)
+				undeployDash0MonitoringResource(namespaceNew)
+				undeployDash0MonitoringResource(namespaceNewAlwaysOptIn)
+				undeployDash0MonitoringResource(namespaceNewDefaultOptOut)
+				removeAllTestApplications(namespaceExisting)
+				removeAllTestApplications(namespaceExistingAlwaysOptIn)
+				removeAllTestApplications(namespaceExistingDefaultOptOut)
+				removeAllTestApplications(namespaceNew)
+				removeAllTestApplications(namespaceNewAlwaysOptIn)
+				removeAllTestApplications(namespaceNewDefaultOptOut)
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceExisting, "--ignore-not-found"))
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceExistingAlwaysOptIn, "--ignore-not-found"))
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceExistingDefaultOptOut, "--ignore-not-found"))
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceNew, "--ignore-not-found"))
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceNewAlwaysOptIn, "--ignore-not-found"))
+				_ = runAndIgnoreOutput(
+					exec.Command("kubectl", "delete", "ns", namespaceNewDefaultOptOut, "--ignore-not-found"))
+				undeployOperator(operatorNamespace)
+			})
+
+			It("automatically monitors namespaces when managing the operator configuration resource manually", func() {
+				By("deploying the Dash0 operator")
+				deployOperatorWithoutAutoOperationConfiguration(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					nil,
+				)
+
+				testIds := make(testIdMap)
+
+				for _, c := range allWorkloadTestConfigs {
+					mapKey := getTestIdMapKey(c.runtime, c.workloadType, applicationUnderTestNamespace)
+					testIds[mapKey] = generateNewTestId(c.runtime, c.workloadType)
+				}
+
+				// Part One: Verify that existing namespaces as well as newly created namespaces are auto-monitored according
+				// to the default label selector.
+
+				By("auto-monitoring test, part I: automatically monitor with the default label selector")
+
+				recreateNamespace(namespaceExisting)
+				recreateNamespaceWithLabel(
+					namespaceExistingAlwaysOptIn,
+					map[string]string{"dash0.com/custom-auto-opt-in": "\"true\""},
+				)
+				recreateNamespaceWithLabel(
+					namespaceExistingDefaultOptOut,
+					map[string]string{
+						"dash0.com/enable":             "\"false\"",
+						"dash0.com/custom-auto-opt-in": "\"true\"",
+					})
+
+				deployDash0OperatorConfigurationResourceWithRetry(dash0OperatorConfigurationValues{
+					SelfMonitoringEnabled:          false,
+					Endpoint:                       defaultEndpoint,
+					Token:                          defaultToken,
+					ApiEndpoint:                    dash0ApiMockServiceBaseUrl,
+					ClusterName:                    e2eKubernetesContext,
+					TelemetryCollectionEnabled:     true,
+					AutoNamespaceMonitoringEnabled: true,
+				}, operatorNamespace, operatorHelmChart)
+
+				waitForMonitoringResourceToBecomeAvailable(namespaceExisting, util.MonitoringAutoResourceDefaultName)
+				waitForMonitoringResourceToBecomeAvailable(
+					namespaceExistingAlwaysOptIn,
+					util.MonitoringAutoResourceDefaultName,
+				)
+				verifyDash0MonitoringResourceDoesNotExist(
+					Default,
+					namespaceExistingDefaultOptOut,
+					util.MonitoringAutoResourceDefaultName,
+				)
+
+				recreateNamespace(namespaceNew)
+				recreateNamespaceWithLabel(
+					namespaceNewAlwaysOptIn,
+					map[string]string{"dash0.com/custom-auto-opt-in": "\"true\""},
+				)
+				recreateNamespaceWithLabel(
+					namespaceNewDefaultOptOut,
+					map[string]string{
+						"dash0.com/enable":             "\"false\"",
+						"dash0.com/custom-auto-opt-in": "\"true\"",
+					},
+				)
+
+				waitForMonitoringResourceToBecomeAvailable(namespaceNew, util.MonitoringAutoResourceDefaultName)
+				waitForMonitoringResourceToBecomeAvailable(namespaceNewAlwaysOptIn, util.MonitoringAutoResourceDefaultName)
+				verifyDash0MonitoringResourceDoesNotExist(
+					Default,
+					namespaceNewDefaultOptOut,
+					util.MonitoringAutoResourceDefaultName,
+				)
+
+				deployWorkloadsInParallel(allWorkloadTestConfigs, testIds)
+
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExisting,
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigNew,
+					workloadTestConfigNewAlwaysOptIn,
+				}, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s has been instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					verifyThatWorkloadHasBeenInstrumented(
+						c.namespace,
+						c.runtime,
+						c.workloadType,
+						getTestIdFromMap(testIds, c.runtime, c.workloadType, c.namespace),
+						images,
+						"webhook",
+					)
+				})
+				By("the workloads in all four namespaces have been instrumented")
+
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExistingDefaultOptOut,
+					workloadTestConfigNewDefaultOptOut,
+				}, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s has not been instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					verifyNoDash0LabelsOrOnlyOptOut(
+						Default,
+						c.namespace,
+						c.runtime,
+						c.workloadType,
+						false,
+					)
+				})
+
+				// Part Two: Change the label selector in the operator configuration and verifying that this change is applied
+				// correctly.
+
+				By("auto-monitoring test, part II: changing the auto-namespace-monitoring label selector")
+				updateOperatorConfigurationAutoNamespaceMonitoringLabelSelector("dash0.com/custom-auto-opt-in==true")
+
+				// The two namespaces that had opted out via the default opt-out label should now be monitored, since they
+				// also have the custom opt-in label.
+				waitForMonitoringResourceToBecomeAvailable(
+					namespaceExistingDefaultOptOut,
+					util.MonitoringAutoResourceDefaultName,
+				)
+				waitForMonitoringResourceToBecomeAvailable(
+					namespaceNewDefaultOptOut,
+					util.MonitoringAutoResourceDefaultName,
+				)
+
+				// The two namespaces that have not opted out via the default selector but also have not opted in via the
+				// custom selector should now be unmonitored.
+				Eventually(func(g Gomega) {
+					verifyDash0MonitoringResourceDoesNotExist(
+						g,
+						namespaceExisting,
+						util.MonitoringAutoResourceDefaultName,
+					)
+					verifyDash0MonitoringResourceDoesNotExist(
+						g,
+						namespaceNew,
+						util.MonitoringAutoResourceDefaultName,
+					)
+				}, 30*time.Second, time.Second)
+
+				// Check that for the two namespaces that don't opt out via the default selector and _also_ opt-in via the
+				// custom selector, the monitoring resource is still there.
+				waitForMonitoringResourceToBecomeAvailable(
+					namespaceExistingAlwaysOptIn,
+					util.MonitoringAutoResourceDefaultName,
+				)
+				waitForMonitoringResourceToBecomeAvailable(
+					namespaceNewAlwaysOptIn,
+					util.MonitoringAutoResourceDefaultName,
+				)
+
+				// Trivially modify the workloads - we run with instrumentWorkloads.mode=created-and-updated, simulate
+				// a change so that the instrumentation webhook will instrument the workloads.
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigExistingDefaultOptOut,
+					workloadTestConfigNewAlwaysOptIn,
+					workloadTestConfigNewDefaultOptOut,
+				}, func(c runtimeWorkloadTestConfig) {
+					Expect(addLabel(
+						c.namespace,
+						c.workloadType.workloadTypeString,
+						workloadName(c.runtime, c.workloadType),
+						"dummy-label=value",
+					)).To(Succeed())
+				})
+
+				// Verify that we receive telemetry from the apps in the namespaces that are now auto-monitored.
+				// (workloadTestConfigExistingDefaultOptOut and workloadTestConfigNewDefaultOptOut were initially not monitored
+				// before changing the label selector).
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigExistingDefaultOptOut,
+					workloadTestConfigNewAlwaysOptIn,
+					workloadTestConfigNewDefaultOptOut,
+				}, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s has been instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					verifyThatWorkloadHasBeenInstrumented(
+						c.namespace,
+						c.runtime,
+						c.workloadType,
+						getTestIdFromMap(testIds, c.runtime, c.workloadType, c.namespace),
+						images,
+						"webhook",
+					)
+				})
+				By("the workloads in all four namespaces have been instrumented")
+
+				// Verify that the apps in the namespaces that are now no longer auto-monitored have been uninstrumented. Both
+				// were initially auto-monitored/instrumented.
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExisting,
+					workloadTestConfigNew,
+				}, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s has not been instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					verifyNoDash0LabelsOrOnlyOptOut(
+						Default,
+						c.namespace,
+						c.runtime,
+						c.workloadType,
+						false,
+					)
+				})
+
+				// Part Three: Update the monitoring template and verify that all monitoring resources are updated accordingly.
+
+				By("auto-monitoring test, part III: update the monitoring template")
+				updateOperatorConfigurationMonitoringTemplateInstrumentWorkloadsMode(dash0common.InstrumentWorkloadsModeAll)
+				Eventually(func(g Gomega) {
+					for _, ns := range []string{
+						namespaceExistingDefaultOptOut,
+						namespaceNewDefaultOptOut,
+						namespaceExistingAlwaysOptIn,
+						namespaceNewAlwaysOptIn,
+					} {
+						verifyDash0MonitoringResourceInstrumentWorkloadsMode(
+							g,
+							ns,
+							util.MonitoringAutoResourceDefaultName,
+							dash0common.InstrumentWorkloadsModeAll,
+						)
+					}
+				}, 30*time.Second, time.Second).Should(Succeed())
+
+				// Part Four: Change the labels of two namespaces so that one previousyl unmonitored namespaces now becomes
+				// monitored, and a previously monitored becomes unmonitored.
+
+				By("auto-monitoring test, part IV: changing the labels on two namespaces now")
+				// namespaceExistingAlwaysOptIn no longer opts in.
+				Expect(runAndIgnoreOutput(
+					exec.Command(
+						"kubectl",
+						"label",
+						"--overwrite",
+						"namespace",
+						namespaceExistingAlwaysOptIn,
+						"dash0.com/custom-auto-opt-in=false",
+					))).To(Succeed())
+				// namespaceExisting is currently unmonitored, it opts in now.
+				Expect(runAndIgnoreOutput(
+					exec.Command(
+						"kubectl",
+						"label",
+						"namespace",
+						namespaceExisting,
+						"dash0.com/custom-auto-opt-in=true",
+					))).To(Succeed())
+
+				waitForMonitoringResourceToBecomeAvailable(namespaceExisting, util.MonitoringAutoResourceDefaultName)
+				// The new resource also should have been created according to the template set in part III.
+				verifyDash0MonitoringResourceInstrumentWorkloadsMode(
+					Default,
+					namespaceExisting,
+					util.MonitoringAutoResourceDefaultName,
+					dash0common.InstrumentWorkloadsModeAll,
+				)
+				Eventually(func(g Gomega) {
+					verifyDash0MonitoringResourceDoesNotExist(
+						g,
+						namespaceExistingAlwaysOptIn,
+						util.MonitoringAutoResourceDefaultName,
+					)
+				}, 30*time.Second, time.Second)
+
+				// Since we changed the instrument workloads mode to "all" previously, the workload in namespaceExisting should
+				// now be automatically instrumented.
+				verifyThatWorkloadHasBeenInstrumented(
+					namespaceExisting,
+					workloadTestConfigExisting.runtime,
+					workloadTestConfigExisting.workloadType,
+					getTestIdFromMap(
+						testIds,
+						workloadTestConfigExisting.runtime,
+						workloadTestConfigExisting.workloadType,
+						namespaceExisting,
+					),
+					images,
+					"controller",
+				)
+				verifyNoDash0LabelsOrOnlyOptOut(
+					Default,
+					namespaceExistingAlwaysOptIn,
+					workloadTestConfigExistingAlwaysOptIn.runtime,
+					workloadTestConfigExistingAlwaysOptIn.workloadType,
+					false,
+				)
+
+				// Part Five: Delete the auto-monitoring resource in a namespace and verify that it is recreated automatically.
+
+				By("auto-monitoring test, part V: deleting the auto-monitoring resource in namespaceExisting")
+				Expect(runAndIgnoreOutput(
+					exec.Command(
+						"kubectl",
+						"delete",
+						"--namespace",
+						namespaceExisting,
+						"dash0monitoring",
+						util.MonitoringAutoResourceDefaultName,
+						"--wait",
+					))).To(Succeed())
+
+				waitForMonitoringResourceToBecomeAvailable(namespaceExisting, util.MonitoringAutoResourceDefaultName)
+
+				// Part Six: Disable automatic namespace monitoring entirely. This deletes all remaining auto-monitoring
+				// resources, and the workloads in those namespaces will be uninstrumented.
+
+				By("auto-monitoring test, part VI: disabling automatic namespace monitoring")
+				updateOperatorConfigurationAutoNamespaceMonitoringEnabled(false)
+
+				// Namespaces that still had auto-monitoring resources at the end of part IV, which now should become unmonitored.
+				namespaces := []string{
+					namespaceExisting,
+					namespaceExistingDefaultOptOut,
+					namespaceNewDefaultOptOut,
+					namespaceNewAlwaysOptIn,
+				}
+				wlConfigs := []runtimeWorkloadTestConfig{
+					workloadTestConfigExisting,
+					workloadTestConfigExistingDefaultOptOut,
+					workloadTestConfigNewDefaultOptOut,
+					workloadTestConfigNewAlwaysOptIn,
+				}
+
+				Eventually(func(g Gomega) {
+					for _, ns := range namespaces {
+						verifyDash0MonitoringResourceDoesNotExist(g, ns, util.MonitoringAutoResourceDefaultName)
+					}
+				}, 60*time.Second, time.Second).Should(Succeed())
+
+				runInParallel(wlConfigs, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s is no longer instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					Eventually(func(g Gomega) {
+						verifyNoDash0LabelsOrOnlyOptOut(g, c.namespace, c.runtime, c.workloadType, false)
+					}, labelChangeTimeout, pollingInterval).Should(Succeed())
+				})
+			})
+
+			It("automatically monitors namespaces when managing the operator configuration resource via Helm", func() {
+				testIds := make(testIdMap)
+
+				for _, c := range allWorkloadTestConfigs {
+					mapKey := getTestIdMapKey(c.runtime, c.workloadType, applicationUnderTestNamespace)
+					testIds[mapKey] = generateNewTestId(c.runtime, c.workloadType)
+				}
+
+				recreateNamespaceWithLabel(
+					namespaceExistingAlwaysOptIn,
+					map[string]string{"dash0.com/custom-auto-opt-in": "\"true\""},
+				)
+
+				By("deploying the Dash0 operator")
+				customResourceName := "auto-monitoring-resource"
+				operatorConfigurationValues := startup.OperatorConfigurationValues{
+					Endpoint:              defaultEndpoint,
+					ApiEndpoint:           dash0ApiMockServiceBaseUrl,
+					Token:                 defaultToken,
+					SelfMonitoringEnabled: false,
+					KubernetesInfrastructureMetricsCollectionEnabled: true,
+					CollectPodLabelsAndAnnotationsEnabled:            true,
+					PrometheusCrdSupportEnabled:                      false,
+					TelemetryCollectionEnabled:                       true,
+				}
+				Expect(deployOperator(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					&operatorConfigurationValues,
+					map[string]string{
+						"operator.autoMonitorNamespaces.enabled":       "true",
+						"operator.autoMonitorNamespaces.labelSelector": "dash0.com/custom-auto-opt-in==true",
+						"operator.monitoringTemplate.metadata.name":    customResourceName,
+					},
+				)).To(Succeed())
+
+				waitForMonitoringResourceToBecomeAvailable(namespaceExistingAlwaysOptIn, customResourceName)
+				recreateNamespaceWithLabel(
+					namespaceNewAlwaysOptIn,
+					map[string]string{"dash0.com/custom-auto-opt-in": "\"true\""},
+				)
+				waitForMonitoringResourceToBecomeAvailable(namespaceNewAlwaysOptIn, customResourceName)
+
+				deployWorkloadsInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigNewAlwaysOptIn,
+				}, testIds)
+				runInParallel([]runtimeWorkloadTestConfig{
+					workloadTestConfigExistingAlwaysOptIn,
+					workloadTestConfigNewAlwaysOptIn,
+				}, func(c runtimeWorkloadTestConfig) {
+					By(fmt.Sprintf("verifying that the %s %s in namespace %s has been instrumented",
+						c.runtime.runtimeTypeLabel,
+						c.workloadType.workloadTypeString,
+						c.namespace,
+					))
+					verifyThatWorkloadHasBeenInstrumented(
+						c.namespace,
+						c.runtime,
+						c.workloadType,
+						getTestIdFromMap(testIds, c.runtime, c.workloadType, c.namespace),
+						images,
+						"webhook",
+					)
+				})
+				By("the workloads have been instrumented")
+
+				By("update the monitoring template via Helm")
+				Expect(upgradeOperator(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					&operatorConfigurationValues,
+					map[string]string{
+						"operator.autoMonitorNamespaces.enabled":                    "true",
+						"operator.autoMonitorNamespaces.labelSelector":              "dash0.com/custom-auto-opt-in==true",
+						"operator.monitoringTemplate.metadata.name":                 customResourceName,
+						"operator.monitoringTemplate.spec.instrumentWorkloads.mode": "all",
+					},
+				)).To(Succeed())
+				Eventually(func(g Gomega) {
+					for _, ns := range []string{
+						namespaceExistingAlwaysOptIn,
+						namespaceNewAlwaysOptIn,
+					} {
+						verifyDash0MonitoringResourceInstrumentWorkloadsMode(
+							g,
+							ns,
+							customResourceName,
+							dash0common.InstrumentWorkloadsModeAll,
+						)
+					}
+				}, 2*time.Minute, time.Second).Should(Succeed())
+			})
+		})
+
+		Context("iac periodic retry", Ordered, func() {
+			BeforeAll(func() {
+				installDash0ApiMock()
+
+				By("deploying the Dash0 operator with a short iac periodic retry interval")
+				deployOperatorWithDefaultAutoOperationConfiguration(
+					operatorNamespace,
+					operatorHelmChart,
+					operatorHelmChartUrl,
+					"",
+					&images,
+					true,
+					map[string]string{
+						"operator.iac.periodicRetry.interval": "20s",
+					},
+				)
+
+				deployDash0MonitoringResourceWithRetry(
+					applicationUnderTestNamespace,
+					dash0MonitoringValuesDefault,
+					operatorNamespace,
+				)
+			})
+
+			AfterEach(func() {
+				clearApiMockResponseOverrides()
+				cleanupStoredApiRequests()
+				removeDash0ApiSyncResources(applicationUnderTestNamespace)
+			})
+
+			AfterAll(func() {
+				undeployDash0MonitoringResource(applicationUnderTestNamespace)
+				uninstallDash0ApiMock()
+				undeployOperator(operatorNamespace)
+			})
+
+			// Note on the magic numbers below: the operator's API client transport retries a failed request up to
+			// WithTransportMaxRetries(2) times, i.e. one synchronization attempt issues up to 3 HTTP requests before it
+			// is considered failed. By failing exactly apiMockFailTimesForOneSyncAttempt (= 3) requests we make the first
+			// synchronization attempt fail entirely; the next request (the first request of the periodic retry attempt)
+			// then succeeds. A failing item therefore receives 3 (failed) + at least 1 (successful retry) = at least 4
+			// PUT requests. Without the periodic retry it would receive only 3.
+
+			It("retries a Prometheus rule synchronization after a transient server error (HTTP 503)", func() {
+				By("configuring the API mock to fail one alerting rule with HTTP 503 for the first sync attempt")
+				configureApiMockResponseOverrides(apiMockResponseOverride{
+					Method:         "PUT",
+					RouteSubstring: "crash",
+					StatusCode:     503,
+					Times:          apiMockFailTimesForOneSyncAttempt,
+				})
+
+				deployPrometheusRuleResource(applicationUnderTestNamespace, dash0ApiResourceValues{})
+
+				//nolint:lll
+				crashRulePutRegex := "^/api/alerting/check-rules/dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_.*crash.*\\?dataset=default$"
+				//nolint:lll
+				checkRuleListGetRegex := "^/api/alerting/check-rules\\?dataset=default&originPrefix=dash0-operator_.*_default_e2e-test-ns_prometheus-rules-e2e-test_"
+
+				By("verifying the operator performs a second synchronization attempt and the rule is synchronized")
+				Eventually(func(g Gomega) {
+					// A second full sync attempt re-issues the GET against the check-rules list endpoint; transport-level
+					// retries do not, so >= 2 list GETs proves a periodic retry happened.
+					g.Expect(countCapturedApiRequests(g, "GET", checkRuleListGetRegex)).To(
+						BeNumerically(">=", 2),
+						"expected at least two synchronization attempts (GET check-rules list)",
+					)
+					// The previously failing rule must have been PUT again after the first attempt failed.
+					g.Expect(countCapturedApiRequests(g, "PUT", crashRulePutRegex)).To(
+						BeNumerically(">=", apiMockFailTimesForOneSyncAttempt+1),
+						"expected the failing rule to be re-synchronized by the periodic retry",
+					)
+				}, 90*time.Second, 2*time.Second).Should(Succeed())
+			})
+
+			It("retries a Perses dashboard synchronization after rate limiting (HTTP 429)", func() {
+				verifyPersesDashboardCrdConversionWebhookConfigured(operatorNamespace)
+
+				By("configuring the API mock to fail the dashboard with HTTP 429 for the first sync attempt")
+				configureApiMockResponseOverrides(apiMockResponseOverride{
+					Method:         "PUT",
+					RouteSubstring: "perses-dashboard-e2e-test",
+					StatusCode:     429,
+					Times:          apiMockFailTimesForOneSyncAttempt,
+				})
+
+				deployPersesDashboardResource(applicationUnderTestNamespace, persesDashboardV1Alpha2, dash0ApiResourceValues{})
+
+				//nolint:lll
+				dashboardPutRegex := "^/api/dashboards/dash0-operator_.*_default_e2e-test-ns_perses-dashboard-e2e-test-v1alpha2\\?dataset=default$"
+
+				By("verifying the operator performs a second synchronization attempt and the dashboard is synchronized")
+				Eventually(func(g Gomega) {
+					g.Expect(countCapturedApiRequests(g, "PUT", dashboardPutRegex)).To(
+						BeNumerically(">=", apiMockFailTimesForOneSyncAttempt+1),
+						"expected the dashboard to be re-synchronized by the periodic retry",
+					)
+				}, 90*time.Second, 2*time.Second).Should(Succeed())
+			})
+
+			It("retries a Dash0 spam filter synchronization after a transient server error (HTTP 503)", func() {
+				By("configuring the API mock to fail the spam filter with HTTP 503 for the first sync attempt")
+				configureApiMockResponseOverrides(apiMockResponseOverride{
+					Method:         "PUT",
+					RouteSubstring: "spam-filter-e2e-test",
+					StatusCode:     503,
+					Times:          apiMockFailTimesForOneSyncAttempt,
+				})
+
+				deploySpamFilterResource(applicationUnderTestNamespace, dash0ApiResourceValues{})
+
+				//nolint:lll
+				spamFilterPutRegex := "^/api/spam-filters/dash0-operator_.*_default_e2e-test-ns_spam-filter-e2e-test\\?dataset=default$"
+
+				By("verifying the operator performs a second synchronization attempt and the spam filter is synchronized")
+				Eventually(func(g Gomega) {
+					g.Expect(countCapturedApiRequests(g, "PUT", spamFilterPutRegex)).To(
+						BeNumerically(">=", apiMockFailTimesForOneSyncAttempt+1),
+						"expected the spam filter to be re-synchronized by the periodic retry",
+					)
+				}, 90*time.Second, 2*time.Second).Should(Succeed())
+			})
+		})
+
 	}) // end of suite "without an existing operator deployment"
 
 	// Prometheus CRD tests
-	Describe("with an existing operator deployment and prometheusCrdSupport enabled", func() {
+	Context("with an existing operator deployment and prometheusCrdSupport enabled", func() {
 		BeforeAll(func() {
 			By("deploying the Dash0 operator")
 			deployOperatorWithDefaultAutoOperationConfiguration(
 				operatorNamespace,
 				operatorHelmChart,
 				operatorHelmChartUrl,
-				images,
+				"",
+				&images,
 				true,
 				map[string]string{
 					"operator.prometheusCrdSupportEnabled": "true",
@@ -1901,40 +3688,74 @@ trace_statements:
 			})
 		})
 	})
+
+	Context("with an existing operator deployment and profiling enabled", func() {
+		BeforeAll(func() {
+			By("deploying the Dash0 operator with profiling enabled")
+			deployOperatorWithDefaultAutoOperationConfiguration(
+				operatorNamespace,
+				operatorHelmChart,
+				operatorHelmChartUrl,
+				"",
+				&images,
+				false,
+				map[string]string{
+					"operator.profilingEnabled": "true",
+				},
+			)
+			deployDash0MonitoringResourceWithRetry(
+				applicationUnderTestNamespace,
+				dash0MonitoringValuesDefault,
+				operatorNamespace,
+			)
+			Expect(installNodeJsDeployment(applicationUnderTestNamespace)).To(Succeed())
+			deployEbpfProfiler(operatorNamespace, applicationUnderTestNamespace)
+		})
+
+		AfterAll(func() {
+			removeAllTestApplications(applicationUnderTestNamespace)
+			undeployDash0MonitoringResource(applicationUnderTestNamespace)
+			teardownEbpfProfiler(operatorNamespace)
+			undeployOperator(operatorNamespace)
+		})
+
+		// Note: This does currently not test whether undesired profiles (e.g. from the operator namespace) are dropped,
+		// but we have good coverage via the unit tests for that.
+		Describe("profiling data collection", func() {
+			It("should collect profiles", func() {
+				By("waiting for profiles to be captured")
+				timestampLowerBound := time.Now()
+				Eventually(func(g Gomega) {
+					verifyProfiles(g, timestampLowerBound, applicationUnderTestNamespace)
+				}, 120*time.Second, 5*time.Second).Should(Succeed())
+				By("matching profiles have been received")
+			})
+		})
+	})
 })
 
 type runtimeWorkloadTestConfig struct {
 	runtime      runtimeType
 	workloadType workloadType
+	namespace    string
 }
 
 func (c runtimeWorkloadTestConfig) GetMapKey() string {
-	return getTestIdMapKey(c.runtime, c.workloadType)
+	return getTestIdMapKey(c.runtime, c.workloadType, c.namespace)
 }
 
 func (c runtimeWorkloadTestConfig) GetLabel() string {
-	return fmt.Sprintf("%s %s", c.runtime.runtimeTypeLabel, c.workloadType.workloadTypeString)
-}
-
-func workloadTestConfigs() []runtimeWorkloadTestConfig {
-	return []runtimeWorkloadTestConfig{
-		{workloadType: workloadTypeCronjob, runtime: runtimeTypeNodeJs},
-		{workloadType: workloadTypeDaemonSet, runtime: runtimeTypeNodeJs},
-		{workloadType: workloadTypeDeployment, runtime: runtimeTypeNodeJs},
-		{workloadType: workloadTypeDeployment, runtime: runtimeTypeJvm},
-		{workloadType: workloadTypeDeployment, runtime: runtimeTypeDotnet},
-		{workloadType: workloadTypeReplicaSet, runtime: runtimeTypeNodeJs},
-		{workloadType: workloadTypeStatefulSet, runtime: runtimeTypeNodeJs},
-	}
+	return fmt.Sprintf("%s %s %s", c.runtime.runtimeTypeLabel, c.workloadType.workloadTypeString, c.namespace)
 }
 
 type deployHelmChartConfig struct {
 	runtime       runtimeType
 	workloadTypes []workloadType
+	namespace     string
 }
 
 func (c deployHelmChartConfig) GetMapKey() string {
-	return fmt.Sprintf("%s", c.runtime.runtimeTypeLabel)
+	return fmt.Sprintf("%s:%s", c.runtime.runtimeTypeLabel, c.namespace)
 }
 
 func (c deployHelmChartConfig) GetLabel() string {
@@ -1943,23 +3764,26 @@ func (c deployHelmChartConfig) GetLabel() string {
 		workloadTypeStrings = append(workloadTypeStrings, wt.workloadTypeString)
 	}
 	return fmt.Sprintf(
-		"deploy %s test app (workload types: %s)",
+		"deploy %s test app (workload types: %s) to namespace %s",
 		c.runtime.runtimeTypeLabel,
 		strings.Join(workloadTypeStrings, ", "),
+		c.namespace,
 	)
 }
 
-func deployWorkloadsForMultipleRuntimesInParallel(workloadTestConfigs []runtimeWorkloadTestConfig, testIds testIdMap) {
+func deployWorkloadsInParallel(workloadTestConfigs []runtimeWorkloadTestConfig, testIds testIdMap) {
 	// group test config workloads by runtime
-	deployConfigMap := make(map[runtimeType]deployHelmChartConfig)
+	deployConfigMap := make(map[string]deployHelmChartConfig)
 	for _, testCfg := range workloadTestConfigs {
-		if deployConfig, ok := deployConfigMap[testCfg.runtime]; ok {
+		key := testCfg.runtime.runtimeTypeLabel + ":" + testCfg.namespace
+		if deployConfig, ok := deployConfigMap[key]; ok {
 			deployConfig.workloadTypes = append(deployConfig.workloadTypes, testCfg.workloadType)
-			deployConfigMap[testCfg.runtime] = deployConfig
+			deployConfigMap[key] = deployConfig
 		} else {
-			deployConfigMap[testCfg.runtime] = deployHelmChartConfig{
+			deployConfigMap[key] = deployHelmChartConfig{
 				runtime:       testCfg.runtime,
 				workloadTypes: []workloadType{testCfg.workloadType},
+				namespace:     testCfg.namespace,
 			}
 		}
 	}
@@ -1969,7 +3793,7 @@ func deployWorkloadsForMultipleRuntimesInParallel(workloadTestConfigs []runtimeW
 		Expect(installTestAppWorkloads(
 			deployConfig.runtime,
 			deployConfig.workloadTypes,
-			applicationUnderTestNamespace,
+			deployConfig.namespace,
 			testIds,
 		)).To(Succeed())
 	})
@@ -1983,7 +3807,7 @@ type removalTestNamespaceConfig struct {
 }
 
 func (c removalTestNamespaceConfig) GetMapKey() string {
-	return getTestIdMapKey(c.runtime, c.workloadType)
+	return getTestIdMapKey(c.runtime, c.workloadType, c.namespace)
 }
 
 func (c removalTestNamespaceConfig) GetLabel() string {
@@ -1995,6 +3819,9 @@ func cleanupAll() {
 		By("removing namespace for application under test")
 		_ = runAndIgnoreOutput(exec.Command("kubectl", "delete", "ns", applicationUnderTestNamespace, "--ignore-not-found"))
 	}
+	uninstallDecisionMakerMock()
+	uninstallControlPlaneMock()
+	uninstallDash0ApiMock()
 	undeployOperator(operatorNamespace)
 	uninstallOtlpSink(&cleanupSteps)
 }
@@ -2007,4 +3834,7 @@ func determineUrls() {
 	determineTestAppBaseUrl(port)
 	determineTelemetryMatcherUrl(port)
 	determineDash0ApiMockBaseUrl(port)
+	determineControlPlaneMockBaseUrl(port)
+	determineDecisionMakerMockBaseUrl(port)
+	determineOutboundConnectorMockBaseUrl(port)
 }

@@ -10,15 +10,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
 	"github.com/dash0hq/dash0-operator/internal/targetallocator/taresources"
 	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -37,7 +36,7 @@ var (
 
 var _ = Describe("The target-allocator manager", Ordered, func() {
 	ctx := context.Background()
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	var createdObjectsTargetAllocatorManagerTest []client.Object
 
@@ -123,10 +122,10 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 				},
 			)
@@ -151,10 +150,10 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 				k8sClient,
 				dash0v1alpha1.Dash0OperatorConfigurationSpec{
 					TelemetryCollection: dash0v1alpha1.TelemetryCollection{
-						Enabled: ptr.To(true),
+						Enabled: new(true),
 					},
 					PrometheusCrdSupport: dash0v1alpha1.PrometheusCrdSupport{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 			)
@@ -184,7 +183,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 				k8sClient,
 				dash0v1beta1.Dash0MonitoringSpec{
 					PrometheusScraping: common.PrometheusScraping{
-						Enabled: ptr.To(false),
+						Enabled: new(false),
 					},
 				},
 				nsName,
@@ -249,7 +248,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			Expect(hasBeenReconciled).To(BeTrue())
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 
-			operatorConfigurationResource.Spec.TelemetryCollection.Enabled = ptr.To(false)
+			operatorConfigurationResource.Spec.TelemetryCollection.Enabled = new(false)
 			Expect(k8sClient.Update(ctx, operatorConfigurationResource)).To(Succeed())
 
 			hasBeenReconciled, err = targetAllocatorManager.ReconcileTargetAllocator(
@@ -280,7 +279,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			Expect(hasBeenReconciled).To(BeTrue())
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 
-			operatorConfigurationResource.Spec.PrometheusCrdSupport.Enabled = ptr.To(false)
+			operatorConfigurationResource.Spec.PrometheusCrdSupport.Enabled = new(false)
 			Expect(k8sClient.Update(ctx, operatorConfigurationResource)).To(Succeed())
 
 			hasBeenReconciled, err = targetAllocatorManager.ReconcileTargetAllocator(
@@ -312,7 +311,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 
 			monitoringResource.Spec.PrometheusScraping = common.PrometheusScraping{
-				Enabled: ptr.To(false),
+				Enabled: new(false),
 			}
 			Expect(k8sClient.Update(ctx, monitoringResource)).To(Succeed())
 
@@ -372,7 +371,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 
 			firstMonitoringResource.Spec.PrometheusScraping = common.PrometheusScraping{
-				Enabled: ptr.To(false),
+				Enabled: new(false),
 			}
 			Expect(k8sClient.Update(ctx, firstMonitoringResource)).To(Succeed())
 
@@ -431,7 +430,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			_, err := targetAllocatorManager.targetAllocatorResourceManager.DeleteResources(
 				ctx,
 				util.ExtraConfigDefaults,
-				&logger,
+				logger,
 			)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -447,7 +446,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 			Expect(hasBeenReconciled).To(BeTrue())
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 
-			targetAllocatorManager.UpdateExtraConfig(ctx, util.ExtraConfigDefaults, &logger)
+			targetAllocatorManager.UpdateExtraConfig(ctx, util.ExtraConfigDefaults, logger)
 			tatest.VerifyTargetAllocatorResources(ctx, k8sClient, operatorNamespace)
 		})
 
@@ -477,7 +476,7 @@ var _ = Describe("The target-allocator manager", Ordered, func() {
 					Effect:   corev1.TaintEffectNoSchedule,
 				},
 			}
-			targetAllocatorManager.UpdateExtraConfig(ctx, changedConfig, &logger)
+			targetAllocatorManager.UpdateExtraConfig(ctx, changedConfig, logger)
 
 			deployment := tatest.VerifyTargetAllocatorDeploymentExists(ctx, k8sClient, operatorNamespace)
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))

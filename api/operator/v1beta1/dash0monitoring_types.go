@@ -4,6 +4,7 @@
 package v1beta1
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 
@@ -15,7 +16,8 @@ import (
 
 	dash0operator "github.com/dash0hq/dash0-operator/api/operator"
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
-	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 // Dash0Monitoring is the schema for the Dash0Monitoring API
@@ -41,6 +43,9 @@ type Dash0Monitoring struct {
 // Dash0MonitoringSpec describes the details of monitoring a single Kubernetes namespace with Dash0 and sending
 // telemetry to an observability backend.
 type Dash0MonitoringSpec struct {
+	// Deprecated: Use `exports` instead. If both `export` and `exports` are specified, `export` will be ignored.
+	// The mutating webhook will automatically migrate `export` to `exports` if only `export` is specified.
+	//
 	// The configuration of the observability backend to which telemetry data will be sent. This property is optional.
 	// If not set, the operator will use the default export configuration from the cluster-wide
 	// Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
@@ -54,9 +59,25 @@ type Dash0MonitoringSpec struct {
 	// +kubebuilder:validation:Optional
 	Export *dash0common.Export `json:"export,omitempty"`
 
+	// The configuration of the observability backend(s) to which telemetry data will be sent. This property is optional.
+	// If not set, the operator will use the default export configuration from the cluster-wide
+	// Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
+	// the cluster, or if the Dash0OperatorConfiguration resource does not have at least one export defined, creating a
+	// Dash0Monitoring resource without export settings will result in an error.
+	//
+	// Each export can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters
+	// per export (i.e. Dash0 plus gRPC plus HTTP). This allows sending the same data to multiple targets simultaneously.
+	// When the exports setting is present, it has to contain at least one export with at least one exporter.
+	//
+	// +kubebuilder:validation:Optional
+	Exports []dash0common.Export `json:"exports,omitempty"`
+
 	// Settings for automatic instrumentation of workloads in the target namespace. This setting is optional, by default
 	// the operator will instrument existing workloads, as well as new workloads at deploy time and changed workloads
 	// when they are updated.
+	//
+	// Note: There are also instrumentWorkloads in the Dash0 operator configuration resource, for cluster-wide settings
+	// for workload instrumentation.
 	//
 	// +kubebuilder:validation:Optional
 	InstrumentWorkloads InstrumentWorkloads `json:"instrumentWorkloads,omitempty"`
@@ -124,19 +145,19 @@ type Dash0MonitoringSpec struct {
 
 	// If enabled, the operator will watch Perses dashboard resources in this namespace and create corresponding
 	// dashboards in Dash0 via the Dash0 API.
-	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-dashboards-with-the-operator
+	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-dashboards-with-the-operator
 	// for details. This setting is optional, it defaults to `true`.
 	//
 	// +kubebuilder:default=true
-	SynchronizePersesDashboards *bool `json:"synchronizePersesDashboards,omitempty"`
+	SynchronizePersesDashboards *bool `json:"synchronizePersesDashboards"`
 
 	// If enabled, the operator will watch Prometheus rule resources in this namespace and create corresponding check
 	// rules in Dash0 via the Dash0 API.
-	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-check-rules-with-the-operator
+	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-check-rules-with-the-operator
 	// for details. This setting is optional, it defaults to `true`.
 	//
 	// +kubebuilder:default=true
-	SynchronizePrometheusRules *bool `json:"synchronizePrometheusRules,omitempty"`
+	SynchronizePrometheusRules *bool `json:"synchronizePrometheusRules"`
 }
 
 type InstrumentWorkloads struct {
@@ -195,12 +216,12 @@ type InstrumentWorkloads struct {
 	// - workloads that do not have the label dash0.com/enable at all, or
 	// - workloads that have the label dash0.com/enable with a value other than "false".
 	//
-	// It is recommended to leave this setting unset (i.e. leave the default "dash0.com/enable!=false" in place), unless
+	// It is recommended to leave this setting unset (i.e., leave the default "dash0.com/enable!=false" in place), unless
 	// you have a specific use case that requires a different label selector. One such use case is implementing an
 	// opt-in model for workload instrumentation instead of the usual opt-out model. That is, instead of instrumenting
 	// all workloads by default and only disabling instrumentation for a few specific workloads, you want to
 	// deliberately turn on instrumentation for a few specific workloads and leave all others uninstrumented. Use a
-	// label selector with equals instead of not-equals to achieve this, i.e.
+	// label selector with equals instead of not-equals to achieve this, i.e.,
 	// spec.instrumentWorkloads.labelSelector="auto-instrument-this-workload-with-dash0=true".
 	//
 	// +kubebuilder:default=dash0.com/enable!=false
@@ -210,6 +231,31 @@ type InstrumentWorkloads struct {
 	//
 	// +kubebuilder:validation:Optional
 	TraceContext TraceContext `json:"traceContext,omitempty"`
+
+	// If set to true, the operator enables SQL query parameter capture in the language agents that support it. Currently
+	// this covers the OpenTelemetry Java agent's JDBC instrumentation and the OpenTelemetry .NET auto-instrumentation
+	// for Microsoft.Data.SqlClient and Entity Framework Core, by adding the following environment variables (all set to
+	// "true") to instrumented containers:
+	//   - OTEL_INSTRUMENTATION_JDBC_EXPERIMENTAL_CAPTURE_QUERY_PARAMETERS
+	//   - OTEL_DOTNET_EXPERIMENTAL_SQLCLIENT_ENABLE_TRACE_DB_QUERY_PARAMETERS
+	//   - OTEL_DOTNET_EXPERIMENTAL_EFCORE_ENABLE_TRACE_DB_QUERY_PARAMETERS
+	// Recorded query parameter values are added to the resulting database span attributes. Other language agents ignore
+	// these variables.
+	//
+	// If a container already has one of these environment variables set to a value other than "true", the existing value
+	// is preserved.
+	//
+	// Note: These are experimental upstream OpenTelemetry agent flags and may be renamed or removed in future agent
+	// releases. Recorded query parameter values may include sensitive data such as personally identifiable information
+	// (PII), so enable this only for namespaces where capturing query parameter values is acceptable.
+	//
+	// By default, the value is not set and the environment variables will not be added to workloads. If this option is
+	// set to true at some point and then later set to false or removed, the operator will remove each environment
+	// variable from instrumented workloads if and only if its current value still matches what the operator would have
+	// set ("true").
+	//
+	// +kubebuilder:validation:Optional
+	CaptureSqlQueryParameters *bool `json:"captureSqlQueryParameters,omitempty"`
 }
 
 type TraceContext struct {
@@ -233,6 +279,29 @@ type TraceContext struct {
 	Propagators *string `json:"propagators,omitempty"`
 }
 
+// NamespaceInstrumentationConfig holds configuration values relevant for instrumenting workloads which apply to one
+// namespace, e.g. settings from the monitoring resource.
+type NamespaceInstrumentationConfig struct {
+	InstrumentationLabelSelector    string
+	TraceContextPropagators         *string
+	PreviousTraceContextPropagators *string
+	// CaptureSqlQueryParameters reflects spec.instrumentWorkloads.captureSqlQueryParameters. When true, the workload
+	// modifier sets the SQL query parameter capture environment variables to "true" on instrumented containers.
+	CaptureSqlQueryParameters *bool
+	// PreviousCaptureSqlQueryParameters reflects the CaptureSqlQueryParameters value at the time of the previous
+	// reconcile. Used during uninstrumentation / re-instrumentation to decide whether to remove previously set SQL
+	// query parameter capture environment variables.
+	PreviousCaptureSqlQueryParameters *bool
+	// LogCollectionEnabled is true if the operator collects pod logs from this namespace via the collector's file_log
+	// receiver. When true, the workload modifier sets OTEL_LOGS_EXPORTER=none on instrumented containers to prevent
+	// the workload's own OTel SDK from also exporting logs via OTLP (which would result in duplicates).
+	LogCollectionEnabled bool
+	// PreviousLogCollectionEnabled reflects the LogCollectionEnabled value at the time of the previous reconcile. Used
+	// during uninstrumentation / re-instrumentation to decide whether to remove a previously set OTEL_LOGS_EXPORTER
+	// env var.
+	PreviousLogCollectionEnabled bool
+}
+
 // Dash0MonitoringStatus defines the observed state of the Dash0Monitoring monitoring resource.
 type Dash0MonitoringStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
@@ -240,6 +309,12 @@ type Dash0MonitoringStatus struct {
 	// The spec.instrumentWorkloads.mode setting that has been observed in the previous reconcile cycle.
 	// +kubebuilder:validation:Optional
 	PreviousInstrumentWorkloads InstrumentWorkloads `json:"previousInstrumentWorkloads,omitempty"`
+
+	// The spec.logCollection setting that has been observed in the previous reconcile cycle. Used to detect when log
+	// collection has been toggled, which requires re-instrumenting workloads so that OTEL_LOGS_EXPORTER is
+	// added/removed accordingly.
+	// +kubebuilder:validation:Optional
+	PreviousLogCollection dash0common.LogCollection `json:"previousLogCollection,omitempty"`
 
 	// Shows results of synchronizing Perses dashboard resources in this namespace via the Dash0 API.
 	// +kubebuilder:validation:Optional
@@ -259,7 +334,7 @@ func (d *Dash0Monitoring) ReadInstrumentWorkloadsMode() dash0common.InstrumentWo
 	if instrumentWorkloadsMode == "" {
 		return dash0common.InstrumentWorkloadsModeAll
 	}
-	if !slices.Contains(dash0common.AllInstrumentWorkloadsMode, instrumentWorkloadsMode) {
+	if !slices.Contains(dash0common.AllInstrumentWorkloadsModes, instrumentWorkloadsMode) {
 		return dash0common.InstrumentWorkloadsModeAll
 	}
 	return instrumentWorkloadsMode
@@ -418,12 +493,99 @@ func (d *Dash0Monitoring) At(list client.ObjectList, index int) dash0operator.Da
 	return &list.(*Dash0MonitoringList).Items[index]
 }
 
-func (d *Dash0Monitoring) GetNamespaceInstrumentationConfig() util.NamespaceInstrumentationConfig {
-	return util.NamespaceInstrumentationConfig{
-		InstrumentationLabelSelector:    d.Spec.InstrumentWorkloads.LabelSelector,
-		TraceContextPropagators:         d.Spec.InstrumentWorkloads.TraceContext.Propagators,
-		PreviousTraceContextPropagators: d.Status.PreviousInstrumentWorkloads.TraceContext.Propagators,
+func (d *Dash0Monitoring) GetNamespaceInstrumentationConfig() NamespaceInstrumentationConfig {
+	return NamespaceInstrumentationConfig{
+		InstrumentationLabelSelector:      d.Spec.InstrumentWorkloads.LabelSelector,
+		TraceContextPropagators:           d.Spec.InstrumentWorkloads.TraceContext.Propagators,
+		PreviousTraceContextPropagators:   d.Status.PreviousInstrumentWorkloads.TraceContext.Propagators,
+		CaptureSqlQueryParameters:         d.Spec.InstrumentWorkloads.CaptureSqlQueryParameters,
+		PreviousCaptureSqlQueryParameters: d.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters,
+		LogCollectionEnabled:              pointers.ReadBoolPointerWithDefault(d.Spec.LogCollection.Enabled, true),
+		PreviousLogCollectionEnabled:      pointers.ReadBoolPointerWithDefault(d.Status.PreviousLogCollection.Enabled, true),
 	}
+}
+
+// EffectiveExports returns Exports if set, otherwise wraps the deprecated Export field into a single-element slice.
+// This ensures code that reads exports works for resources that have not yet been migrated by the mutating webhook.
+func (d *Dash0Monitoring) EffectiveExports() []dash0common.Export {
+	if len(d.Spec.Exports) > 0 {
+		return d.Spec.Exports
+	}
+	//nolint:staticcheck
+	if d.Spec.Export != nil {
+		//nolint:staticcheck
+		return []dash0common.Export{*d.Spec.Export}
+	}
+	return nil
+}
+
+func (d *Dash0Monitoring) HasExportsConfigured() bool {
+	return d != nil && len(d.EffectiveExports()) > 0
+}
+
+func (d *Dash0Monitoring) HasDash0ExportConfigured() bool {
+	for _, export := range d.EffectiveExports() {
+		if export.HasDash0ExportConfigured() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (d *Dash0Monitoring) ExportsCount() int {
+	if !d.HasExportsConfigured() {
+		return 0
+	} else {
+		return dash0common.CountExports(d.EffectiveExports())
+	}
+}
+
+func (d *Dash0Monitoring) HasDash0ApiAccessConfigured() bool {
+	for _, export := range d.EffectiveExports() {
+		if export.HasDash0ApiAccessConfigured() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (d *Dash0Monitoring) GetDash0Exports() []dash0common.Dash0Configuration {
+	var res []dash0common.Dash0Configuration
+	for _, export := range d.EffectiveExports() {
+		// intentionally not doing any further filtering here, as validation will happen later where errors are properly logged
+		if export.Dash0 != nil {
+			res = append(res, *export.Dash0)
+		}
+	}
+	return res
+}
+
+func (d *Dash0Monitoring) LogResourceAsEvent(logger logd.Logger) {
+	redactedMonitoringResource := d.cloneAndRedact()
+	if redactedMonitoringResourceMarshalled, err := json.Marshal(redactedMonitoringResource); err != nil {
+		logger.Error(err, "cannot marshal Dash0Monitoring resource for dash0.monitoring_resource event")
+	} else {
+		logger.Info(
+			// per https://opentelemetry.io/docs/specs/semconv/general/events, events should not use the log body
+			"",
+			"otel.event.name", "dash0.monitoring_resource",
+			"dash0.monitoring.monitoring_resource.snapshot", string(redactedMonitoringResourceMarshalled),
+			"dash0.monitoring.monitoring_resource.namespace", d.GetNamespace(),
+			"dash0.monitoring.monitoring_resource.name", d.GetName(),
+		)
+	}
+}
+
+func (d *Dash0Monitoring) cloneAndRedact() Dash0Monitoring {
+	redactedResource := Dash0Monitoring{}
+	d.DeepCopyInto(&redactedResource)
+	redactedResource.ManagedFields = nil
+	for _, export := range redactedResource.EffectiveExports() {
+		export.Redact()
+	}
+	return redactedResource
 }
 
 //+kubebuilder:object:root=true
@@ -433,8 +595,4 @@ type Dash0MonitoringList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Dash0Monitoring `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&Dash0Monitoring{}, &Dash0MonitoringList{})
 }

@@ -26,6 +26,13 @@ The directory `test/util` contains additional Go code only used in unit tests.
 The directory `test/e2e` contains the end-to-end test suite.
 The directory `test-resources` contains a collection of scripts for running semi-manual tests scenarios.
 
+## Formatting
+
+Use the current year in the license header comment when adding new files.
+Do not update the copyright year when editing files.
+Use lines of 120 characters when formatting files with line breaks.
+Use 120 characters per line when formatting comments in Go code.
+
 ## Make Commands
 
 Build, lint and test tasks in this repository are performed via the Makefile in the root of the repository.
@@ -33,6 +40,8 @@ Build, lint and test tasks in this repository are performed via the Makefile in 
 - make build: build the Go code
 - make lint: run all static code analysis checks (Go, Helm, shell scripts).
 - make test: run all unit tests (Go, Helm chart unit tests)
+    - To only run the Go unit tests, run `make go-unit-tests`.
+    - To only run the Helm chart unit tests, run `make helm-unit-tests`.
 - make images: build all container images used by the operator.
 
 ## Common Workflows
@@ -49,3 +58,8 @@ Start by making changes to the Go code in `api/operator`.
 Then run `make manifests generate` to update the Kustomize source files in `config/crd`.
 The resulting changes in the directory `config/crd` need to be carried over to the respective files in
 `helm-chart/dash0-operator/templates/operator`, which are the Helm chart templates.
+
+CRD specs must be fully typed with structured Go types (enums, nested objects, required/optional markers, and
+kubebuilder validation annotations). Do not use opaque string fields to hold structured data. Validate the Go types
+against the canonical OpenAPI spec in `https://github.com/dash0hq/dash0hq/dash0/tree/main/modules/openapi-types/internal/spec/` to ensure they match the Dash0 API
+object schemas.

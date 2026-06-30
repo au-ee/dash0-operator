@@ -61,17 +61,29 @@ verify_kubectx() {
 }
 
 setup_test_environment () {
+  local target_namespace="${1:-$default_target_ns}"
   if ! docker info > /dev/null 2>&1; then
     echo "This script uses docker, but it looks like Docker is not running. Please start docker and try again."
     exit 1
   fi
 
-  test-resources/bin/render-templates.sh
+  test-resources/bin/render-templates.sh "$target_namespace"
   determine_container_images
   determine_test_app_images
 
   install_cert_manager_if_necessary
   install_nginx_ingress
+
+  # Do not accidentally add monitoring resources to the following namespaces when testing namespace auto-monitoring.
+  if kubectl get ns cert-manager &> /dev/null; then
+    kubectl label namespace cert-manager --overwrite dash0.com/enable=false
+  fi
+  if kubectl get ns default &> /dev/null; then
+    kubectl label namespace default --overwrite dash0.com/enable=false
+  fi
+  if kubectl get ns ingress-nginx &> /dev/null; then
+    kubectl label namespace ingress-nginx --overwrite dash0.com/enable=false
+  fi
 }
 
 ensure_namespace_exists() {
@@ -83,6 +95,8 @@ ensure_namespace_exists() {
 
   if ! kubectl get ns "$target_namespace" &> /dev/null; then
     kubectl create ns "$target_namespace"
+    kubectl label namespace "$target_namespace" test-label-1=test-value-1 test-label-2=test-value-2
+    kubectl annotate namespace "$target_namespace" test-annotation-1=test-value-1 test-annotation-2=test-value-2
   fi
 }
 
@@ -167,6 +181,22 @@ determine_container_images() {
   target_allocator_image_tag="$image_tag"
   target_allocator_image_digest=""
   target_allocator_image_pull_policy="$pull_policy"
+  agent0_connector_image_repository="${image_repository_prefix}agent0-connector"
+  agent0_connector_image_tag="$image_tag"
+  agent0_connector_image_digest=""
+  agent0_connector_image_pull_policy="$pull_policy"
+  # The intelligent edge collector and barker images are not built in this repo. By default we let the values.yaml
+  # pinned tag win (the published ghcr image), and only override when an explicit env var is set. Set
+  # INTELLIGENT_EDGE_COLLECTOR_IMAGE_{REPOSITORY,TAG,DIGEST,PULL_POLICY} or BARKER_IMAGE_* to use a locally built
+  # image (see "make all-images-with-ie").
+  intelligent_edge_collector_image_repository=""
+  intelligent_edge_collector_image_tag=""
+  intelligent_edge_collector_image_digest=""
+  intelligent_edge_collector_image_pull_policy=""
+  barker_image_repository=""
+  barker_image_tag=""
+  barker_image_digest=""
+  barker_image_pull_policy=""
 
   operator_helm_chart=${OPERATOR_HELM_CHART:-helm-chart/dash0-operator}
 
@@ -174,6 +204,7 @@ determine_container_images() {
   if [[ "$operator_helm_chart" != "helm-chart/dash0-operator" ]]; then
     echo "Looks like a remote helm chart or an installed Helm chart is used."
     is_local_helm_chart="false"
+    SKIP_IMAGE_BUILDS="true"
 
     controller_image_repository=""
     controller_image_tag=""
@@ -196,6 +227,9 @@ determine_container_images() {
     target_allocator_image_repository=""
     target_allocator_image_tag=""
     target_allocator_image_pull_policy=""
+    agent0_connector_image_repository=""
+    agent0_connector_image_tag=""
+    agent0_connector_image_pull_policy=""
   fi
 
   if [[ -n "${CONTROLLER_IMAGE_REPOSITORY:-}" ]]; then
@@ -289,6 +323,45 @@ determine_container_images() {
     target_allocator_image_pull_policy="$TARGET_ALLOCATOR_IMAGE_PULL_POLICY"
   fi
 
+  if [[ -n "${AGENT0_CONNECTOR_IMAGE_REPOSITORY:-}" ]]; then
+    agent0_connector_image_repository="$AGENT0_CONNECTOR_IMAGE_REPOSITORY"
+  fi
+  if [[ -n "${AGENT0_CONNECTOR_IMAGE_TAG:-}" ]]; then
+    agent0_connector_image_tag="$AGENT0_CONNECTOR_IMAGE_TAG"
+  fi
+  if [[ -n "${AGENT0_CONNECTOR_IMAGE_DIGEST:-}" ]]; then
+    agent0_connector_image_digest="$AGENT0_CONNECTOR_IMAGE_DIGEST"
+  fi
+  if [[ -n "${AGENT0_CONNECTOR_IMAGE_PULL_POLICY:-}" ]]; then
+    agent0_connector_image_pull_policy="$AGENT0_CONNECTOR_IMAGE_PULL_POLICY"
+  fi
+
+  if [[ -n "${INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY:-}" ]]; then
+    intelligent_edge_collector_image_repository="$INTELLIGENT_EDGE_COLLECTOR_IMAGE_REPOSITORY"
+  fi
+  if [[ -n "${INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG:-}" ]]; then
+    intelligent_edge_collector_image_tag="$INTELLIGENT_EDGE_COLLECTOR_IMAGE_TAG"
+  fi
+  if [[ -n "${INTELLIGENT_EDGE_COLLECTOR_IMAGE_DIGEST:-}" ]]; then
+    intelligent_edge_collector_image_digest="$INTELLIGENT_EDGE_COLLECTOR_IMAGE_DIGEST"
+  fi
+  if [[ -n "${INTELLIGENT_EDGE_COLLECTOR_IMAGE_PULL_POLICY:-}" ]]; then
+    intelligent_edge_collector_image_pull_policy="$INTELLIGENT_EDGE_COLLECTOR_IMAGE_PULL_POLICY"
+  fi
+
+  if [[ -n "${BARKER_IMAGE_REPOSITORY:-}" ]]; then
+    barker_image_repository="$BARKER_IMAGE_REPOSITORY"
+  fi
+  if [[ -n "${BARKER_IMAGE_TAG:-}" ]]; then
+    barker_image_tag="$BARKER_IMAGE_TAG"
+  fi
+  if [[ -n "${BARKER_IMAGE_DIGEST:-}" ]]; then
+    barker_image_digest="$BARKER_IMAGE_DIGEST"
+  fi
+  if [[ -n "${BARKER_IMAGE_PULL_POLICY:-}" ]]; then
+    barker_image_pull_policy="$BARKER_IMAGE_PULL_POLICY"
+  fi
+
   if [[ "$is_local_helm_chart" = "true" ]]; then
     # support using the local helm chart with remote images
     controller_image_pull_policy=$(determine_pull_policy "$controller_image_repository" "$controller_image_pull_policy")
@@ -298,6 +371,9 @@ determine_container_images() {
     filelog_offset_sync_image_pull_policy=$(determine_pull_policy "$filelog_offset_sync_image_repository" "$filelog_offset_sync_image_pull_policy")
     filelog_offset_volume_ownership_image_pull_policy=$(determine_pull_policy "$filelog_offset_volume_ownership_image_repository" "$filelog_offset_volume_ownership_image_pull_policy")
     target_allocator_image_pull_policy=$(determine_pull_policy "$target_allocator_image_repository" "$target_allocator_image_pull_policy")
+    agent0_connector_image_pull_policy=$(determine_pull_policy "$agent0_connector_image_repository" "$agent0_connector_image_pull_policy")
+    intelligent_edge_collector_image_pull_policy=$(determine_pull_policy "$intelligent_edge_collector_image_repository" "$intelligent_edge_collector_image_pull_policy")
+    barker_image_pull_policy=$(determine_pull_policy "$barker_image_repository" "$barker_image_pull_policy")
   fi
 }
 
@@ -402,6 +478,8 @@ build_all_images() {
     FILELOG_OFFSET_VOLUME_OWNERSHIP_IMAGE_TAG="$filelog_offset_volume_ownership_image_tag" \
     TARGET_ALLOCATOR_IMAGE_REPOSITORY="$target_allocator_image_repository" \
     TARGET_ALLOCATOR_IMAGE_TAG="$target_allocator_image_tag" \
+    AGENT0_CONNECTOR_IMAGE_REPOSITORY="$agent0_connector_image_repository" \
+    AGENT0_CONNECTOR_IMAGE_TAG="$agent0_connector_image_tag" \
     make images
 }
 
@@ -423,6 +501,8 @@ push_all_images() {
     FILELOG_OFFSET_VOLUME_OWNERSHIP_IMAGE_TAG="$filelog_offset_volume_ownership_image_tag" \
     TARGET_ALLOCATOR_IMAGE_REPOSITORY="$target_allocator_image_repository" \
     TARGET_ALLOCATOR_IMAGE_TAG="$target_allocator_image_tag" \
+    AGENT0_CONNECTOR_IMAGE_REPOSITORY="$agent0_connector_image_repository" \
+    AGENT0_CONNECTOR_IMAGE_TAG="$agent0_connector_image_tag" \
     make push-images
 }
 
@@ -434,10 +514,10 @@ deploy_filelog_offsets_pvc() {
   if [[ "$FILELOG_OFFSETS_PVC" = "kind" ]]; then
     kubectl patch persistentvolume filelogreceiver-offsets --type=json -p='[{"op": "remove", "path": "/spec/claimRef"}]' || true
     kubectl apply -f test-resources/filelog-offset-storage/offset-storage-pvc-kind.yaml
-  elif [[ "$FILELOG_OFFSETS_PVC" = "docker" ]]; then
-    kubectl apply -f test-resources/filelog-offset-storage/offset-storage-pvc-docker.yaml
   elif [[ "$FILELOG_OFFSETS_PVC" = "gke" ]]; then
     kubectl apply -f test-resources/filelog-offset-storage/offset-storage-pvc-gke.yaml
+  elif [[ "$FILELOG_OFFSETS_PVC" = "gke-ap" ]]; then
+    kubectl apply -f test-resources/filelog-offset-storage/offset-storage-pvc-gke-ap.yaml
   elif [[ "$FILELOG_OFFSETS_PVC" = "aws-efs-dp" ]]; then
     if ! kubectl get storageclass efs-sc > /dev/null; then
       kubectl apply -f test-resources/filelog-offset-storage/aws-efs-dynamic-provisioning-storage-class.yaml
@@ -499,7 +579,9 @@ run_helm() {
   if [[ "${TA_MTLS_ENABLED:-}" = "true" ]]; then
     helm_install_command+=" --values test-resources/cert-manager/ta-mtls-values.yaml"
   fi
+  if [[ "${DEVELOPMENT_MODE:-}" != "false" ]]; then
   helm_install_command+=" --set operator.developmentMode=true"
+  fi
   if [[ "${OTEL_COLLECTOR_DEBUG_VERBOSITY_DETAILED:-}" = "true" ]]; then
     helm_install_command+=" --set operator.collectors.debugVerbosityDetailed=true"
   fi
@@ -509,6 +591,9 @@ run_helm() {
   if [[ "${COLLECTOR_ENABLE_PPROF:-}" = "true" ]]; then
     helm_install_command+=" --set operator.collectors.enablePprofExtension=true"
   fi
+  if [[ -n "${OTEL_COLLECTOR_SEND_BATCH_SIZE:-}" ]]; then
+    helm_install_command+=" --set operator.collectors.sendBatchSize=$OTEL_COLLECTOR_SEND_BATCH_SIZE"
+  fi
   if [[ -n "${OTEL_COLLECTOR_SEND_BATCH_MAX_SIZE:-}" ]]; then
     helm_install_command+=" --set operator.collectors.sendBatchMaxSize=$OTEL_COLLECTOR_SEND_BATCH_MAX_SIZE"
   fi
@@ -517,6 +602,7 @@ run_helm() {
   elif [[ "${FILELOG_OFFSETS_HOST_PATH_VOLUME:-}" = "true" ]]; then
     helm_install_command+=" --values test-resources/filelog-offset-storage/volume-values-hostpath.yaml"
   fi
+  helm_install_command+=" --set operator.collectNamespaceLabelsAndAnnotationsEnabled=true"
 
   if [[ -n "$controller_image_repository" ]]; then
     helm_install_command+=" --set operator.image.repository=$controller_image_repository"
@@ -532,16 +618,16 @@ run_helm() {
   fi
 
   if [[ -n "$instrumentation_image_repository" ]]; then
-    helm_install_command+=" --set operator.initContainerImage.repository=$instrumentation_image_repository"
+    helm_install_command+=" --set operator.instrumentationImage.repository=$instrumentation_image_repository"
   fi
   if [[ -n "$instrumentation_image_tag" ]]; then
-    helm_install_command+=" --set operator.initContainerImage.tag=$instrumentation_image_tag"
+    helm_install_command+=" --set operator.instrumentationImage.tag=$instrumentation_image_tag"
   fi
   if [[ -n "$instrumentation_image_digest" ]]; then
-    helm_install_command+=" --set operator.initContainerImage.digest=$instrumentation_image_digest"
+    helm_install_command+=" --set operator.instrumentationImage.digest=$instrumentation_image_digest"
   fi
   if [[ -n "$instrumentation_image_pull_policy" ]]; then
-    helm_install_command+=" --set operator.initContainerImage.pullPolicy=$instrumentation_image_pull_policy"
+    helm_install_command+=" --set operator.instrumentationImage.pullPolicy=$instrumentation_image_pull_policy"
   fi
 
   if [[ -n "$collector_image_repository" ]]; then
@@ -609,6 +695,45 @@ run_helm() {
     helm_install_command+=" --set operator.targetAllocatorImage.pullPolicy=$target_allocator_image_pull_policy"
   fi
 
+  if [[ -n "$agent0_connector_image_repository" ]]; then
+    helm_install_command+=" --set operator.agent0ConnectorImage.repository=$agent0_connector_image_repository"
+  fi
+  if [[ -n "$agent0_connector_image_tag" ]]; then
+    helm_install_command+=" --set operator.agent0ConnectorImage.tag=$agent0_connector_image_tag"
+  fi
+  if [[ -n "$agent0_connector_image_digest" ]]; then
+    helm_install_command+=" --set operator.agent0ConnectorImage.digest=$agent0_connector_image_digest"
+  fi
+  if [[ -n "$agent0_connector_image_pull_policy" ]]; then
+    helm_install_command+=" --set operator.agent0ConnectorImage.pullPolicy=$agent0_connector_image_pull_policy"
+  fi
+
+  if [[ -n "$intelligent_edge_collector_image_repository" ]]; then
+    helm_install_command+=" --set operator.intelligentEdgeCollectorImage.repository=$intelligent_edge_collector_image_repository"
+  fi
+  if [[ -n "$intelligent_edge_collector_image_tag" ]]; then
+    helm_install_command+=" --set operator.intelligentEdgeCollectorImage.tag=$intelligent_edge_collector_image_tag"
+  fi
+  if [[ -n "$intelligent_edge_collector_image_digest" ]]; then
+    helm_install_command+=" --set operator.intelligentEdgeCollectorImage.digest=$intelligent_edge_collector_image_digest"
+  fi
+  if [[ -n "$intelligent_edge_collector_image_pull_policy" ]]; then
+    helm_install_command+=" --set operator.intelligentEdgeCollectorImage.pullPolicy=$intelligent_edge_collector_image_pull_policy"
+  fi
+
+  if [[ -n "$barker_image_repository" ]]; then
+    helm_install_command+=" --set operator.barkerImage.repository=$barker_image_repository"
+  fi
+  if [[ -n "$barker_image_tag" ]]; then
+    helm_install_command+=" --set operator.barkerImage.tag=$barker_image_tag"
+  fi
+  if [[ -n "$barker_image_digest" ]]; then
+    helm_install_command+=" --set operator.barkerImage.digest=$barker_image_digest"
+  fi
+  if [[ -n "$barker_image_pull_policy" ]]; then
+    helm_install_command+=" --set operator.barkerImage.pullPolicy=$barker_image_pull_policy"
+  fi
+
   # Deploy an operator configuration right away.
   if [[ "${DEPLOY_OPERATOR_CONFIGURATION_VIA_HELM:-}" != "false" ]]; then
     if [[ "${USE_OTLP_SINK:-}" = "true" ]]; then
@@ -639,10 +764,28 @@ run_helm() {
     if [[ "${PROMETHEUS_CRD_SUPPORT_ENABLED:-}" = "true" ]]; then
       helm_install_command+=" --set operator.prometheusCrdSupportEnabled=true"
     fi
+    if [[ "${PROFILING_ENABLED:-}" = "true" ]]; then
+      helm_install_command+=" --set operator.profilingEnabled=true"
+    fi
+    if [[ "${AUTO_MONITOR_NAMESPACES_ENABLED:-}" = "true" ]]; then
+      helm_install_command+=" --set operator.autoMonitorNamespaces.enabled=true"
+    fi
+    if [[ "${TELEMETRY_COLLECTION_ENABLED:-}" = "false" ]]; then
+      helm_install_command+=" --set operator.telemetryCollectionEnabled=false"
+    fi
+    if [[ "${FEATURE_INTELLIGENT_EDGE_ENABLED:-}" = "true" ]]; then
+      helm_install_command+=" --set operator.intelligentEdge.enabled=true"
+    fi
     helm_install_command+=" --set operator.clusterName=$(kubectl config current-context)"
   fi
   if [[ -n "${OPERATOR_REPLICAS:-}" ]]; then
     helm_install_command+=" --set operator.replicaCount=${OPERATOR_REPLICAS:-1}"
+  fi
+
+  # on kind, the collectors sometimes need more time to start
+  if [[ "${ALLOW_MORE_TIME_FOR_COLLECTOR_STARTUP:-}" == "true" ]]; then
+    helm_install_command+=" --set operator.collectors.daemonSetProbes.startup.failureThreshold=60"
+    helm_install_command+=" --set operator.collectors.deploymentProbes.startup.failureThreshold=60"
   fi
 
   helm_install_command+=" dash0-operator"
@@ -675,13 +818,22 @@ deploy_otlp_sink_if_requested() {
   echo "deploying otlp-sink"
   echo "$helm_install_command"
   $helm_install_command
+
+  # Note: Since the otlp-sink collector is configured with a debug/verbosity=detailed exporter, if we accidentally
+  # auto-monitor otlp-sink, it gets into a feedback cycle of collecting metrics by collecting logs and metrics in that
+  # namespace and then also logging each collected data point.
+  kubectl label namespace otlp-sink dash0.com/enable=false
 }
 
 install_operator_configuration_resource() {
   if [[ "${USE_OTLP_SINK:-}" = "true" ]]; then
     kubectl apply -f test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.otlpsink.yaml
-  elif [[ "${USE_TOKEN:-}" = true ]]; then
+  elif [[ "${USE_TOKEN:-}" = "true" ]]; then
     kubectl apply -f test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.token.yaml
+  elif [[ "${USE_MULTI_CAST:-}" = "true" ]]; then
+    kubectl apply -f test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.multi.yaml
+  elif [[ "${AUTO_MONITOR_NAMESPACES_ENABLED:-}" = "true" ]]; then
+    kubectl apply -f test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.auto-namespace-monitoring.yaml
   else
     kubectl apply -f test-resources/customresources/dash0operatorconfiguration/dash0operatorconfiguration.secret.yaml
   fi
@@ -912,14 +1064,14 @@ helm_install_test_application() {
 }
 
 install_third_party_crds() {
-  kubectl apply --server-side -f https://raw.githubusercontent.com/perses/perses-operator/refs/tags/v0.2.0/config/crd/bases/perses.dev_persesdashboards.yaml
-  kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.88.0/example/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml
+  kubectl apply --server-side -f https://raw.githubusercontent.com/perses/perses-operator/refs/tags/v0.4.0/config/crd/bases/perses.dev_persesdashboards.yaml
+  kubectl apply --server-side -f https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.92.1/example/prometheus-operator-crd/monitoring.coreos.com_prometheusrules.yaml
   install_prometheus_crds
 }
 
 install_prometheus_crds() {
   helm upgrade --install \
-    --namespace "$target_namespace" \
+    --namespace "$operator_namespace" \
     --set crds.alertmanagerconfigs.enabled=false \
     --set crds.alertmanagers.enabled=false \
     --set crds.prometheusagents.enabled=false \
@@ -928,6 +1080,24 @@ install_prometheus_crds() {
     --set crds.prometheusrules.enabled=false \
     prometheus-crds \
     prometheus-community/prometheus-operator-crds
+}
+
+deploy_cadvisor_scrapeconfig() {
+  if [[ "${DEPLOY_CADVISOR_SCRAPECONFIG:-}" != "true" ]]; then
+    return
+  fi
+  echo "STEP $step_counter: deploy a ScrapeConfig for scraping cadvisor metrics to ${target_namespace}"
+  kubectl apply -n "$target_namespace" -f test-resources/customresources/prometheus/cadvisor-scrapeconfig.yaml
+  finish_step
+}
+
+deploy_ebpf_profiler() {
+  echo "STEP $step_counter: deploy the eBPF profiler DaemonSet to namespace ${operator_namespace}"
+  helm upgrade --install \
+    --namespace "$operator_namespace" \
+    --wait --timeout 120s \
+    ebpf-profiler test-resources/ebpf-profiler/helm-chart
+  finish_step
 }
 
 deploy_dash0_api_sync_resources() {
@@ -941,9 +1111,17 @@ deploy_dash0_api_sync_resources() {
     kubectl apply -n "$target_namespace" -f test-resources/customresources/dash0view/dash0view.yaml
     finish_step
   fi
+  if [[ "${DEPLOY_SPAM_FILTER:-}" = "true" ]]; then
+    echo "STEP $step_counter: deploy a Dash0 spam filter resource to namespace ${target_namespace}"
+    kubectl apply -n "$target_namespace" -f test-resources/customresources/dash0spamfilter/dash0spamfilter.yaml
+    finish_step
+  fi
   if [[ "${DEPLOY_PERSES_DASHBOARD:-}" = "true" ]]; then
-    echo "STEP $step_counter: deploy a Perses dashboard resource to namespace ${target_namespace}"
-    kubectl apply -n "$target_namespace" -f test-resources/customresources/persesdashboard/persesdashboard.yaml
+    DEPLOY_PERSES_DASHBOARD="v1alpha2"
+  fi
+  if [[ "${DEPLOY_PERSES_DASHBOARD:-}" = "v1alpha1" || "${DEPLOY_PERSES_DASHBOARD:-}" = "v1alpha2" ]]; then
+    echo "STEP $step_counter: deploy a Perses dashboard resource (${DEPLOY_PERSES_DASHBOARD}) to namespace ${target_namespace}"
+    kubectl apply -n "$target_namespace" -f "test-resources/customresources/persesdashboard/${DEPLOY_PERSES_DASHBOARD}/persesdashboard.yaml"
     finish_step
   fi
   if [[ "${DEPLOY_PROMETHEUS_RULE:-}" = "true" ]]; then
@@ -951,6 +1129,28 @@ deploy_dash0_api_sync_resources() {
     kubectl apply -n "$target_namespace" -f test-resources/customresources/prometheusrule/prometheusrule.yaml
     finish_step
   fi
+  if [[ -n "${DEPLOY_NOTIFICATION_CHANNEL:-}" ]]; then
+    echo "STEP $step_counter: deploy a Dash0 notification channel resource (${DEPLOY_NOTIFICATION_CHANNEL}) to namespace ${target_namespace}"
+    kubectl apply -n "$target_namespace" -f "test-resources/customresources/dash0notificationchannel/${DEPLOY_NOTIFICATION_CHANNEL}.yaml"
+    finish_step
+  fi
+  if [[ -n "${DEPLOY_SIGNAL_TO_METRICS:-}" ]]; then
+    echo "STEP $step_counter: deploy a Dash0 signal-to-metrics resource (${DEPLOY_SIGNAL_TO_METRICS}) to namespace ${target_namespace}"
+    kubectl apply -n "$target_namespace" -f "test-resources/customresources/dash0signaltometrics/${DEPLOY_SIGNAL_TO_METRICS}.yaml"
+    finish_step
+  fi
+}
+
+deploy_intelligent_edge_resource() {
+  if [[ "${FEATURE_INTELLIGENT_EDGE_ENABLED:-}" != "true" ]]; then
+    return
+  fi
+  echo "STEP $step_counter: deploy the Dash0 intelligent edge resource"
+  # helm install --wait does not wait for CRDs to reach the "Established" condition, so we need to do that
+  # explicitly before applying the custom resource.
+  kubectl wait --for=condition=Established --timeout=60s crd/dash0intelligentedges.operator.dash0.com
+  kubectl apply -f test-resources/customresources/dash0intelligentedge/dash0intelligentedge.yaml
+  finish_step
 }
 
 trim() {

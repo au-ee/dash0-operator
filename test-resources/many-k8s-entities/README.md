@@ -35,12 +35,13 @@ operator:
   collectors:
     # Optional, this is useful to not have the collector pods go OOM due to high number of replicasets, if you want
     # to focus your testing on the operator manager.
-    disableReplicasetInformer: true
+    k8s_attributes:
+      disableReplicasetInformer: true
 ```
 
 Then run
 `kubectl --namespace operator-namespace port-forward $(kubectl get pods --namespace operator-namespace -l app.kubernetes.io/name=dash0-operator -l app.kubernetes.io/component=controller -o jsonpath="{.items[0].metadata.name}") 1777:1777` and use `curl http://localhost:1777/debug/pprof/` to talk
 to pprof and `curl http://localhost:1777/debug/pprof/heap > operator_manager.out` to get a heap profile.
 Alternatively, attach a debug container as outlined in
-<https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#create-heap-profiles>
+<https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/troubleshooting.md#create-heap-profiles>
 

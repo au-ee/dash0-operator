@@ -8,19 +8,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 
-	"github.com/go-logr/logr"
+	admissionv1 "k8s.io/api/admission/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1alpha1 "github.com/dash0hq/dash0-operator/api/operator/v1alpha1"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
-	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/logd"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 type MonitoringMutatingWebhookHandler struct {
@@ -59,11 +59,11 @@ func (h *MonitoringMutatingWebhookHandler) Handle(ctx context.Context, request a
 	// api/operator/v1alpha1/dash0monitoring_types.go have already been applied by the time this webhook
 	// is called.
 	// See https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#admission-control-phases.
-	logger := log.FromContext(ctx)
+	logger := logd.FromContext(ctx)
 
 	monitoringResource := &dash0v1beta1.Dash0Monitoring{}
 	if _, _, err := decoder.Decode(request.Object.Raw, nil, monitoringResource); err != nil {
-		logger.Info("rejecting invalid monitoring resource", "error", err)
+		logger.Warn("rejecting invalid monitoring resource", "error", err)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
@@ -76,7 +76,8 @@ func (h *MonitoringMutatingWebhookHandler) Handle(ctx context.Context, request a
 		operatorConfigurationSpec = &availableOperatorConfigurations[0].Spec
 	}
 
-	patchRequired, errorResponse := h.normalizeMonitoringResourceSpec(request, operatorConfigurationSpec, &monitoringResource.Spec, &logger)
+	patchRequired, errorResponse :=
+		h.normalizeMonitoringResourceSpec(request, operatorConfigurationSpec, &monitoringResource.Spec, logger)
 
 	if errorResponse != nil {
 		return *errorResponse
@@ -89,21 +90,45 @@ func (h *MonitoringMutatingWebhookHandler) Handle(ctx context.Context, request a
 	marshalled, err := json.Marshal(monitoringResource)
 	if err != nil {
 		wrappedErr := fmt.Errorf("error when marshalling modfied monitoring resource to JSON: %w", err)
+		logger.Error(wrappedErr, "JSON marshalling error")
 		return admission.Errored(http.StatusInternalServerError, wrappedErr)
 	}
 
 	return admission.PatchResponseFromRaw(request.Object.Raw, marshalled)
 }
 
+//nolint:staticcheck
 func (h *MonitoringMutatingWebhookHandler) normalizeMonitoringResourceSpec(
 	request admission.Request,
 	operatorConfigurationSpec *dash0v1alpha1.Dash0OperatorConfigurationSpec,
 	monitoringSpec *dash0v1beta1.Dash0MonitoringSpec,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) (bool, *admission.Response) {
 	patchRequired := h.setTelemetryCollectionRelatedDefaults(request, operatorConfigurationSpec, monitoringSpec)
 	patchRequiredForLogCollection := h.overrideLogCollectionDefault(request, monitoringSpec, logger)
 	patchRequired = patchRequired || patchRequiredForLogCollection
+
+	// Migrate deprecated export field to exports, or strip it if exports is already set.
+	// - If only export is set: migrate export → exports (the common upgrade path).
+	// - If both are set on UPDATE and exports matches the stored resource: kubectl's three-way merge carried over the
+	//   old exports from the stored resource. The user's real change is in export, so we migrate export → exports.
+	// - If both are set and exports differs from the stored resource (or this is a CREATE): the user intentionally
+	//   changed exports directly (or is actively migrating). We honor exports and discard export.
+	if monitoringSpec.Export != nil {
+		if len(monitoringSpec.Exports) == 0 {
+			monitoringSpec.Exports = []dash0common.Export{*monitoringSpec.Export}
+		} else {
+			unchanged, errorResponse := isExportsUnchangedFromOldMonitoringResource(request, monitoringSpec.Exports, logger)
+			if errorResponse != nil {
+				return false, errorResponse
+			}
+			if unchanged {
+				monitoringSpec.Exports = []dash0common.Export{*monitoringSpec.Export}
+			}
+		}
+		monitoringSpec.Export = nil
+		patchRequired = true
+	}
 
 	// Normalize spec.transform to the transform processors "advanced" config format.
 	transform := monitoringSpec.Transform
@@ -129,11 +154,13 @@ func (h *MonitoringMutatingWebhookHandler) setTelemetryCollectionRelatedDefaults
 	patchRequired := false
 	telemetryCollectionEnabled := true
 	if operatorConfigurationSpec != nil {
-		telemetryCollectionEnabled = util.ReadBoolPointerWithDefault(operatorConfigurationSpec.TelemetryCollection.Enabled, true)
+		telemetryCollectionEnabled = pointers.ReadBoolPointerWithDefault(operatorConfigurationSpec.TelemetryCollection.Enabled, true)
 	}
 
 	if monitoringSpec.InstrumentWorkloads.Mode == "" {
-		if telemetryCollectionEnabled {
+		if request.Namespace == h.operatorNamespace {
+			monitoringSpec.InstrumentWorkloads.Mode = dash0common.InstrumentWorkloadsModeNone
+		} else if telemetryCollectionEnabled {
 			monitoringSpec.InstrumentWorkloads.Mode = dash0common.InstrumentWorkloadsModeAll
 		} else {
 			monitoringSpec.InstrumentWorkloads.Mode = dash0common.InstrumentWorkloadsModeNone
@@ -142,18 +169,18 @@ func (h *MonitoringMutatingWebhookHandler) setTelemetryCollectionRelatedDefaults
 	}
 	if monitoringSpec.LogCollection.Enabled == nil {
 		if request.Namespace == h.operatorNamespace {
-			monitoringSpec.LogCollection.Enabled = ptr.To(false)
+			monitoringSpec.LogCollection.Enabled = new(false)
 		} else {
-			monitoringSpec.LogCollection.Enabled = ptr.To(telemetryCollectionEnabled)
+			monitoringSpec.LogCollection.Enabled = new(telemetryCollectionEnabled)
 		}
 		patchRequired = true
 	}
 	if monitoringSpec.EventCollection.Enabled == nil {
-		monitoringSpec.EventCollection.Enabled = ptr.To(telemetryCollectionEnabled)
+		monitoringSpec.EventCollection.Enabled = new(telemetryCollectionEnabled)
 		patchRequired = true
 	}
 	if monitoringSpec.PrometheusScraping.Enabled == nil {
-		monitoringSpec.PrometheusScraping.Enabled = ptr.To(telemetryCollectionEnabled)
+		monitoringSpec.PrometheusScraping.Enabled = new(telemetryCollectionEnabled)
 		patchRequired = true
 	}
 	return patchRequired
@@ -162,26 +189,55 @@ func (h *MonitoringMutatingWebhookHandler) setTelemetryCollectionRelatedDefaults
 func (h *MonitoringMutatingWebhookHandler) overrideLogCollectionDefault(
 	request admission.Request,
 	monitoringSpec *dash0v1beta1.Dash0MonitoringSpec,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) bool {
 	if request.Namespace == h.operatorNamespace &&
-		util.ReadBoolPointerWithDefault(monitoringSpec.LogCollection.Enabled, true) {
+		pointers.ReadBoolPointerWithDefault(monitoringSpec.LogCollection.Enabled, true) {
 		logger.Info(
 			fmt.Sprintf(
 				"Automatically disabling log collection in the operator namespace %s. Logs from the operator can be "+
 					"collected via self monitoring, see "+
 					"https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator#operatorconfigurationresource.spec.selfMonitoring.enabled. "+
-					"Collecting them via the filelog receiver is not supported. You can get rid of this log message "+
+					"Collecting them via the file_log receiver is not supported. You can get rid of this log message "+
 					"by explicitly disabling log collection for this namespace, see "+
 					"https://github.com/dash0hq/dash0-operator/tree/main/helm-chart/dash0-operator#monitoringresource.spec.logCollection.enabled.",
 				h.operatorNamespace))
-		monitoringSpec.LogCollection.Enabled = ptr.To(false)
+		monitoringSpec.LogCollection.Enabled = new(false)
 		return true
 	}
 	return false
 }
 
-func normalizeTransform(transform *dash0common.Transform, logger *logr.Logger) (*dash0common.NormalizedTransformSpec, int32, error) {
+// isExportsUnchangedFromOldMonitoringResource checks whether the incoming exports slice matches the previously stored
+// exports on an UPDATE operation. This detects when kubectl's three-way merge carried over the old exports field (set
+// by a prior webhook migration), so the user's real intent is in the deprecated export field.
+// Returns false for CREATE operations or when exports differ. Returns an error response if the OldObject cannot be
+// decoded.
+func isExportsUnchangedFromOldMonitoringResource(
+	request admission.Request,
+	incomingExports []dash0common.Export,
+	logger logd.Logger,
+) (bool, *admission.Response) {
+	if request.Operation != admissionv1.Update {
+		return false, nil
+	}
+	if request.OldObject.Raw == nil {
+		return false, nil
+	}
+	oldResource := &dash0v1beta1.Dash0Monitoring{}
+	if _, _, err := decoder.Decode(request.OldObject.Raw, nil, oldResource); err != nil {
+		msg := "could not decode OldObject for export migration"
+		logger.Error(err, msg)
+		errResponse := admission.Errored(
+			http.StatusBadRequest,
+			fmt.Errorf("%s: %w", msg, err),
+		)
+		return false, &errResponse
+	}
+	return reflect.DeepEqual(incomingExports, oldResource.Spec.Exports), nil
+}
+
+func normalizeTransform(transform *dash0common.Transform, logger logd.Logger) (*dash0common.NormalizedTransformSpec, int32, error) {
 	traceTransformGroups, responseStatus, err :=
 		normalizeTransformGroupsForOneSignal(transform.Traces, "trace_statements", logger)
 	if err != nil {
@@ -200,19 +256,26 @@ func normalizeTransform(transform *dash0common.Transform, logger *logr.Logger) (
 		logger.Error(err, "error when normalizing transform.log_statements")
 		return nil, responseStatus, err
 	}
+	profileTransformGroups, responseStatus, err :=
+		normalizeTransformGroupsForOneSignal(transform.Profiles, "profile_statements", logger)
+	if err != nil {
+		logger.Error(err, "error when normalizing transform.profile_statements")
+		return nil, responseStatus, err
+	}
 
 	return &dash0common.NormalizedTransformSpec{
 		ErrorMode: transform.ErrorMode,
 		Traces:    traceTransformGroups,
 		Metrics:   metricTransformGroups,
 		Logs:      logTransformGroups,
+		Profiles:  profileTransformGroups,
 	}, 0, nil
 }
 
 func normalizeTransformGroupsForOneSignal(
 	signalTransformSpec []json.RawMessage,
 	signalTypeKey string,
-	logger *logr.Logger,
+	logger logd.Logger,
 ) ([]dash0common.NormalizedTransformGroup, int32, error) {
 	var allGroups []dash0common.NormalizedTransformGroup
 	for ctxIdx, transformGroup := range signalTransformSpec {
@@ -221,7 +284,7 @@ func normalizeTransformGroupsForOneSignal(
 			return nil, http.StatusInternalServerError, fmt.Errorf("extracting the JSON payload for spec.transform.%s[%d] failed: %w", signalTypeKey, ctxIdx, err)
 		}
 
-		var groupUnmarshalled interface{}
+		var groupUnmarshalled any
 		if err = json.Unmarshal(jsonPayload, &groupUnmarshalled); err != nil {
 			return nil,
 				http.StatusBadRequest,
@@ -235,7 +298,7 @@ func normalizeTransformGroupsForOneSignal(
 			continue
 		}
 
-		groupAsMap, isMap := groupUnmarshalled.(map[string]interface{})
+		groupAsMap, isMap := groupUnmarshalled.(map[string]any)
 		if isMap {
 			normalizedGroup := dash0common.NormalizedTransformGroup{}
 			if contextSpec, hasContext := groupAsMap["context"]; hasContext && contextSpec != nil {
@@ -247,7 +310,7 @@ func normalizeTransformGroupsForOneSignal(
 					em := dash0common.FilterTransformErrorMode(errorMode)
 					normalizedGroup.ErrorMode = &em
 				} else {
-					logger.Error(
+					logger.ErrorAsWarn(
 						err,
 						fmt.Sprintf(
 							"ignoring invalid error mode %v for spec.transform.%s[%d]: ",
@@ -258,7 +321,7 @@ func normalizeTransformGroupsForOneSignal(
 				}
 			}
 			if conditionsRaw, hasConditions := groupAsMap["conditions"]; hasConditions {
-				if conditionsI, listOk := conditionsRaw.([]interface{}); listOk {
+				if conditionsI, listOk := conditionsRaw.([]any); listOk {
 					conditions := make([]string, len(conditionsI))
 					for conditionIdx, condition := range conditionsI {
 						if conditionS, elemOk := condition.(string); elemOk {
@@ -286,7 +349,7 @@ func normalizeTransformGroupsForOneSignal(
 				}
 			}
 			if statementsRaw, hasStatements := groupAsMap["statements"]; hasStatements {
-				if statementsI, listOk := statementsRaw.([]interface{}); listOk {
+				if statementsI, listOk := statementsRaw.([]any); listOk {
 					statements := make([]string, len(statementsI))
 					for statementIdx, statement := range statementsI {
 						if statementS, elemOk := statement.(string); elemOk {
@@ -330,6 +393,7 @@ func loadAvailableOperatorConfigurationResources(
 	operatorConfigurationList := &dash0v1alpha1.Dash0OperatorConfigurationList{}
 	if err := k8sClient.List(ctx, operatorConfigurationList, &client.ListOptions{}); err != nil {
 		if !apierrors.IsNotFound(err) {
+			logd.FromContext(ctx).Error(err, "failed to list operator configuration resources")
 			errorResponse := admission.Errored(http.StatusInternalServerError, err)
 			return nil, &errorResponse
 		}

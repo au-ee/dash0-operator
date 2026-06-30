@@ -34,7 +34,7 @@ const (
 	InstrumentWorkloadsModeNone InstrumentWorkloadsMode = "none"
 )
 
-var AllInstrumentWorkloadsMode = []InstrumentWorkloadsMode{
+var AllInstrumentWorkloadsModes = []InstrumentWorkloadsMode{
 	InstrumentWorkloadsModeAll,
 	InstrumentWorkloadsModeCreatedAndUpdated,
 	InstrumentWorkloadsModeNone,
@@ -51,7 +51,7 @@ type LogCollection struct {
 	// `logCollection.enabled=true` in any monitoring resource at the same time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type EventCollection struct {
@@ -65,7 +65,7 @@ type EventCollection struct {
 	// `eventCollection.enabled=true` in any monitoring resource at the same time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type PrometheusScraping struct {
@@ -77,7 +77,7 @@ type PrometheusScraping struct {
 	// `prometheusScraping.enabled=true` in any monitoring resource at the same time.
 	//
 	// +kubebuilder:validation:Optional
-	Enabled *bool `json:"enabled"`
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // FilterTransformErrorMode determine how the filter or the transform processor reacts to errors that occur while
@@ -135,6 +135,12 @@ type Filter struct {
 	//
 	// +kubebuilder:validation:Optional
 	Logs *LogFilter `json:"logs,omitempty"`
+
+	// Filters for the profiles signal.
+	// This can be used to drop _profiles_.
+	//
+	// +kubebuilder:validation:Optional
+	Profiles *ProfileFilter `json:"profiles,omitempty"`
 }
 
 func (f *Filter) HasAnyFilters() bool {
@@ -145,6 +151,9 @@ func (f *Filter) HasAnyFilters() bool {
 		return true
 	}
 	if f.Logs != nil && f.Logs.HasAnyFilters() {
+		return true
+	}
+	if f.Profiles != nil && f.Profiles.HasAnyFilters() {
 		return true
 	}
 	return false
@@ -223,6 +232,20 @@ func (f *LogFilter) HasAnyFilters() bool {
 	return len(f.LogRecordFilter) > 0
 }
 
+type ProfileFilter struct {
+	// A list of conditions for filtering profiles.
+	// This is a list of OTTL conditions.
+	// All profiles where at least one condition evaluates to true will be dropped.
+	// (That is, the conditions are implicitly connected by a logical OR.)
+	//
+	// +kubebuilder:validation:Optional
+	ProfileFilter []string `json:"profile,omitempty"`
+}
+
+func (f *ProfileFilter) HasAnyFilters() bool {
+	return len(f.ProfileFilter) > 0
+}
+
 type Transform struct {
 	// An optional field which will determine how the transform processor reacts to errors that occur while processing a
 	// statement. Possible values:
@@ -257,6 +280,12 @@ type Transform struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	Logs []json.RawMessage `json:"log_statements,omitempty"`
+
+	// Transform statements (or groups) for the profile signal type.
+	//
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Schemaless
+	Profiles []json.RawMessage `json:"profile_statements,omitempty"`
 }
 
 type NormalizedTransformSpec struct {
@@ -264,6 +293,7 @@ type NormalizedTransformSpec struct {
 	Traces    []NormalizedTransformGroup `json:"trace_statements,omitempty"`
 	Metrics   []NormalizedTransformGroup `json:"metric_statements,omitempty"`
 	Logs      []NormalizedTransformGroup `json:"log_statements,omitempty"`
+	Profiles  []NormalizedTransformGroup `json:"profile_statements,omitempty"`
 }
 
 func (t *NormalizedTransformSpec) HasAnyStatements() bool {
@@ -274,6 +304,9 @@ func (t *NormalizedTransformSpec) HasAnyStatements() bool {
 		return true
 	}
 	if len(t.Logs) > 0 {
+		return true
+	}
+	if len(t.Profiles) > 0 {
 		return true
 	}
 	return false
@@ -289,14 +322,17 @@ type NormalizedTransformGroup struct {
 // Dash0ApiResourceSynchronizationStatus describes the result of synchronizing a (non-third-party) Kubernetes resource
 // (e.g. synthetic checks) to the Dash0 API.
 //
-// +kubebuilder:validation:Enum=successful;failed
+// +kubebuilder:validation:Enum=successful;partially-successful;failed
 type Dash0ApiResourceSynchronizationStatus string
 
 const (
-	// Dash0ApiResourceSynchronizationStatusSuccessful means the last synchronization attempt has been successsful.
+	// Dash0ApiResourceSynchronizationStatusSuccessful means the resource was synced successfully to all provided endpoints/datasets.
 	Dash0ApiResourceSynchronizationStatusSuccessful Dash0ApiResourceSynchronizationStatus = "successful"
 
-	// Dash0ApiResourceSynchronizationStatusFailed means the last synchronization attempt has failed.
+	// Dash0ApiResourceSynchronizationStatusPartiallySuccessful means the sync has succeeded for some endpoints/datasets and failed for others.
+	Dash0ApiResourceSynchronizationStatusPartiallySuccessful Dash0ApiResourceSynchronizationStatus = "partially-successful"
+
+	// Dash0ApiResourceSynchronizationStatusFailed means the resource could not be synced to any endpoints/datasets.
 	Dash0ApiResourceSynchronizationStatusFailed Dash0ApiResourceSynchronizationStatus = "failed"
 )
 
@@ -318,31 +354,71 @@ const (
 )
 
 type PersesDashboardSynchronizationResults struct {
+	// +kubebuilder:validation:Optional
 	SynchronizationStatus ThirdPartySynchronizationStatus `json:"synchronizationStatus"`
-	SynchronizedAt        metav1.Time                     `json:"synchronizedAt"`
+	// +kubebuilder:validation:Optional
+	SynchronizedAt metav1.Time `json:"synchronizedAt"`
+	// +kubebuilder:validation:Optional
+	ValidationIssues []string `json:"validationIssues,omitempty"`
+	// +kubebuilder:validation:Optional`
+	SynchronizationResults []PersesDashboardSynchronizationResultPerEndpointAndDataset `json:"synchronizationResults,omitempty"`
+}
+
+type PersesDashboardSynchronizationResultPerEndpointAndDataset struct {
+	Dash0ApiEndpoint string `json:"dash0ApiEndpoint"`
+	// +kubebuilder:validation:Optional
+	Dash0Dataset string `json:"dash0Dataset,omitempty"`
 	// +kubebuilder:validation:Optional
 	Dash0Origin string `json:"dash0Origin,omitempty"`
 	// +kubebuilder:validation:Optional
-	Dash0Dataset         string   `json:"dash0Dataset,omitempty"`
-	SynchronizationError string   `json:"synchronizationError,omitempty"`
-	ValidationIssues     []string `json:"validationIssues,omitempty"`
+	SynchronizationError string `json:"synchronizationError,omitempty"`
+	// HttpStatusCode is the HTTP status code that the Dash0 API returned for the failed synchronization attempt, if the
+	// failure was caused by an unexpected HTTP response. It is 0 (absent) for successful synchronizations and for
+	// transport-level errors (network errors, timeouts) where no HTTP response was received. It is used to decide
+	// whether a failed synchronization should be retried.
+	// +kubebuilder:validation:Optional
+	HttpStatusCode int `json:"httpStatusCode,omitempty"`
 }
 
 type PrometheusRuleSynchronizationResult struct {
-	SynchronizationStatus       ThirdPartySynchronizationStatus                     `json:"synchronizationStatus"`
-	SynchronizedAt              metav1.Time                                         `json:"synchronizedAt"`
-	AlertingRulesTotal          int                                                 `json:"alertingRulesTotal"`
-	SynchronizedRulesTotal      int                                                 `json:"synchronizedRulesTotal"`
+	// +kubebuilder:validation:Optional
+	SynchronizationStatus ThirdPartySynchronizationStatus `json:"synchronizationStatus"`
+	// +kubebuilder:validation:Optional
+	SynchronizedAt metav1.Time `json:"synchronizedAt"`
+	// +kubebuilder:validation:Optional
+	AlertingRulesTotal int `json:"alertingRulesTotal"`
+	// +kubebuilder:validation:Optional
+	RecordingRulesTotal int `json:"recordingRulesTotal"`
+	// +kubebuilder:validation:Optional
+	InvalidRulesTotal int `json:"invalidRulesTotal"`
+	// +kubebuilder:validation:Optional
+	InvalidRules map[string][]string `json:"invalidRules,omitempty"`
+	// +kubebuilder:validation:Optional
+	SynchronizationResults []PrometheusRuleSynchronizationResultPerEndpointAndDataset `json:"synchronizationResults,omitempty"`
+}
+
+type PrometheusRuleSynchronizationResultPerEndpointAndDataset struct {
+	Dash0ApiEndpoint string `json:"dash0ApiEndpoint"`
+	// +kubebuilder:validation:Optional
+	Dash0Dataset string `json:"dash0Dataset,omitempty"`
+	// +kubebuilder:validation:Optional
+	SynchronizedRulesTotal int `json:"synchronizedRulesTotal"`
+	// +kubebuilder:validation:Optional
 	SynchronizedRulesAttributes map[string]PrometheusRuleSynchronizedRuleAttributes `json:"synchronizedRulesAttributes,omitempty"`
-	SynchronizationErrorsTotal  int                                                 `json:"synchronizationErrorsTotal"`
-	SynchronizationErrors       map[string]string                                   `json:"synchronizationErrors,omitempty"`
-	InvalidRulesTotal           int                                                 `json:"invalidRulesTotal"`
-	InvalidRules                map[string][]string                                 `json:"invalidRules,omitempty"`
+	// +kubebuilder:validation:Optional
+	SynchronizationErrorsTotal int `json:"synchronizationErrorsTotal"`
+	// +kubebuilder:validation:Optional
+	SynchronizationErrors map[string]string `json:"synchronizationErrors,omitempty"`
+	// SynchronizationErrorHttpStatusCodes maps the name of a rule that failed to synchronize to the HTTP status code
+	// that the Dash0 API returned for that rule, if the failure was caused by an unexpected HTTP response. The status
+	// code is 0 (absent) for transport-level errors (network errors, timeouts) where no HTTP response was received. It
+	// is used to decide whether a failed synchronization should be retried. The keys match the keys of
+	// SynchronizationErrors.
+	// +kubebuilder:validation:Optional
+	SynchronizationErrorHttpStatusCodes map[string]int `json:"synchronizationErrorHttpStatusCodes,omitempty"`
 }
 
 type PrometheusRuleSynchronizedRuleAttributes struct {
 	// +kubebuilder:validation:Optional
 	Dash0Origin string `json:"dash0Origin,omitempty"`
-	// +kubebuilder:validation:Optional
-	Dash0Dataset string `json:"dash0Dataset,omitempty"`
 }

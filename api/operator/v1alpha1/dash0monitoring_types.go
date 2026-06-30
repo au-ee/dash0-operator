@@ -20,15 +20,18 @@ import (
 	dash0operator "github.com/dash0hq/dash0-operator/api/operator"
 	dash0common "github.com/dash0hq/dash0-operator/api/operator/common"
 	dash0v1beta1 "github.com/dash0hq/dash0-operator/api/operator/v1beta1"
-	"github.com/dash0hq/dash0-operator/internal/util"
+	"github.com/dash0hq/dash0-operator/internal/util/pointers"
 )
 
 const (
-	annotationNameSpecInstrumentWorkloadsTraceContextPropagators           = "dash0.com/spec.instrumentWorkloads.traceContext.propagators"
-	annotationNameStatusPreviousInstrumentWorkloadsTraceContextPropagators = "dash0.com/status.previousInstrumentWorkloads.traceContext.propagators"
-	annotationNameSpecInstrumentWorkloadsLabelSelector                     = "dash0.com/spec.instrumentWorkloads.labelSelector"
-	annotationNameStatusPreviousInstrumentWorkloadsLabelSelector           = "dash0.com/status.previousInstrumentWorkloads.labelSelector"
-	annotationNameSpecEventCollectionEnabled                               = "dash0.com/spec.eventCollection.enabled"
+	annotationNameSpecInstrumentWorkloadsTraceContextPropagators             = "dash0.com/spec.instrumentWorkloads.traceContext.propagators"
+	annotationNameStatusPreviousInstrumentWorkloadsTraceContextPropagators   = "dash0.com/status.previousInstrumentWorkloads.traceContext.propagators"
+	annotationNameSpecInstrumentWorkloadsCaptureSqlQueryParameters           = "dash0.com/spec.instrumentWorkloads.captureSqlQueryParameters"
+	annotationNameStatusPreviousInstrumentWorkloadsCaptureSqlQueryParameters = "dash0.com/status.previousInstrumentWorkloads.captureSqlQueryParameters"
+	annotationNameSpecInstrumentWorkloadsLabelSelector                       = "dash0.com/spec.instrumentWorkloads.labelSelector"
+	annotationNameStatusPreviousInstrumentWorkloadsLabelSelector             = "dash0.com/status.previousInstrumentWorkloads.labelSelector"
+	annotationNameSpecEventCollectionEnabled                                 = "dash0.com/spec.eventCollection.enabled"
+	annotationNameStatusPreviousLogCollectionEnabled                         = "dash0.com/status.previousLogCollection.enabled"
 )
 
 // Dash0Monitoring is the schema for the Dash0Monitoring API
@@ -48,6 +51,9 @@ type Dash0Monitoring struct {
 // Dash0MonitoringSpec describes the details of monitoring a single Kubernetes namespace with Dash0 and sending
 // telemetry to an observability backend.
 type Dash0MonitoringSpec struct {
+	// Deprecated: Use `exports` instead. If both `export` and `exports` are specified, `export` will be ignored.
+	// The mutating webhook will automatically migrate `export` to `exports` if only `export` is specified.
+	//
 	// The configuration of the observability backend to which telemetry data will be sent. This property is optional.
 	// If not set, the operator will use the default export configuration from the cluster-wide
 	// Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
@@ -60,6 +66,19 @@ type Dash0MonitoringSpec struct {
 	//
 	// +kubebuilder:validation:Optional
 	Export *dash0common.Export `json:"export,omitempty"`
+
+	// The configuration of the observability backend(s) to which telemetry data will be sent. This property is optional.
+	// If not set, the operator will use the default export configuration from the cluster-wide
+	// Dash0OperatorConfiguration resource, if present. If no Dash0OperatorConfiguration resource has been created for
+	// the cluster, or if the Dash0OperatorConfiguration resource does not have at least one export defined, creating a
+	// Dash0Monitoring resource without export settings will result in an error.
+	//
+	// Each export can either be Dash0 or another OTLP-compatible backend. You can also combine up to three exporters
+	// per export (i.e. Dash0 plus gRPC plus HTTP). This allows sending the same data to multiple targets simultaneously.
+	// When the exports setting is present, it has to contain at least one export with at least one exporter.
+	//
+	// +kubebuilder:validation:Optional
+	Exports []dash0common.Export `json:"exports,omitempty"`
 
 	// Opt-out for automatic workload instrumentation for the target namespace. There are three possible settings:
 	// `all`, `created-and-updated` and `none`. By default, the setting `all` is assumed, unless there is an operator
@@ -171,19 +190,19 @@ type Dash0MonitoringSpec struct {
 
 	// If enabled, the operator will watch Perses dashboard resources in this namespace and create corresponding
 	// dashboards in Dash0 via the Dash0 API.
-	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-dashboards-with-the-operator
+	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-dashboards-with-the-operator
 	// for details. This setting is optional, it defaults to `true`.
 	//
 	// +kubebuilder:default=true
-	SynchronizePersesDashboards *bool `json:"synchronizePersesDashboards,omitempty"`
+	SynchronizePersesDashboards *bool `json:"synchronizePersesDashboards"`
 
 	// If enabled, the operator will watch Prometheus rule resources in this namespace and create corresponding check
 	// rules in Dash0 via the Dash0 API.
-	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/README.md#managing-dash0-check-rules-with-the-operator
+	// See https://github.com/dash0hq/dash0-operator/blob/main/helm-chart/dash0-operator/docs/managing-dash0-resources.md#managing-dash0-check-rules-with-the-operator
 	// for details. This setting is optional, it defaults to `true`.
 	//
 	// +kubebuilder:default=true
-	SynchronizePrometheusRules *bool `json:"synchronizePrometheusRules,omitempty"`
+	SynchronizePrometheusRules *bool `json:"synchronizePrometheusRules"`
 }
 
 // Dash0MonitoringStatus defines the observed state of the Dash0Monitoring monitoring resource.
@@ -208,7 +227,7 @@ func (d *Dash0Monitoring) ReadInstrumentWorkloadsSetting() dash0common.Instrumen
 	if instrumentWorkloads == "" {
 		return dash0common.InstrumentWorkloadsModeAll
 	}
-	if !slices.Contains(dash0common.AllInstrumentWorkloadsMode, instrumentWorkloads) {
+	if !slices.Contains(dash0common.AllInstrumentWorkloadsModes, instrumentWorkloads) {
 		return dash0common.InstrumentWorkloadsModeAll
 	}
 	return instrumentWorkloads
@@ -376,18 +395,18 @@ type Dash0MonitoringList struct {
 	Items           []Dash0Monitoring `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&Dash0Monitoring{}, &Dash0MonitoringList{})
-}
-
 // ConvertFrom converts the hub version (v1beta1) to this Dash0Monitoring resource version (v1alpha1).
+//
+//nolint:staticcheck
 func (dst *Dash0Monitoring) ConvertFrom(srcRaw conversion.Hub) error {
 	src := srcRaw.(*dash0v1beta1.Dash0Monitoring)
 	dst.ObjectMeta = src.ObjectMeta
+	//nolint:staticcheck
 	dst.Spec.Export = src.Spec.Export
+	dst.Spec.Exports = src.Spec.Exports
 	dst.Spec.InstrumentWorkloads = src.Spec.InstrumentWorkloads.Mode
 	if strings.TrimSpace(src.Spec.InstrumentWorkloads.LabelSelector) != "" &&
-		src.Spec.InstrumentWorkloads.LabelSelector != util.DefaultAutoInstrumentationLabelSelector {
+		src.Spec.InstrumentWorkloads.LabelSelector != dash0common.DefaultAutoInstrumentationLabelSelector {
 		if dst.Annotations == nil {
 			dst.Annotations = make(map[string]string)
 		}
@@ -400,6 +419,13 @@ func (dst *Dash0Monitoring) ConvertFrom(srcRaw conversion.Hub) error {
 		}
 		dst.Annotations[annotationNameSpecInstrumentWorkloadsTraceContextPropagators] =
 			*src.Spec.InstrumentWorkloads.TraceContext.Propagators
+	}
+	if src.Spec.InstrumentWorkloads.CaptureSqlQueryParameters != nil {
+		if dst.Annotations == nil {
+			dst.Annotations = make(map[string]string)
+		}
+		dst.Annotations[annotationNameSpecInstrumentWorkloadsCaptureSqlQueryParameters] =
+			strconv.FormatBool(*src.Spec.InstrumentWorkloads.CaptureSqlQueryParameters)
 	}
 	if src.Spec.EventCollection.Enabled != nil {
 		if dst.Annotations == nil {
@@ -420,7 +446,7 @@ func (dst *Dash0Monitoring) ConvertFrom(srcRaw conversion.Hub) error {
 	dst.Status.Conditions = src.Status.Conditions
 	dst.Status.PreviousInstrumentWorkloads = src.Status.PreviousInstrumentWorkloads.Mode
 	if strings.TrimSpace(src.Status.PreviousInstrumentWorkloads.LabelSelector) != "" &&
-		src.Status.PreviousInstrumentWorkloads.LabelSelector != util.DefaultAutoInstrumentationLabelSelector {
+		src.Status.PreviousInstrumentWorkloads.LabelSelector != dash0common.DefaultAutoInstrumentationLabelSelector {
 		if dst.Annotations == nil {
 			dst.Annotations = make(map[string]string)
 		}
@@ -434,18 +460,36 @@ func (dst *Dash0Monitoring) ConvertFrom(srcRaw conversion.Hub) error {
 		dst.Annotations[annotationNameStatusPreviousInstrumentWorkloadsTraceContextPropagators] =
 			*src.Status.PreviousInstrumentWorkloads.TraceContext.Propagators
 	}
+	if src.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters != nil {
+		if dst.Annotations == nil {
+			dst.Annotations = make(map[string]string)
+		}
+		dst.Annotations[annotationNameStatusPreviousInstrumentWorkloadsCaptureSqlQueryParameters] =
+			strconv.FormatBool(*src.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters)
+	}
+	if src.Status.PreviousLogCollection.Enabled != nil {
+		if dst.Annotations == nil {
+			dst.Annotations = make(map[string]string)
+		}
+		dst.Annotations[annotationNameStatusPreviousLogCollectionEnabled] =
+			strconv.FormatBool(*src.Status.PreviousLogCollection.Enabled)
+	}
 	dst.Status.PersesDashboardSynchronizationResults = src.Status.PersesDashboardSynchronizationResults
 	dst.Status.PrometheusRuleSynchronizationResults = src.Status.PrometheusRuleSynchronizationResults
 	return nil
 }
 
 // ConvertTo converts this Dash0Monitoring resource (v1alpha1) to the hub version (v1beta1).
+//
+//nolint:dupl
 func (src *Dash0Monitoring) ConvertTo(dstRaw conversion.Hub) error {
 	dst := dstRaw.(*dash0v1beta1.Dash0Monitoring)
 	dst.ObjectMeta = src.ObjectMeta
+	//nolint:staticcheck
 	dst.Spec.Export = src.Spec.Export
+	dst.Spec.Exports = src.Spec.Exports
 	dst.Spec.InstrumentWorkloads = dash0v1beta1.InstrumentWorkloads{
-		LabelSelector: util.DefaultAutoInstrumentationLabelSelector,
+		LabelSelector: dash0common.DefaultAutoInstrumentationLabelSelector,
 		Mode:          src.Spec.InstrumentWorkloads,
 	}
 	if src.Annotations != nil {
@@ -459,9 +503,19 @@ func (src *Dash0Monitoring) ConvertTo(dstRaw conversion.Hub) error {
 		propagators, propagatorsFound :=
 			src.Annotations[annotationNameSpecInstrumentWorkloadsTraceContextPropagators]
 		if propagatorsFound && strings.TrimSpace(propagators) != "" {
-			dst.Spec.InstrumentWorkloads.TraceContext.Propagators = ptr.To(propagators)
+			dst.Spec.InstrumentWorkloads.TraceContext.Propagators = new(propagators)
 		}
 		delete(dst.Annotations, annotationNameSpecInstrumentWorkloadsTraceContextPropagators)
+
+		captureSqlQueryParametersAnnotationValue, captureSqlQueryParametersFound :=
+			src.Annotations[annotationNameSpecInstrumentWorkloadsCaptureSqlQueryParameters]
+		if captureSqlQueryParametersFound && strings.TrimSpace(captureSqlQueryParametersAnnotationValue) != "" {
+			if captureSqlQueryParameters, err := strconv.ParseBool(captureSqlQueryParametersAnnotationValue); err == nil {
+				dst.Spec.InstrumentWorkloads.CaptureSqlQueryParameters = ptr.To(captureSqlQueryParameters)
+			}
+			// Deliberately not handling the error here, if the annotation has an invalid value, we ignore it.
+		}
+		delete(dst.Annotations, annotationNameSpecInstrumentWorkloadsCaptureSqlQueryParameters)
 
 		eventCollectionEnabledAnnotationValue, eventCollectionEnabledFound :=
 			src.Annotations[annotationNameSpecEventCollectionEnabled]
@@ -475,8 +529,8 @@ func (src *Dash0Monitoring) ConvertTo(dstRaw conversion.Hub) error {
 	}
 	dst.Spec.LogCollection = src.Spec.LogCollection
 	dst.Spec.PrometheusScraping = src.Spec.PrometheusScraping
-	prometheusScrapingEnabledLegacy := util.ReadBoolPointerWithDefault(src.Spec.PrometheusScrapingEnabled, true)
-	prometheusScrapingEnabledNew := util.ReadBoolPointerWithDefault(src.Spec.PrometheusScraping.Enabled, true)
+	prometheusScrapingEnabledLegacy := pointers.ReadBoolPointerWithDefault(src.Spec.PrometheusScrapingEnabled, true)
+	prometheusScrapingEnabledNew := pointers.ReadBoolPointerWithDefault(src.Spec.PrometheusScraping.Enabled, true)
 	if !prometheusScrapingEnabledLegacy || !prometheusScrapingEnabledNew {
 		// If either setting has been disabled explicitly, the Prometheus scraping has to be disabled in the v1beta1
 		// version as well.
@@ -489,7 +543,7 @@ func (src *Dash0Monitoring) ConvertTo(dstRaw conversion.Hub) error {
 	dst.Spec.SynchronizePrometheusRules = src.Spec.SynchronizePrometheusRules
 	dst.Status.Conditions = src.Status.Conditions
 	dst.Status.PreviousInstrumentWorkloads = dash0v1beta1.InstrumentWorkloads{
-		LabelSelector: util.DefaultAutoInstrumentationLabelSelector,
+		LabelSelector: dash0common.DefaultAutoInstrumentationLabelSelector,
 		Mode:          src.Status.PreviousInstrumentWorkloads,
 	}
 	if src.Annotations != nil {
@@ -503,9 +557,29 @@ func (src *Dash0Monitoring) ConvertTo(dstRaw conversion.Hub) error {
 		previousPropagators, previousPropagatorsFound :=
 			src.Annotations[annotationNameStatusPreviousInstrumentWorkloadsTraceContextPropagators]
 		if previousPropagatorsFound && strings.TrimSpace(previousPropagators) != "" {
-			dst.Status.PreviousInstrumentWorkloads.TraceContext.Propagators = ptr.To(previousPropagators)
+			dst.Status.PreviousInstrumentWorkloads.TraceContext.Propagators = new(previousPropagators)
 		}
 		delete(dst.Annotations, annotationNameStatusPreviousInstrumentWorkloadsTraceContextPropagators)
+
+		previousCaptureSqlQueryParametersAnnotationValue, previousCaptureSqlQueryParametersFound :=
+			src.Annotations[annotationNameStatusPreviousInstrumentWorkloadsCaptureSqlQueryParameters]
+		if previousCaptureSqlQueryParametersFound && strings.TrimSpace(previousCaptureSqlQueryParametersAnnotationValue) != "" {
+			if previousCaptureSqlQueryParameters, err := strconv.ParseBool(previousCaptureSqlQueryParametersAnnotationValue); err == nil {
+				dst.Status.PreviousInstrumentWorkloads.CaptureSqlQueryParameters = ptr.To(previousCaptureSqlQueryParameters)
+			}
+			// Deliberately not handling the error here, if the annotation has an invalid value, we ignore it.
+		}
+		delete(dst.Annotations, annotationNameStatusPreviousInstrumentWorkloadsCaptureSqlQueryParameters)
+
+		previousLogCollectionEnabledAnnotationValue, previousLogCollectionEnabledFound :=
+			src.Annotations[annotationNameStatusPreviousLogCollectionEnabled]
+		if previousLogCollectionEnabledFound && strings.TrimSpace(previousLogCollectionEnabledAnnotationValue) != "" {
+			if previousLogCollectionEnabled, err := strconv.ParseBool(previousLogCollectionEnabledAnnotationValue); err == nil {
+				dst.Status.PreviousLogCollection.Enabled = ptr.To(previousLogCollectionEnabled)
+			}
+			// Deliberately not handling the error here, if the annotation has an invalid value, we ignore it.
+		}
+		delete(dst.Annotations, annotationNameStatusPreviousLogCollectionEnabled)
 	}
 	dst.Status.PersesDashboardSynchronizationResults = src.Status.PersesDashboardSynchronizationResults
 	dst.Status.PrometheusRuleSynchronizationResults = src.Status.PrometheusRuleSynchronizationResults
